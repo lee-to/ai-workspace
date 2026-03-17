@@ -18,17 +18,17 @@ AI Workspace fixes that. It's a lightweight CLI + [MCP server](https://modelcont
                  │                    │                    │
                  └────────┬───────────┘────────────────────┘
                           │
-                    ┌─────▼─────┐
+                    ┌─────▼──────┐
                     │  "backend" │  ← group
                     │   group    │
-                    └─────┬─────┘
+                    └─────┬──────┘
                           │
-                    ┌─────▼─────┐
+                    ┌─────▼──────┐
                     │ MCP Server │  ← ai-workspace serve
                     │  (stdio)   │
-                    └─────┬─────┘
+                    └─────┬──────┘
                           │
-                    ┌─────▼─────┐
+                    ┌─────▼──────┐
                     │  AI Agent  │  sees files, dirs & notes
                     │            │  from all 3 projects
                     └────────────┘
@@ -89,6 +89,32 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 ```
 
 That's it. The agent now has access to 5 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, and `list_projects`.
+
+## Example Prompts
+
+Once connected, you can talk to your AI agent naturally. Here are some examples:
+
+**Discover context:**
+- *"What shared context do I have from other projects?"*
+- *"Show me all projects and groups in my workspace"*
+- *"What files are shared in the backend group?"*
+
+**Read shared files:**
+- *"Read the shared database schema from the api project"*
+- *"Show me the deploy guide shared by the infra team"*
+- *"What's in the shared config directory?"*
+
+**Search notes:**
+- *"Search workspace notes for migration instructions"*
+- *"Are there any shared notes about the deploy process?"*
+- *"Find notes mentioning staging environment"*
+
+**Cross-project tasks:**
+- *"I'm building a new endpoint — check the shared API schema and follow the same patterns"*
+- *"Before I refactor this model, check if other projects share files that depend on it"*
+- *"Read the shared style guide and apply it to this component"*
+
+The agent will automatically call the right MCP tools (`workspace_context`, `workspace_read`, `workspace_search`) to answer these.
 
 ## CLI at a glance
 
