@@ -1,0 +1,5 @@
+/target
+.idea/
+.claude/settings.local.json
+.env
+.env.*

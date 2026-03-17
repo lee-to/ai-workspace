@@ -1,0 +1,29 @@
+[package]
+name = "ai-workspace"
+version = "0.1.0"
+edition = "2024"
+authors = ["Danil Shutsky <thecutcode@gmail.com>"]
+description = "Cross-project shared context for AI coding agents via CLI and MCP server"
+license = "MIT"
+repository = "https://github.com/lee-to/ai-workspace"
+homepage = "https://cutcode.dev"
+readme = "README.md"
+keywords = ["ai", "mcp", "workspace", "context", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "ai-workspace"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+env_logger = "0.11"
+log = "0.4"
+dirs = "6"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
