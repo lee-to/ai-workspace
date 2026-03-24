@@ -12,6 +12,7 @@ Commands that operate on the "current project" must be run inside an initialized
 - `edit`
 - `rm`
 - `leave`
+- `destroy`
 - `status`
 - `export`
 
@@ -23,6 +24,7 @@ Commands that work from any directory (no project required):
 - `delete-group`
 - `sync`
 - `serve`
+- `update`
 
 ## Commands
 
@@ -39,7 +41,7 @@ ai-workspace init [--name <name>] [--group <group>]
 | `-n, --name` | Project name (defaults to directory name) |
 | `-g, --group` | Group to join or create |
 
-If the directory is already initialized, running `init` again with `--group` adds the project to that group.
+If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
 If `.ai-workspace.json` exists in the current directory, `init` reads it and applies the config (groups, shares, notes) via sync. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file.
 
@@ -127,6 +129,18 @@ ai-workspace delete-group <group>
 
 This removes all project associations with the group, all group-scoped notes, and the group itself. Does not require being inside a project directory.
 
+### `destroy`
+
+Remove the current project from ai-workspace entirely.
+
+```bash
+ai-workspace destroy
+```
+
+Deletes the project record, all its shared items (files, directories, project-scoped notes), group memberships, and group-scoped notes created by this project. **Files on disk are not affected.**
+
+After `destroy`, you can re-register the project with `ai-workspace init`.
+
 ### `list`
 
 List all projects and groups in the workspace.
@@ -195,6 +209,18 @@ ai-workspace serve
 ```
 
 See [MCP Server](mcp-server.md) for details on the available tools.
+
+### `update`
+
+Update ai-workspace to the latest version.
+
+```bash
+ai-workspace update
+```
+
+Checks the latest release on GitHub, downloads the appropriate binary for your platform, and replaces the current binary in place. No Rust or Cargo required.
+
+If you're already on the latest version, it prints a message and exits without changes.
 
 ## See Also
 

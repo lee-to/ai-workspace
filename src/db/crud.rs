@@ -82,6 +82,24 @@ impl Db {
         Ok(())
     }
 
+    pub fn delete_project(&self, project_id: i64) -> Result<()> {
+        info!("Deleting project {}", project_id);
+        // Clean up FTS entries for project-scoped notes
+        self.conn.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )?;
+        // Clean up FTS entries for group-scoped notes created by this project
+        self.conn.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )?;
+        // shared_items and project_groups cascade-deleted via FK
+        self.conn
+            .execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        Ok(())
+    }
+
     pub fn get_project_by_path(&self, path: &str) -> Result<Option<Project>> {
         debug!("Looking up project by path: {}", path);
         let mut stmt = self

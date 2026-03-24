@@ -133,10 +133,12 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `rm <target>` | Remove a shared item |
 | `leave <group>` | Remove project from a group |
 | `delete-group <group>` | Delete a group entirely |
+| `destroy` | Remove current project from ai-workspace (keeps files) |
 | `status` | Show project info, groups, and items |
 | `export` | Export project config to `.ai-workspace.json` |
 | `sync` | Clean up stale files + reconcile `.ai-workspace.json` |
 | `serve` | Start the MCP server |
+| `update` | Update to the latest version |
 
 ## Team Sharing
 
@@ -225,6 +227,14 @@ cargo install --path .
 </details>
 
 Requires Rust 1.85+ (edition 2024). SQLite is bundled — no extra dependencies.
+
+### Update
+
+```bash
+ai-workspace update
+```
+
+Downloads the latest release from GitHub and replaces the current binary. No Rust or Cargo required.
 
 ## License
 

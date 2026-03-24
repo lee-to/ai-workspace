@@ -92,6 +92,8 @@ pub enum Command {
         #[arg(value_enum, default_value = "all")]
         what: ListTarget,
     },
+    /// Remove current project from ai-workspace (keeps files on disk)
+    Destroy,
     /// Show project status
     Status,
     /// Export project config to .ai-workspace.json
@@ -100,6 +102,8 @@ pub enum Command {
     Sync,
     /// Start MCP server (stdio transport)
     Serve,
+    /// Update ai-workspace to the latest version
+    Update,
 }
 
 /// Resolve the current project from cwd
@@ -336,7 +340,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 None
             };
 
-            // --name wins over .json name, which wins over dir name
+            // Resolve project name: --name flag, then .json config, then dir name
+            let name_from_flag = name.is_some();
             let project_name = name.unwrap_or_else(|| {
                 if let Some(ref cfg) = config {
                     cfg.name.clone()
@@ -352,8 +357,8 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Check if already initialized
             let project_id = if let Some(existing) = db.get_project_by_path(&cwd_str)? {
-                // Update name if differs
-                if existing.name != project_name {
+                // Only rename if --name was explicitly provided
+                if name_from_flag && existing.name != project_name {
                     db.rename_project(existing.id, &project_name)?;
                     print_success(format!(
                         "Renamed project '{}' -> '{}' (id={})",
@@ -627,6 +632,17 @@ pub fn run(cmd: Command) -> Result<()> {
             Ok(())
         }
 
+        Command::Destroy => {
+            let db = Db::open_default()?;
+            let project = require_project(&db)?;
+            db.delete_project(project.id)?;
+            print_success(format!(
+                "Removed project '{}' from ai-workspace (files on disk are untouched)",
+                project.name
+            ));
+            Ok(())
+        }
+
         Command::List { what } => {
             let db = Db::open_default()?;
 
@@ -826,6 +842,28 @@ pub fn run(cmd: Command) -> Result<()> {
             let config_path = Path::new(&project.path).join(".ai-workspace.json");
             config.save(&config_path)?;
             print_success(format!("Exported config to {}", config_path.display()));
+            Ok(())
+        }
+
+        Command::Update => {
+            let current = env!("CARGO_PKG_VERSION");
+            println!("Current version: v{}", current);
+            println!("Checking for updates...");
+
+            let status = self_update::backends::github::Update::configure()
+                .repo_owner("lee-to")
+                .repo_name("ai-workspace")
+                .bin_name("ai-workspace")
+                .current_version(current)
+                .build()?
+                .update()?;
+
+            if status.updated() {
+                print_success(format!("Updated to v{}", status.version()));
+            } else {
+                print_info(format!("Already up to date (v{})", current));
+            }
+
             Ok(())
         }
 
