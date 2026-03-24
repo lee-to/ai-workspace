@@ -2,6 +2,7 @@ mod cli;
 mod db;
 mod mcp;
 mod models;
+mod walk;
 
 use anyhow::Result;
 use clap::Parser;

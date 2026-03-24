@@ -24,6 +24,8 @@ env_logger = "0.11"
 log = "0.4"
 dirs = "6"
 anyhow = "1"
+ignore = "0.4"
+regex = "1"
 
 [dev-dependencies]
 tempfile = "3"
