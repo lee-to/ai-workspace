@@ -99,16 +99,23 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_read",
-                    "description": "Read the content of a shared file by item ID",
+                    "description": "Read a shared file by item_id OR by project_id+path. Provide one or the other, not both.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "item_id": {
                                 "type": "integer",
-                                "description": "The shared item ID to read"
+                                "description": "The shared item ID to read (mutually exclusive with project_id+path)"
+                            },
+                            "project_id": {
+                                "type": "integer",
+                                "description": "Project ID to read from (use with path)"
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Relative path within the project (use with project_id)"
                             }
-                        },
-                        "required": ["item_id"]
+                        }
                     }
                 },
                 {
@@ -142,6 +149,46 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "properties": {},
                         "required": []
                     }
+                },
+                {
+                    "name": "project_tree",
+                    "description": "List the file tree of a project, respecting .gitignore",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "description": "The project ID"
+                            },
+                            "path": {
+                                "type": "string",
+                                "description": "Optional subdirectory to list (relative to project root)"
+                            }
+                        },
+                        "required": ["project_id"]
+                    }
+                },
+                {
+                    "name": "project_grep",
+                    "description": "Search project files for a regex pattern, respecting .gitignore",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "description": "The project ID"
+                            },
+                            "pattern": {
+                                "type": "string",
+                                "description": "Regex pattern to search for"
+                            },
+                            "glob": {
+                                "type": "string",
+                                "description": "Optional glob to filter files (e.g. \"*.rs\")"
+                            }
+                        },
+                        "required": ["project_id", "pattern"]
+                    }
                 }
             ]
         }),
@@ -173,17 +220,19 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_five_tools() {
+    fn handle_tools_list_returns_seven_tools() {
         let resp = handle_tools_list(json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 5);
+        assert_eq!(tools.len(), 7);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
         assert!(names.contains(&"workspace_read"));
         assert!(names.contains(&"workspace_search"));
         assert!(names.contains(&"list_groups"));
         assert!(names.contains(&"list_projects"));
+        assert!(names.contains(&"project_tree"));
+        assert!(names.contains(&"project_grep"));
     }
 
     #[test]

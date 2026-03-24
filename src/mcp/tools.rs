@@ -3,6 +3,7 @@ use std::path::Path;
 
 use super::protocol::{JsonRpcResponse, McpError};
 use crate::db::Db;
+use crate::walk;
 
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -23,20 +24,37 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             workspace_context(id, &db)
         }
         "workspace_read" => {
-            let item_id = match arguments.get("item_id").and_then(|v| v.as_i64()) {
-                Some(iid) => iid,
-                None => {
-                    return JsonRpcResponse::error(
-                        id,
-                        McpError::invalid_params("Missing required parameter: item_id"),
-                    );
-                }
-            };
+            let item_id = arguments.get("item_id").and_then(|v| v.as_i64());
+            let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
+            let path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+            // Error if both item_id and project_id+path provided
+            if item_id.is_some() && (project_id.is_some() || path.is_some()) {
+                return JsonRpcResponse::error(
+                    id,
+                    McpError::invalid_params(
+                        "Provide either item_id OR project_id+path, not both",
+                    ),
+                );
+            }
+
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_read(id, item_id, &db)
+
+            if let Some(iid) = item_id {
+                workspace_read(id, iid, &db)
+            } else if let (Some(pid), Some(p)) = (project_id, path) {
+                workspace_read_by_path(id, pid, &p, &db)
+            } else {
+                JsonRpcResponse::error(
+                    id,
+                    McpError::invalid_params(
+                        "Missing required parameters: provide item_id OR project_id+path",
+                    ),
+                )
+            }
         }
         "workspace_search" => {
             let query = match arguments.get("query").and_then(|v| v.as_str()) {
@@ -67,6 +85,49 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Err(e) => return tool_error(id, &e),
             };
             list_projects(id, &db)
+        }
+        "project_tree" => {
+            let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
+                Some(pid) => pid,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: project_id"),
+                    );
+                }
+            };
+            let path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            project_tree(id, project_id, path.as_deref(), &db)
+        }
+        "project_grep" => {
+            let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
+                Some(pid) => pid,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: project_id"),
+                    );
+                }
+            };
+            let pattern = match arguments.get("pattern").and_then(|v| v.as_str()) {
+                Some(p) => p.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: pattern"),
+                    );
+                }
+            };
+            let glob = arguments.get("glob").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            project_grep(id, project_id, &pattern, glob.as_deref(), &db)
         }
         _ => {
             error!("Unknown tool: {}", tool_name);
@@ -270,6 +331,61 @@ fn workspace_read(id: serde_json::Value, item_id: i64, db: &Db) -> JsonRpcRespon
     }
 }
 
+fn workspace_read_by_path(
+    id: serde_json::Value,
+    project_id: i64,
+    path: &str,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "workspace_read_by_path: project_id={}, path={}",
+        project_id, path
+    );
+
+    let (_canonical_root, canonical) = match resolve_project_path(project_id, Some(path), db) {
+        Ok(v) => v,
+        Err(e) => return tool_error(id, &e),
+    };
+
+    // Same 10MB limit as workspace_read
+    const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
+    debug!("Reading file: {}", canonical.display());
+    if canonical.is_dir() {
+        match std::fs::read_dir(&canonical) {
+            Ok(entries) => {
+                let listing: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                tool_result(id, listing.join("\n"))
+            }
+            Err(e) => {
+                error!("Failed to read dir {}: {}", canonical.display(), e);
+                tool_error(id, "Failed to read directory")
+            }
+        }
+    } else {
+        match std::fs::metadata(&canonical) {
+            Ok(meta) if meta.len() > MAX_READ_SIZE => tool_error(
+                id,
+                &format!(
+                    "File too large ({} bytes, max {})",
+                    meta.len(),
+                    MAX_READ_SIZE
+                ),
+            ),
+            _ => match std::fs::read_to_string(&canonical) {
+                Ok(content) => tool_result(id, content),
+                Err(e) => {
+                    error!("Failed to read file {}: {}", canonical.display(), e);
+                    tool_error(id, "Failed to read file")
+                }
+            },
+        }
+    }
+}
+
 fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcResponse {
     info!("workspace_search: query={}", query);
 
@@ -321,6 +437,114 @@ fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
 
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     tool_result(id, text)
+}
+
+/// Resolve a project by ID and validate an optional subpath within it.
+/// Returns (project_root_path, resolved_canonical_path).
+fn resolve_project_path(
+    project_id: i64,
+    subpath: Option<&str>,
+    db: &Db,
+) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
+    let project = db
+        .get_project_by_id(project_id)
+        .map_err(|e| format!("DB error: {}", e))?
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let root = Path::new(&project.path);
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+
+    let target = if let Some(sub) = subpath {
+        let full = root.join(sub);
+        let canonical = full
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve path '{}': {}", sub, e))?;
+        if !canonical.starts_with(&canonical_root) {
+            return Err("Access denied: path is outside project directory".to_string());
+        }
+        canonical
+    } else {
+        canonical_root.clone()
+    };
+
+    Ok((canonical_root, target))
+}
+
+fn project_tree(
+    id: serde_json::Value,
+    project_id: i64,
+    path: Option<&str>,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "project_tree: project_id={}, path={:?}",
+        project_id, path
+    );
+
+    let (canonical_root, _target) = match resolve_project_path(project_id, path, db) {
+        Ok(v) => v,
+        Err(e) => return tool_error(id, &e),
+    };
+
+    let entries = walk::walk_project_tree(&canonical_root, path);
+
+    // Format as indented tree
+    let mut lines = Vec::new();
+    for entry in &entries {
+        let depth = entry.path.matches('/').count();
+        let indent = "  ".repeat(depth);
+        let suffix = if entry.is_dir { "/" } else { "" };
+        lines.push(format!("{}{}{}", indent, entry.name, suffix));
+    }
+
+    tool_result(id, lines.join("\n"))
+}
+
+fn project_grep(
+    id: serde_json::Value,
+    project_id: i64,
+    pattern: &str,
+    glob: Option<&str>,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "project_grep: project_id={}, pattern={}, glob={:?}",
+        project_id, pattern, glob
+    );
+
+    let (canonical_root, _) = match resolve_project_path(project_id, None, db) {
+        Ok(v) => v,
+        Err(e) => return tool_error(id, &e),
+    };
+
+    let matches = match walk::grep_project(&canonical_root, pattern, glob) {
+        Ok(m) => m,
+        Err(e) => {
+            return JsonRpcResponse::error(
+                id,
+                McpError::invalid_params(&e),
+            );
+        }
+    };
+
+    // Group by file
+    let mut grouped: std::collections::BTreeMap<&str, Vec<&walk::GrepMatch>> =
+        std::collections::BTreeMap::new();
+    for m in &matches {
+        grouped.entry(&m.path).or_default().push(m);
+    }
+
+    let mut lines = Vec::new();
+    for (path, file_matches) in &grouped {
+        lines.push(format!("{}:", path));
+        for m in file_matches {
+            lines.push(format!("  {}:{}", m.line_number, m.line_content));
+        }
+    }
+
+    tool_result(id, lines.join("\n"))
 }
 
 fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
@@ -390,8 +614,18 @@ mod tests {
     }
 
     #[test]
-    fn handle_tool_call_workspace_read_missing_item_id() {
+    fn handle_tool_call_workspace_read_missing_params() {
         let resp = handle_tool_call(json!(1), json!({"name": "workspace_read", "arguments": {}}));
+        assert!(resp.error.is_some());
+        assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    #[test]
+    fn handle_tool_call_workspace_read_both_params_error() {
+        let resp = handle_tool_call(
+            json!(1),
+            json!({"name": "workspace_read", "arguments": {"item_id": 1, "project_id": 1, "path": "foo"}}),
+        );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32602);
     }
