@@ -69,6 +69,27 @@ fn seed_data(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+/// Seed a project with a file tree suitable for project_tree/project_grep tests
+fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+
+    // Create file structure
+    std::fs::write(project_dir.path().join("main.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+    std::fs::create_dir(project_dir.path().join("src")).unwrap();
+    std::fs::write(project_dir.path().join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
+    std::fs::write(project_dir.path().join("src/utils.rs"), "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n").unwrap();
+
+    // Init project via CLI
+    Command::new(binary_path())
+        .args(["init", "--name", "tree-proj"])
+        .current_dir(project_dir.path())
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+
+    project_dir
+}
+
 #[test]
 fn test_mcp_initialize() {
     let (_db_dir, db_path) = temp_db();
@@ -255,4 +276,313 @@ fn test_mcp_list_projects() {
     let projects: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert_eq!(projects[0]["name"], "seed-proj");
     assert!(projects[0]["groups"].as_array().unwrap().len() > 0);
+}
+
+// --- project_tree tests ---
+
+#[test]
+fn test_mcp_project_tree_basic() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("src/"));
+    assert!(content.contains("lib.rs"));
+    assert!(content.contains("utils.rs"));
+}
+
+#[test]
+fn test_mcp_project_tree_subpath() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "path": "src" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("lib.rs"));
+    assert!(content.contains("utils.rs"));
+    // Should NOT contain main.rs (it's outside src/)
+    assert!(!content.contains("main.rs"));
+}
+
+#[test]
+fn test_mcp_project_tree_invalid_project() {
+    let (_db_dir, db_path) = temp_db();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 9999 }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("not found"));
+}
+
+// --- workspace_read by project_id+path tests ---
+
+#[test]
+fn test_mcp_workspace_read_by_path() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "path": "src/lib.rs" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("pub fn add"));
+}
+
+#[test]
+fn test_mcp_workspace_read_path_traversal_attack() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "path": "../../etc/passwd" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let result = &responses[0]["result"];
+    let text = result["content"][0]["text"].as_str().unwrap();
+    // Should be denied or fail to resolve
+    assert!(text.contains("denied") || text.contains("Cannot resolve") || result["isError"] == true);
+}
+
+#[test]
+fn test_mcp_workspace_read_missing_file() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "path": "nonexistent.txt" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+}
+
+#[test]
+fn test_mcp_workspace_read_backward_compat() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    // item_id still works
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": 1 }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "# Hello");
+}
+
+#[test]
+fn test_mcp_workspace_read_both_params_error() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": 1, "project_id": 1, "path": "readme.md" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0]["error"].is_object());
+    assert_eq!(responses[0]["error"]["code"], -32602);
+}
+
+// --- project_grep tests ---
+
+#[test]
+fn test_mcp_project_grep_basic() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "println" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("println"));
+    // Should match in main.rs and src/utils.rs
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("utils.rs"));
+}
+
+#[test]
+fn test_mcp_project_grep_glob_filter() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "pub fn", "glob": "*.rs" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("pub fn"));
+}
+
+#[test]
+fn test_mcp_project_grep_invalid_regex() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "[invalid" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0]["error"].is_object());
+    assert_eq!(responses[0]["error"]["code"], -32602);
+}
+
+#[test]
+fn test_mcp_project_grep_no_matches() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "zzzzz_no_match_zzzzz" }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "");
 }

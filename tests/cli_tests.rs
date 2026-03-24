@@ -783,3 +783,90 @@ fn test_sync_with_json() {
     assert!(stdout.contains("team"));
     assert!(stdout.contains("sync-lbl"));
 }
+
+// --- Auto-share on init ---
+
+#[test]
+fn test_auto_share_rust_project() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
+
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "rust-proj"]);
+    assert!(success, "init should succeed");
+    assert!(stdout.contains("Auto-shared 2 key file(s)"));
+
+    // Verify via status
+    let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(stdout.contains("Cargo.toml"));
+    assert!(stdout.contains("README.md"));
+}
+
+#[test]
+fn test_auto_share_node_project() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("package.json"), "{\"name\": \"test\"}").unwrap();
+    fs::write(project_dir.path().join("README.rst"), "Test").unwrap();
+
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "node-proj"]);
+    assert!(success, "init should succeed");
+    assert!(stdout.contains("Auto-shared 2 key file(s)"));
+
+    let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(stdout.contains("package.json"));
+    assert!(stdout.contains("README.rst"));
+}
+
+#[test]
+fn test_auto_share_skipped_when_json_exists() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("Cargo.toml"), "[package]").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        "{\"name\": \"proj\", \"groups\": [], \"share\": [], \"notes\": []}",
+    )
+    .unwrap();
+
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(success, "init should succeed");
+    // Should NOT auto-share when .ai-workspace.json exists
+    assert!(!stdout.contains("Auto-shared"));
+
+    let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(!stdout.contains("Cargo.toml"));
+}
+
+#[test]
+fn test_auto_share_no_duplicates_on_reinit() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("Cargo.toml"), "[package]").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
+
+    // First init — auto-shares
+    let (stdout, _stderr, _) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    assert!(stdout.contains("Auto-shared 2 key file(s)"));
+
+    // Second init — should not auto-share again (already shared)
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    assert!(success, "re-init should succeed");
+    assert!(!stdout.contains("Auto-shared"));
+
+    // Verify only 2 shared items, not 4
+    let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    let cargo_count = stdout.matches("Cargo.toml").count();
+    assert_eq!(cargo_count, 1, "Cargo.toml should appear exactly once");
+}
