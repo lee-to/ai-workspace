@@ -55,18 +55,22 @@ Get workspace metadata: all projects, their groups, and shared items (no file co
 
 ### `workspace_read`
 
-Read the content of a shared file or directory by item ID.
+Read the content of a shared file, directory, or note. Supports two modes: by shared item ID or by project ID + relative path.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `item_id` | integer | yes | The shared item ID |
+| `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`path`) |
+| `project_id` | integer | — | Project ID to read from (use with `path`) |
+| `path` | string | — | Relative path within the project (use with `project_id`) |
+
+Provide **either** `item_id` **or** `project_id`+`path`, not both. Passing both returns an `invalid_params` error.
 
 **Behavior:**
 - **File:** returns file content as text (max 10 MB)
 - **Directory:** returns listing of filenames
-- **Note:** returns note content
+- **Note:** returns note content (only via `item_id`)
 - Path traversal protection: rejects paths outside the project directory
 
 ### `workspace_search`
@@ -89,6 +93,52 @@ Full-text search over shared notes.
 - `deploy` — notes containing "deploy"
 - `staging environment` — notes containing both terms
 - `release checklist` — notes containing both terms
+
+### `project_tree`
+
+List the file tree of a project, respecting `.gitignore` rules.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | yes | The project ID |
+| `path` | string | no | Subdirectory to list (relative to project root) |
+
+**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.
+
+**Example output:**
+```
+Cargo.toml
+README.md
+src/
+  main.rs
+  lib.rs
+```
+
+### `project_grep`
+
+Search project files for a regex pattern, respecting `.gitignore` rules.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | yes | The project ID |
+| `pattern` | string | yes | Regex pattern to search for |
+| `glob` | string | no | Glob to filter files (e.g. `*.rs`) |
+
+**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files and files larger than 1 MB.
+
+**Example output:**
+```
+src/main.rs:
+  3:    println!("hello");
+src/utils.rs:
+  2:    println!("hello {}", name);
+```
+
+Invalid regex patterns return an `invalid_params` error.
 
 ### `list_groups`
 

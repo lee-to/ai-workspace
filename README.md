@@ -88,7 +88,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 5 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, and `list_projects`.
+That's it. The agent now has access to 7 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
 
 ## Example Prompts
 
@@ -109,6 +109,12 @@ Once connected, you can talk to your AI agent naturally. Here are some examples:
 - *"Are there any shared notes about the deploy process?"*
 - *"Find notes mentioning staging environment"*
 
+**Navigate project files:**
+- *"Show me the file tree of the api project"*
+- *"List the files under src/ in project 2"*
+- *"Search the api project for any function that mentions 'auth'"*
+- *"Grep the web project for TODO comments"*
+
 **Cross-project tasks:**
 - *"I'm building a new endpoint — check the shared API schema and follow the same patterns"*
 - *"Before I refactor this model, check if other projects share files that depend on it"*
@@ -120,7 +126,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 
 | Command | What it does |
 |---------|-------------|
-| `init --group <name>` | Register project, join/create a group |
+| `init --group <name>` | Register project, join/create a group, auto-share key files |
 | `share <path> --label <label>` | Share a file or directory |
 | `note <text> --group <name>` | Add a group-scoped note |
 | `edit <target> --content/--label/--scope` | Edit a shared item |

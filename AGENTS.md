@@ -21,6 +21,7 @@ ai-workspace/
 ├── src/
 │   ├── main.rs             # Entry point, clap App definition
 │   ├── models.rs           # Data models (Project, Group, SharedItem, SharedItemKind)
+│   ├── walk.rs             # File tree walker and grep (ignore + regex crates)
 │   ├── cli/
 │   │   └── mod.rs          # CLI subcommands and handlers
 │   ├── db/
@@ -30,7 +31,7 @@ ai-workspace/
 │   └── mcp/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
 │       ├── protocol.rs     # JSON-RPC types (request, response, error)
-│       └── tools.rs        # MCP tool implementations (workspace_context, read, search)
+│       └── tools.rs        # MCP tool implementations (workspace_context, read, search, project_tree, project_grep)
 ├── tests/
 │   ├── cli_tests.rs        # CLI integration tests
 │   └── mcp_tests.rs        # MCP protocol integration tests
@@ -46,6 +47,7 @@ ai-workspace/
 | src/db/crud.rs | All database operations (Db struct) |
 | src/cli/mod.rs | CLI command definitions and handlers |
 | src/models.rs | Shared data types |
+| src/walk.rs | File tree walker and project grep |
 
 ## Documentation
 | Document | Path | Description |
