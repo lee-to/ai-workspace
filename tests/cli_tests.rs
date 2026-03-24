@@ -791,11 +791,18 @@ fn test_auto_share_rust_project() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
 
-    fs::write(project_dir.path().join("Cargo.toml"), "[package]\nname = \"test\"").unwrap();
+    fs::write(
+        project_dir.path().join("Cargo.toml"),
+        "[package]\nname = \"test\"",
+    )
+    .unwrap();
     fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
 
-    let (stdout, _stderr, success) =
-        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "rust-proj"]);
+    let (stdout, _stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "rust-proj"],
+    );
     assert!(success, "init should succeed");
     assert!(stdout.contains("Auto-shared 2 key file(s)"));
 
@@ -810,11 +817,18 @@ fn test_auto_share_node_project() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
 
-    fs::write(project_dir.path().join("package.json"), "{\"name\": \"test\"}").unwrap();
+    fs::write(
+        project_dir.path().join("package.json"),
+        "{\"name\": \"test\"}",
+    )
+    .unwrap();
     fs::write(project_dir.path().join("README.rst"), "Test").unwrap();
 
-    let (stdout, _stderr, success) =
-        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "node-proj"]);
+    let (stdout, _stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "node-proj"],
+    );
     assert!(success, "init should succeed");
     assert!(stdout.contains("Auto-shared 2 key file(s)"));
 
@@ -836,8 +850,7 @@ fn test_auto_share_skipped_when_json_exists() {
     )
     .unwrap();
 
-    let (stdout, _stderr, success) =
-        run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
     assert!(success, "init should succeed");
     // Should NOT auto-share when .ai-workspace.json exists
     assert!(!stdout.contains("Auto-shared"));

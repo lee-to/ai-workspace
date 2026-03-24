@@ -74,10 +74,22 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().unwrap();
 
     // Create file structure
-    std::fs::write(project_dir.path().join("main.rs"), "fn main() {\n    println!(\"hello\");\n}\n").unwrap();
+    std::fs::write(
+        project_dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"hello\");\n}\n",
+    )
+    .unwrap();
     std::fs::create_dir(project_dir.path().join("src")).unwrap();
-    std::fs::write(project_dir.path().join("src/lib.rs"), "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n").unwrap();
-    std::fs::write(project_dir.path().join("src/utils.rs"), "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n").unwrap();
+    std::fs::write(
+        project_dir.path().join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 {\n    a + b\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("src/utils.rs"),
+        "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n",
+    )
+    .unwrap();
 
     // Init project via CLI
     Command::new(binary_path())
@@ -409,7 +421,9 @@ fn test_mcp_workspace_read_path_traversal_attack() {
     let result = &responses[0]["result"];
     let text = result["content"][0]["text"].as_str().unwrap();
     // Should be denied or fail to resolve
-    assert!(text.contains("denied") || text.contains("Cannot resolve") || result["isError"] == true);
+    assert!(
+        text.contains("denied") || text.contains("Cannot resolve") || result["isError"] == true
+    );
 }
 
 #[test]

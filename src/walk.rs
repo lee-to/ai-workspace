@@ -45,7 +45,11 @@ fn is_binary(path: &Path) -> bool {
 /// If `subpath` is provided, only entries under that subdirectory are returned.
 /// If `max_depth` is provided, limits traversal depth (1 = immediate children only).
 /// Paths in the result are relative to `root`.
-pub fn walk_project_tree(root: &Path, subpath: Option<&str>, max_depth: Option<usize>) -> Vec<FileEntry> {
+pub fn walk_project_tree(
+    root: &Path,
+    subpath: Option<&str>,
+    max_depth: Option<usize>,
+) -> Vec<FileEntry> {
     let walk_root = match subpath {
         Some(sub) => root.join(sub),
         None => root.to_path_buf(),
@@ -147,7 +151,11 @@ pub fn grep_project(
             .add("custom", glob)
             .map_err(|e| format!("Invalid glob pattern: {}", e))?;
         types_builder.select("custom");
-        Some(types_builder.build().map_err(|e| format!("Glob build error: {}", e))?)
+        Some(
+            types_builder
+                .build()
+                .map_err(|e| format!("Glob build error: {}", e))?,
+        )
     } else {
         None
     };

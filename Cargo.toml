@@ -1,6 +1,6 @@
 [package]
 name = "ai-workspace"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Danil Shutsky <thecutcode@gmail.com>"]
 description = "Cross-project shared context for AI coding agents via CLI and MCP server"

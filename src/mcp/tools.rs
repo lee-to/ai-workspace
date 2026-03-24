@@ -26,15 +26,16 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
         "workspace_read" => {
             let item_id = arguments.get("item_id").and_then(|v| v.as_i64());
             let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
-            let path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let path = arguments
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
 
             // Error if both item_id and project_id+path provided
             if item_id.is_some() && (project_id.is_some() || path.is_some()) {
                 return JsonRpcResponse::error(
                     id,
-                    McpError::invalid_params(
-                        "Provide either item_id OR project_id+path, not both",
-                    ),
+                    McpError::invalid_params("Provide either item_id OR project_id+path, not both"),
                 );
             }
 
@@ -96,8 +97,14 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                     );
                 }
             };
-            let path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
-            let max_depth = arguments.get("max_depth").and_then(|v| v.as_u64()).map(|d| d as usize);
+            let path = arguments
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let max_depth = arguments
+                .get("max_depth")
+                .and_then(|v| v.as_u64())
+                .map(|d| d as usize);
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
@@ -123,7 +130,10 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                     );
                 }
             };
-            let glob = arguments.get("glob").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let glob = arguments
+                .get("glob")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
@@ -524,10 +534,7 @@ fn project_grep(
     let matches = match walk::grep_project(&canonical_root, pattern, glob) {
         Ok(m) => m,
         Err(e) => {
-            return JsonRpcResponse::error(
-                id,
-                McpError::invalid_params(&e),
-            );
+            return JsonRpcResponse::error(id, McpError::invalid_params(&e));
         }
     };
 

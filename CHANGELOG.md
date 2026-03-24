@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-03-24
+
+### Added
+
+- **`update` command** — self-update binary from GitHub Releases. Downloads the appropriate binary for the current platform and replaces the running executable in place. No Rust or Cargo required.
+- **`destroy` command** — remove the current project from ai-workspace entirely (shared items, group memberships, notes). Files on disk are not affected.
+
+### Changed
+
+- `init` no longer renames a project when re-run without `--name`. The project name is only updated when `--name` is explicitly provided.
+
 ## [0.2.0] - 2026-03-24
 
 ### Added

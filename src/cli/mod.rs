@@ -272,12 +272,12 @@ const AUTO_SHARE_FILES: &[&str] = &[
 const AUTO_SHARE_PREFIXES: &[&str] = &["README"];
 
 /// Auto-share key project files on init. Returns the count of files shared.
-fn auto_share_key_files(
-    db: &Db,
-    project_id: i64,
-    project_dir: &Path,
-) -> Result<usize> {
-    debug!("auto_share_key_files: project_id={}, dir={}", project_id, project_dir.display());
+fn auto_share_key_files(db: &Db, project_id: i64, project_dir: &Path) -> Result<usize> {
+    debug!(
+        "auto_share_key_files: project_id={}, dir={}",
+        project_id,
+        project_dir.display()
+    );
 
     // Get already-shared paths to avoid duplicates
     let existing_items = db.get_shared_items_for_project(project_id)?;
