@@ -97,11 +97,12 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 }
             };
             let path = arguments.get("path").and_then(|v| v.as_str()).map(|s| s.to_string());
+            let max_depth = arguments.get("max_depth").and_then(|v| v.as_u64()).map(|d| d as usize);
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            project_tree(id, project_id, path.as_deref(), &db)
+            project_tree(id, project_id, path.as_deref(), max_depth, &db)
         }
         "project_grep" => {
             let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
@@ -476,11 +477,12 @@ fn project_tree(
     id: serde_json::Value,
     project_id: i64,
     path: Option<&str>,
+    max_depth: Option<usize>,
     db: &Db,
 ) -> JsonRpcResponse {
     info!(
-        "project_tree: project_id={}, path={:?}",
-        project_id, path
+        "project_tree: project_id={}, path={:?}, max_depth={:?}",
+        project_id, path, max_depth
     );
 
     let (canonical_root, _target) = match resolve_project_path(project_id, path, db) {
@@ -488,7 +490,7 @@ fn project_tree(
         Err(e) => return tool_error(id, &e),
     };
 
-    let entries = walk::walk_project_tree(&canonical_root, path);
+    let entries = walk::walk_project_tree(&canonical_root, path, max_depth);
 
     // Format as indented tree
     let mut lines = Vec::new();

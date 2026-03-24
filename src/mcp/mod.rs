@@ -163,6 +163,10 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                             "path": {
                                 "type": "string",
                                 "description": "Optional subdirectory to list (relative to project root)"
+                            },
+                            "max_depth": {
+                                "type": "integer",
+                                "description": "Maximum traversal depth (1 = immediate children only, default: unlimited)"
                             }
                         },
                         "required": ["project_id"]

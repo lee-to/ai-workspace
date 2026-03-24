@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.0] - 2026-03-24
+
+### Added
+
+- **`project_tree` MCP tool** — browse a project's file tree respecting `.gitignore`. Supports `path` (subdirectory) and `max_depth` parameters to control output scope.
+- **`project_grep` MCP tool** — regex search across project files respecting `.gitignore`. Supports `glob` filter, returns up to 100 matches grouped by file. Skips binary files and files > 1 MB.
+- **`workspace_read` by path** — read any file in a registered project via `project_id` + `path`, without pre-sharing it. Mutually exclusive with existing `item_id` mode.
+- **Auto-share on init** — `ai-workspace init` automatically detects and shares key project files (`README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`). Skipped when `.ai-workspace.json` exists. No duplicates on re-init.
+
+### Changed
+
+- `rusqlite` upgraded from 0.32 to 0.39.
+
 ## [0.1.0] - 2025-03-17
 
 ### Added

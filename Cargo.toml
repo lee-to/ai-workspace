@@ -1,6 +1,6 @@
 [package]
 name = "ai-workspace"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 authors = ["Danil Shutsky <thecutcode@gmail.com>"]
 description = "Cross-project shared context for AI coding agents via CLI and MCP server"
@@ -17,7 +17,7 @@ path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 env_logger = "0.11"

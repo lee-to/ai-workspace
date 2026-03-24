@@ -104,6 +104,7 @@ List the file tree of a project, respecting `.gitignore` rules.
 |------|------|----------|-------------|
 | `project_id` | integer | yes | The project ID |
 | `path` | string | no | Subdirectory to list (relative to project root) |
+| `max_depth` | integer | no | Maximum traversal depth (1 = immediate children only, default: unlimited) |
 
 **Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.
 

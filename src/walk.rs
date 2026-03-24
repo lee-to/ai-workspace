@@ -43,8 +43,9 @@ fn is_binary(path: &Path) -> bool {
 /// Walk the project file tree, respecting .gitignore rules.
 ///
 /// If `subpath` is provided, only entries under that subdirectory are returned.
+/// If `max_depth` is provided, limits traversal depth (1 = immediate children only).
 /// Paths in the result are relative to `root`.
-pub fn walk_project_tree(root: &Path, subpath: Option<&str>) -> Vec<FileEntry> {
+pub fn walk_project_tree(root: &Path, subpath: Option<&str>, max_depth: Option<usize>) -> Vec<FileEntry> {
     let walk_root = match subpath {
         Some(sub) => root.join(sub),
         None => root.to_path_buf(),
@@ -61,13 +62,19 @@ pub fn walk_project_tree(root: &Path, subpath: Option<&str>) -> Vec<FileEntry> {
         return Vec::new();
     }
 
-    let walker = ignore::WalkBuilder::new(&walk_root)
+    let mut builder = ignore::WalkBuilder::new(&walk_root);
+    builder
         .hidden(false)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
-        .sort_by_file_name(|a, b| a.cmp(b))
-        .build();
+        .sort_by_file_name(|a, b| a.cmp(b));
+
+    if let Some(depth) = max_depth {
+        builder.max_depth(Some(depth));
+    }
+
+    let walker = builder.build();
 
     let mut entries = Vec::new();
     for result in walker {
