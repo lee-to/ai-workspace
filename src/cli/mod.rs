@@ -252,6 +252,73 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     println!("{}", style_table_border(&border));
 }
 
+/// Key files to auto-share on init (when no .ai-workspace.json exists).
+const AUTO_SHARE_FILES: &[&str] = &[
+    "Cargo.toml",
+    "package.json",
+    "go.mod",
+    "pyproject.toml",
+    "composer.json",
+    "Makefile",
+    "Taskfile.yml",
+    "Justfile",
+];
+
+/// Prefixes for key files that may have varying names (e.g. README.md, README.txt).
+const AUTO_SHARE_PREFIXES: &[&str] = &["README"];
+
+/// Auto-share key project files on init. Returns the count of files shared.
+fn auto_share_key_files(
+    db: &Db,
+    project_id: i64,
+    project_dir: &Path,
+) -> Result<usize> {
+    debug!("auto_share_key_files: project_id={}, dir={}", project_id, project_dir.display());
+
+    // Get already-shared paths to avoid duplicates
+    let existing_items = db.get_shared_items_for_project(project_id)?;
+    let existing_paths: HashSet<String> = existing_items
+        .iter()
+        .filter_map(|i| i.path.clone())
+        .collect();
+
+    let mut count = 0;
+
+    // Check exact-name files
+    for &filename in AUTO_SHARE_FILES {
+        if existing_paths.contains(filename) {
+            debug!("auto_share: skipping already shared {}", filename);
+            continue;
+        }
+        let full = project_dir.join(filename);
+        if full.exists() && full.is_file() {
+            info!("auto_share: sharing {}", filename);
+            db.share_file(project_id, filename, None)?;
+            count += 1;
+        }
+    }
+
+    // Check prefix-matched files (e.g. README*)
+    if let Ok(entries) = std::fs::read_dir(project_dir) {
+        for entry in entries.filter_map(|e| e.ok()) {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !entry.path().is_file() {
+                continue;
+            }
+            for &prefix in AUTO_SHARE_PREFIXES {
+                if name.starts_with(prefix) && !existing_paths.contains(&name) {
+                    info!("auto_share: sharing {}", name);
+                    db.share_file(project_id, &name, None)?;
+                    count += 1;
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(count)
+}
+
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Serve => crate::mcp::serve(),
@@ -314,6 +381,14 @@ pub fn run(cmd: Command) -> Result<()> {
                 let group_id = db.get_or_create_group(&group_name)?;
                 db.add_project_to_group(project_id, group_id)?;
                 print_success(format!("Joined group '{}'", group_name));
+            }
+
+            // Auto-share key files when NO .ai-workspace.json exists
+            if config.is_none() {
+                let auto_shared = auto_share_key_files(&db, project_id, &cwd)?;
+                if auto_shared > 0 {
+                    print_success(format!("Auto-shared {} key file(s)", auto_shared));
+                }
             }
 
             // Sync from config if present
