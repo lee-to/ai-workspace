@@ -84,6 +84,8 @@ ai-workspace init --group backend
 
 Both projects now belong to the `backend` group.
 
+Key project files (`README*`, `Cargo.toml`, `package.json`, `go.mod`, etc.) are automatically shared on first `init` — no manual `share` needed for common files. This auto-share is skipped when `.ai-workspace.json` is present.
+
 ### 2. Share files
 
 ```bash
@@ -128,6 +130,8 @@ ai-workspace serve
 ```
 
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
+
+The server exposes 7 tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first.
 
 ## Data Storage
 
