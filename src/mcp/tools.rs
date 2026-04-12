@@ -140,6 +140,27 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             };
             project_grep(id, project_id, &pattern, glob.as_deref(), &db)
         }
+        "workspace_search_fulltext" => {
+            let query = match arguments.get("query").and_then(|v| v.as_str()) {
+                Some(q) => q.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: query"),
+                    );
+                }
+            };
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|l| l as usize)
+                .unwrap_or(20);
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            workspace_search_fulltext(id, &query, limit, &db)
+        }
         _ => {
             error!("Unknown tool: {}", tool_name);
             JsonRpcResponse::error(
@@ -419,6 +440,40 @@ fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcRespo
             tool_result(id, text)
         }
         Err(e) => tool_error(id, &format!("Search error: {}", e)),
+    }
+}
+
+fn workspace_search_fulltext(
+    id: serde_json::Value,
+    query: &str,
+    limit: usize,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!("workspace_search_fulltext: query='{}' limit={}", query, limit);
+
+    // Bounded lazy refresh so on-disk edits are reflected.
+    if let Err(e) = crate::indexer::refresh_stale(db, 200) {
+        log::warn!("refresh_stale failed: {}", e);
+    }
+
+    match db.search_files(query, limit) {
+        Ok(hits) => {
+            let results: Vec<_> = hits
+                .iter()
+                .map(|h| {
+                    serde_json::json!({
+                        "shared_item_id": h.shared_item_id,
+                        "project_id": h.project_id,
+                        "path": h.path,
+                        "snippet": h.snippet,
+                        "rank": h.rank,
+                    })
+                })
+                .collect();
+            let text = serde_json::to_string_pretty(&results).unwrap_or_default();
+            tool_result(id, text)
+        }
+        Err(e) => tool_error(id, &format!("Fulltext search error: {}", e)),
     }
 }
 

@@ -193,6 +193,24 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         },
                         "required": ["project_id", "pattern"]
                     }
+                },
+                {
+                    "name": "workspace_search_fulltext",
+                    "description": "Full-text search over indexed shared .md files (SQLite FTS5, bm25-ranked, unicode61 tokenizer)",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "query": {
+                                "type": "string",
+                                "description": "FTS5 query (supports phrase \"...\" and AND/OR/NOT)"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "description": "Max number of results (default: 20)"
+                            }
+                        },
+                        "required": ["query"]
+                    }
                 }
             ]
         }),
@@ -224,11 +242,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_seven_tools() {
+    fn handle_tools_list_returns_eight_tools() {
         let resp = handle_tools_list(json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 7);
+        assert_eq!(tools.len(), 8);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
         assert!(names.contains(&"workspace_read"));
@@ -237,6 +255,7 @@ mod tests {
         assert!(names.contains(&"list_projects"));
         assert!(names.contains(&"project_tree"));
         assert!(names.contains(&"project_grep"));
+        assert!(names.contains(&"workspace_search_fulltext"));
     }
 
     #[test]
