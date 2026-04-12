@@ -75,6 +75,17 @@ pub struct SharedItem {
     pub updated_at: String,
 }
 
+/// A single hit from FTS5 search over indexed files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileSearchHit {
+    pub shared_item_id: i64,
+    pub project_id: i64,
+    pub path: String,
+    pub snippet: String,
+    /// bm25 score — lower is better (SQLite FTS5 convention).
+    pub rank: f64,
+}
+
 // --- Workspace Config (for .ai-workspace.json) ---
 
 /// A shared item entry in the config file.

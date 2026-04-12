@@ -7,7 +7,8 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::models::{
-    Group, NoteEntry, Project, ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig,
+    FileSearchHit, Group, NoteEntry, Project, ShareEntry, SharedItem, SharedItemKind, SyncReport,
+    WorkspaceConfig,
 };
 
 pub enum ScopeChange {
@@ -1037,6 +1038,137 @@ impl Db {
         info!("Sync complete: {} stale entries removed", removed.len());
         Ok(removed)
     }
+
+    // --- Files FTS index ---
+
+    /// UPSERT a file into the FTS index and update its meta row.
+    /// `rel_path` is the project-relative path (used as the indexed `path` column).
+    /// `abs_path` is the resolved absolute path (persisted in meta for stat-based refresh).
+    pub fn index_file(
+        &self,
+        shared_item_id: i64,
+        rel_path: &str,
+        abs_path: &str,
+        content: &str,
+        mtime: i64,
+        size: i64,
+    ) -> Result<()> {
+        debug!(
+            "index_file: id={} path={} size={} mtime={}",
+            shared_item_id, rel_path, size, mtime
+        );
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = ?1",
+            params![shared_item_id],
+        )?;
+        self.conn.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![shared_item_id, rel_path, content],
+        )?;
+        self.conn.execute(
+            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size, indexed_at) \
+             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+             ON CONFLICT(shared_item_id) DO UPDATE SET \
+                abs_path = excluded.abs_path, \
+                mtime = excluded.mtime, \
+                size = excluded.size, \
+                indexed_at = excluded.indexed_at",
+            params![shared_item_id, abs_path, mtime, size],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a file from the FTS index (and its meta row).
+    pub fn delete_file_index(&self, shared_item_id: i64) -> Result<()> {
+        debug!("delete_file_index: id={}", shared_item_id);
+        self.conn.execute(
+            "DELETE FROM files_fts WHERE rowid = ?1",
+            params![shared_item_id],
+        )?;
+        self.conn.execute(
+            "DELETE FROM files_fts_meta WHERE shared_item_id = ?1",
+            params![shared_item_id],
+        )?;
+        Ok(())
+    }
+
+    /// Get (abs_path, mtime, size) of an indexed file, if present.
+    #[allow(dead_code)]
+    pub fn get_file_index_meta(
+        &self,
+        shared_item_id: i64,
+    ) -> Result<Option<(String, i64, i64)>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT abs_path, mtime, size FROM files_fts_meta WHERE shared_item_id = ?1",
+                params![shared_item_id],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, i64>(1)?,
+                        r.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    /// List all indexed files (for reindex / refresh passes).
+    /// Returns (shared_item_id, abs_path, mtime, size).
+    pub fn list_file_index_meta(&self) -> Result<Vec<(i64, String, i64, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT shared_item_id, abs_path, mtime, size FROM files_fts_meta",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+            ))
+        })?;
+        let out = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
+    pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
+        debug!("search_files: query='{}' limit={}", query, limit);
+        let mut stmt = self.conn.prepare(
+            "SELECT f.rowid, \
+                    s.project_id, \
+                    f.path, \
+                    snippet(files_fts, 1, '[', ']', '…', 12), \
+                    bm25(files_fts) \
+             FROM files_fts f \
+             JOIN shared_items s ON s.id = f.rowid \
+             WHERE files_fts MATCH ?1 \
+             ORDER BY bm25(files_fts) \
+             LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![query, limit as i64], |r| {
+            Ok(FileSearchHit {
+                shared_item_id: r.get(0)?,
+                project_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                path: r.get(2)?,
+                snippet: r.get(3)?,
+                rank: r.get(4)?,
+            })
+        })?;
+        let hits: Vec<FileSearchHit> = rows
+            .filter_map(|r| match r {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    warn!("search_files row error: {}", e);
+                    None
+                }
+            })
+            .collect();
+        debug!("search_files: {} hits", hits.len());
+        Ok(hits)
+    }
 }
 
 #[cfg(test)]
@@ -1945,5 +2077,68 @@ mod tests {
         assert_eq!(r2.notes_added, 0);
         assert_eq!(r2.notes_removed, 0);
         assert_eq!(r2.notes_updated, 0);
+    }
+
+    // --- Files FTS ---
+
+    #[test]
+    fn index_and_search_file() {
+        let db = test_db();
+        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let id = db.share_file(pid, "doc.md", None).unwrap();
+        db.index_file(id, "doc.md", "/tmp/p/doc.md", "hello rustaceans world", 100, 22)
+            .unwrap();
+
+        let hits = db.search_files("rustaceans", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].shared_item_id, id);
+        assert_eq!(hits[0].path, "doc.md");
+        assert!(hits[0].snippet.contains("["));
+    }
+
+    #[test]
+    fn index_file_upsert_replaces_content() {
+        let db = test_db();
+        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let id = db.share_file(pid, "a.md", None).unwrap();
+        db.index_file(id, "a.md", "/tmp/p/a.md", "alpha", 1, 5).unwrap();
+        db.index_file(id, "a.md", "/tmp/p/a.md", "bravo", 2, 5).unwrap();
+
+        let hits = db.search_files("bravo", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        let hits_old = db.search_files("alpha", 10).unwrap();
+        assert!(hits_old.is_empty(), "old content should be gone");
+
+        let meta = db.get_file_index_meta(id).unwrap().unwrap();
+        assert_eq!(meta.1, 2);
+    }
+
+    #[test]
+    fn delete_file_index_removes_rows() {
+        let db = test_db();
+        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let id = db.share_file(pid, "x.md", None).unwrap();
+        db.index_file(id, "x.md", "/tmp/p/x.md", "lorem ipsum", 1, 11).unwrap();
+        db.delete_file_index(id).unwrap();
+        assert!(db.search_files("lorem", 10).unwrap().is_empty());
+        assert!(db.get_file_index_meta(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn search_cyrillic() {
+        let db = test_db();
+        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let id = db.share_file(pid, "ru.md", None).unwrap();
+        db.index_file(
+            id,
+            "ru.md",
+            "/tmp/p/ru.md",
+            "привет мир полнотекстовый поиск",
+            1,
+            40,
+        )
+        .unwrap();
+        let hits = db.search_files("полнотекстовый", 10).unwrap();
+        assert_eq!(hits.len(), 1);
     }
 }
