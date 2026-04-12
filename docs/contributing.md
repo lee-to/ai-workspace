@@ -1,4 +1,6 @@
-# Contributing to AI Workspace
+[← MCP Server](mcp-server.md) · [Back to README](../README.md)
+
+# Contributing
 
 Thank you for your interest in contributing! Here's how you can help.
 
@@ -55,3 +57,8 @@ Open an issue at [github.com/lee-to/ai-workspace/issues](https://github.com/lee-
 ## License
 
 By contributing, you agree that your contributions will be licensed under the MIT License.
+
+## See Also
+
+- [Getting Started](getting-started.md) — Installation and setup
+- [CLI Reference](cli.md) — Commands available for local development

@@ -23,6 +23,8 @@ Commands that work from any directory (no project required):
 - `list`
 - `delete-group`
 - `sync`
+- `search`
+- `reindex`
 - `serve`
 - `update`
 
@@ -199,6 +201,46 @@ ai-workspace sync
 Two-step process:
 1. Remove stale file/dir entries whose paths no longer exist on disk
 2. If the current directory is inside a project and `.ai-workspace.json` exists, sync the database to match the config (add missing groups/shares/notes, remove extras, update changed notes)
+
+### `search`
+
+Full-text search over shared `.md` files. Uses SQLite FTS5 with the `unicode61 remove_diacritics 2` tokenizer, ranked by bm25.
+
+```bash
+ai-workspace search <query> [--limit <n>]
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `<query>` | — | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
+| `-l, --limit` | `20` | Maximum number of results |
+
+**Output:** Each hit shows path, shared item id, bm25 rank (lower = better), and a snippet with matched terms wrapped in `[...]`.
+
+**Query examples:**
+- `deploy` — files containing "deploy"
+- `"release checklist"` — exact phrase
+- `deploy AND staging` — both terms
+- `deploy NOT legacy` — "deploy" but not "legacy"
+
+**Index coverage:**
+- Only `.md` files are indexed.
+- Files larger than 1 MB or with invalid UTF-8 are skipped.
+- Indexing happens automatically on `share` and when `init` auto-shares files.
+- Before each search, files whose mtime has changed on disk are lazily refreshed (bounded to 200 per call).
+- Russian/English text is supported at the normalization level, but there is no stemming.
+
+For existing databases created before FTS was added, run `reindex` once to populate the index.
+
+### `reindex`
+
+Rebuild the full-text index for all shared `.md` files across every project.
+
+```bash
+ai-workspace reindex
+```
+
+Walks every shared file and every `.md` inside every shared directory, re-reads content from disk, and rewrites the FTS index. Prints counts for indexed, skipped (size), skipped (non-UTF-8), and missing files. Does not require being inside a project directory.
 
 ### `serve`
 
