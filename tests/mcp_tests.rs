@@ -333,7 +333,7 @@ fn test_mcp_project_tree_subpath() {
             "method": "tools/call",
             "params": {
                 "name": "project_tree",
-                "arguments": { "project_id": 1, "path": "src" }
+                "arguments": { "project_id": 1, "subdir": "src" }
             }
         })],
     );
@@ -387,7 +387,7 @@ fn test_mcp_workspace_read_by_path() {
             "method": "tools/call",
             "params": {
                 "name": "workspace_read",
-                "arguments": { "project_id": 1, "path": "src/lib.rs" }
+                "arguments": { "project_id": 1, "rel_path": "src/lib.rs" }
             }
         })],
     );
@@ -412,7 +412,7 @@ fn test_mcp_workspace_read_path_traversal_attack() {
             "method": "tools/call",
             "params": {
                 "name": "workspace_read",
-                "arguments": { "project_id": 1, "path": "../../etc/passwd" }
+                "arguments": { "project_id": 1, "rel_path": "../../etc/passwd" }
             }
         })],
     );
@@ -439,7 +439,7 @@ fn test_mcp_workspace_read_missing_file() {
             "method": "tools/call",
             "params": {
                 "name": "workspace_read",
-                "arguments": { "project_id": 1, "path": "nonexistent.txt" }
+                "arguments": { "project_id": 1, "rel_path": "nonexistent.txt" }
             }
         })],
     );
@@ -488,7 +488,7 @@ fn test_mcp_workspace_read_both_params_error() {
             "method": "tools/call",
             "params": {
                 "name": "workspace_read",
-                "arguments": { "item_id": 1, "project_id": 1, "path": "readme.md" }
+                "arguments": { "item_id": 1, "project_id": 1, "rel_path": "readme.md" }
             }
         })],
     );

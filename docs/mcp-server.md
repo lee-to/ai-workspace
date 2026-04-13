@@ -61,11 +61,11 @@ Read the content of a shared file, directory, or note. Supports two modes: by sh
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`path`) |
-| `project_id` | integer | — | Project ID to read from (use with `path`) |
-| `path` | string | — | Relative path within the project (use with `project_id`) |
+| `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`rel_path`) |
+| `project_id` | integer | — | Project ID to read from (use with `rel_path`) |
+| `rel_path` | string | — | Relative path within the project (use with `project_id`) |
 
-Provide **either** `item_id` **or** `project_id`+`path`, not both. Passing both returns an `invalid_params` error.
+Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing both returns an `invalid_params` error.
 
 **Behavior:**
 - **File:** returns file content as text (max 10 MB)
@@ -131,7 +131,7 @@ List the file tree of a project, respecting `.gitignore` rules.
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `project_id` | integer | yes | The project ID |
-| `path` | string | no | Subdirectory to list (relative to project root) |
+| `subdir` | string | no | Subdirectory to list (relative to project root) |
 | `max_depth` | integer | no | Maximum traversal depth (1 = immediate children only, default: unlimited) |
 
 **Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.

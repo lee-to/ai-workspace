@@ -94,7 +94,8 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
-                        "required": []
+                        "required": [],
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -105,17 +106,25 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "properties": {
                             "item_id": {
                                 "type": "integer",
+                                "minimum": 1,
                                 "description": "The shared item ID to read (mutually exclusive with project_id+path)"
                             },
                             "project_id": {
                                 "type": "integer",
+                                "minimum": 1,
                                 "description": "Project ID to read from (use with path)"
                             },
-                            "path": {
+                            "rel_path": {
                                 "type": "string",
-                                "description": "Relative path within the project (use with project_id)"
+                                "minLength": 1,
+                                "description": "Relative file location within the project (use with project_id)"
                             }
-                        }
+                        },
+                        "additionalProperties": false,
+                        "oneOf": [
+                            {"required": ["item_id"]},
+                            {"required": ["project_id", "rel_path"]}
+                        ]
                     }
                 },
                 {
@@ -158,18 +167,22 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "properties": {
                             "project_id": {
                                 "type": "integer",
+                                "minimum": 1,
                                 "description": "The project ID"
                             },
-                            "path": {
+                            "subdir": {
                                 "type": "string",
+                                "minLength": 1,
                                 "description": "Optional subdirectory to list (relative to project root)"
                             },
                             "max_depth": {
                                 "type": "integer",
+                                "minimum": 1,
                                 "description": "Maximum traversal depth (1 = immediate children only, default: unlimited)"
                             }
                         },
-                        "required": ["project_id"]
+                        "required": ["project_id"],
+                        "additionalProperties": false
                     }
                 },
                 {

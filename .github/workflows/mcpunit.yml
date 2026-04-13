@@ -1,0 +1,30 @@
+name: MCP Unit
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  mcpunit:
+    name: MCP Unit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --locked
+      - uses: lee-to/mcpunit@v1.0.0
+        with:
+          cmd: ./target/release/ai-workspace serve
+          min-score: "80"
+          upload-sarif: "true"

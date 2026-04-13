@@ -27,15 +27,17 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             let item_id = arguments.get("item_id").and_then(|v| v.as_i64());
             let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
             let path = arguments
-                .get("path")
+                .get("rel_path")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
 
-            // Error if both item_id and project_id+path provided
+            // Error if both item_id and project_id+rel_path provided
             if item_id.is_some() && (project_id.is_some() || path.is_some()) {
                 return JsonRpcResponse::error(
                     id,
-                    McpError::invalid_params("Provide either item_id OR project_id+path, not both"),
+                    McpError::invalid_params(
+                        "Provide either item_id OR project_id+rel_path, not both",
+                    ),
                 );
             }
 
@@ -52,7 +54,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 JsonRpcResponse::error(
                     id,
                     McpError::invalid_params(
-                        "Missing required parameters: provide item_id OR project_id+path",
+                        "Missing required parameters: provide item_id OR project_id+rel_path",
                     ),
                 )
             }
@@ -98,7 +100,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 }
             };
             let path = arguments
-                .get("path")
+                .get("subdir")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
             let max_depth = arguments
@@ -688,7 +690,7 @@ mod tests {
     fn handle_tool_call_workspace_read_both_params_error() {
         let resp = handle_tool_call(
             json!(1),
-            json!({"name": "workspace_read", "arguments": {"item_id": 1, "project_id": 1, "path": "foo"}}),
+            json!({"name": "workspace_read", "arguments": {"item_id": 1, "project_id": 1, "rel_path": "foo"}}),
         );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32602);
