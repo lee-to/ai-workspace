@@ -1,5 +1,6 @@
 mod cli;
 mod db;
+mod indexer;
 mod mcp;
 mod models;
 mod walk;

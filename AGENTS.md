@@ -22,6 +22,7 @@ ai-workspace/
 │   ├── main.rs             # Entry point, clap App definition
 │   ├── models.rs           # Data models (Project, Group, SharedItem, SharedItemKind)
 │   ├── walk.rs             # File tree walker and grep (ignore + regex crates)
+│   ├── indexer.rs          # FTS5 indexer for shared .md files (mtime refresh, reindex)
 │   ├── cli/
 │   │   └── mod.rs          # CLI subcommands and handlers
 │   ├── db/
@@ -31,9 +32,10 @@ ai-workspace/
 │   └── mcp/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
 │       ├── protocol.rs     # JSON-RPC types (request, response, error)
-│       └── tools.rs        # MCP tool implementations (workspace_context, read, search, project_tree, project_grep)
+│       └── tools.rs        # MCP tool implementations (workspace_context, read, search, search_fulltext, project_tree, project_grep)
 ├── tests/
 │   ├── cli_tests.rs        # CLI integration tests
+│   ├── fts_search.rs       # FTS5 fulltext search integration tests
 │   └── mcp_tests.rs        # MCP protocol integration tests
 └── .ai-factory/
     └── DESCRIPTION.md      # Project specification and tech stack
@@ -56,6 +58,7 @@ ai-workspace/
 | Getting Started | docs/getting-started.md | Installation, setup, first steps |
 | CLI Reference | docs/cli.md | All commands and options |
 | MCP Server | docs/mcp-server.md | MCP tools and integration |
+| Contributing | docs/contributing.md | Development setup, testing, pull requests |
 
 ## AI Context Files
 | File | Purpose |

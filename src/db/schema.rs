@@ -52,10 +52,31 @@ pub fn init_db(conn: &Connection) -> Result<()> {
 
         CREATE VIRTUAL TABLE IF NOT EXISTS notes_fts USING fts5(label, content);
 
+        CREATE VIRTUAL TABLE IF NOT EXISTS files_fts USING fts5(
+            path,
+            content,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE TABLE IF NOT EXISTS files_fts_meta (
+            shared_item_id INTEGER PRIMARY KEY REFERENCES shared_items(id) ON DELETE CASCADE,
+            abs_path TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_items_project_path
         ON shared_items (project_id, path) WHERE path IS NOT NULL;
+
+        CREATE TRIGGER IF NOT EXISTS trg_shared_items_delete_fts
+        AFTER DELETE ON shared_items
+        BEGIN
+            DELETE FROM files_fts WHERE rowid = OLD.id;
+        END;
         ",
     )?;
+    debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
 
     info!("Database schema initialized");
     Ok(())
@@ -84,6 +105,26 @@ mod tests {
         assert!(tables.contains(&"groups".to_string()));
         assert!(tables.contains(&"project_groups".to_string()));
         assert!(tables.contains(&"shared_items".to_string()));
+        assert!(tables.contains(&"files_fts_meta".to_string()));
+    }
+
+    #[test]
+    fn files_fts_virtual_table_created() {
+        let conn = mem_conn();
+        // Should be able to insert into files_fts without error
+        conn.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (1, 'a.md', 'hello world')",
+            [],
+        )
+        .unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH 'hello'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[test]

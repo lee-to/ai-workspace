@@ -104,6 +104,16 @@ pub enum Command {
     Serve,
     /// Update ai-workspace to the latest version
     Update,
+    /// Full-text search across indexed .md files
+    Search {
+        /// FTS5 query (supports phrase "..." and operators AND/OR/NOT)
+        query: String,
+        /// Max number of results
+        #[arg(short, long, default_value = "20")]
+        limit: usize,
+    },
+    /// Rebuild the full-text index for all shared .md files
+    Reindex,
 }
 
 /// Resolve the current project from cwd
@@ -441,13 +451,29 @@ pub fn run(cmd: Command) -> Result<()> {
                 bail!("Path is outside project directory");
             }
 
-            if canonical.is_dir() {
+            let share_id = if canonical.is_dir() {
                 info!("Sharing directory: {}", path);
                 let id = db.share_dir(project.id, &path, label.as_deref())?;
                 print_success(format!("Shared dir '{}' (id={})", path, id));
+                id
             } else {
                 let id = db.share_file(project.id, &path, label.as_deref())?;
                 print_success(format!("Shared '{}' (id={})", path, id));
+                id
+            };
+
+            // Index markdown content so it becomes searchable immediately.
+            if let Some(item) = db.get_item_by_id(share_id)? {
+                let project_root = Path::new(&project.path);
+                match crate::indexer::index_shared_item(&db, &item, project_root) {
+                    Ok(stats) if stats.indexed > 0 => {
+                        print_info(format!("Indexed {} .md file(s) for search", stats.indexed));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        log::warn!("FTS indexing failed for id={}: {}", share_id, e);
+                    }
+                }
             }
 
             update_workspace_json_if_exists(&db, &project)?;
@@ -916,6 +942,48 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
             }
 
+            Ok(())
+        }
+
+        Command::Search { query, limit } => {
+            let db = Db::open_default()?;
+            info!("CLI search: query='{}' limit={}", query, limit);
+
+            // Best-effort lazy refresh so on-disk edits surface in results.
+            let refreshed = crate::indexer::refresh_stale(&db, 200).unwrap_or_else(|e| {
+                log::warn!("refresh_stale failed: {}", e);
+                0
+            });
+            if refreshed > 0 {
+                debug!("Refreshed {} stale files before search", refreshed);
+            }
+
+            let hits = db.search_files(&query, limit)?;
+            if hits.is_empty() {
+                print_info(format!("No matches for '{}'", query));
+                return Ok(());
+            }
+            for hit in &hits {
+                println!(
+                    "{}  [id={} rank={:.3}]\n  {}\n",
+                    style_ok(&hit.path),
+                    hit.shared_item_id,
+                    hit.rank,
+                    hit.snippet.trim()
+                );
+            }
+            print_info(format!("{} result(s)", hits.len()));
+            Ok(())
+        }
+
+        Command::Reindex => {
+            let db = Db::open_default()?;
+            info!("CLI reindex: starting");
+            let stats = crate::indexer::reindex_all(&db)?;
+            print_success(format!(
+                "Reindex complete: {} files indexed, {} skipped (size), {} skipped (non-utf8), {} missing",
+                stats.indexed, stats.skipped_size, stats.skipped_non_utf8, stats.skipped_missing
+            ));
             Ok(())
         }
     }

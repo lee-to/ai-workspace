@@ -1,4 +1,4 @@
-[← CLI Reference](cli.md) · [Back to README](../README.md)
+[← CLI Reference](cli.md) · [Back to README](../README.md) · [Contributing →](contributing.md)
 
 # MCP Server
 
@@ -75,7 +75,7 @@ Provide **either** `item_id` **or** `project_id`+`path`, not both. Passing both 
 
 ### `workspace_search`
 
-Full-text search over shared notes.
+Full-text search over shared **notes** (not files — use `workspace_search_fulltext` for `.md` file contents).
 
 **Parameters:**
 
@@ -93,6 +93,34 @@ Full-text search over shared notes.
 - `deploy` — notes containing "deploy"
 - `staging environment` — notes containing both terms
 - `release checklist` — notes containing both terms
+
+### `workspace_search_fulltext`
+
+Full-text search over shared `.md` **files** (including `.md` files inside shared directories). Uses SQLite FTS5 with the `unicode61 remove_diacritics 2` tokenizer, ranked by bm25.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `query` | string | yes | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
+| `limit` | integer | no | Maximum number of results (default: 20) |
+
+**Returns:** JSON array of hits, each with:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `shared_item_id` | integer | Shared item row id (use with `workspace_read`) |
+| `project_id` | integer | Project the file belongs to |
+| `path` | string | File path relative to the project root |
+| `snippet` | string | Context snippet with matched terms wrapped in `[...]` |
+| `rank` | number | bm25 score (lower = better match) |
+
+**Indexing behavior:**
+- Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
+- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call).
+- If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
+
+**vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
 
 ### `project_tree`
 

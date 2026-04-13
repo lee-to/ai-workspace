@@ -88,7 +88,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 7 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
+That's it. The agent now has access to 8 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
 
 ## Example Prompts
 
@@ -120,7 +120,7 @@ Once connected, you can talk to your AI agent naturally. Here are some examples:
 - *"Before I refactor this model, check if other projects share files that depend on it"*
 - *"Read the shared style guide and apply it to this component"*
 
-The agent will automatically call the right MCP tools (`workspace_context`, `workspace_read`, `workspace_search`) to answer these.
+The agent will automatically call the right MCP tools (`workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`) to answer these.
 
 ## CLI at a glance
 
@@ -137,6 +137,8 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `status` | Show project info, groups, and items |
 | `export` | Export project config to `.ai-workspace.json` |
 | `sync` | Clean up stale files + reconcile `.ai-workspace.json` |
+| `search <query>` | Full-text search over shared `.md` files (FTS5, bm25-ranked) |
+| `reindex` | Rebuild the full-text index for all shared `.md` files |
 | `serve` | Start the MCP server |
 | `update` | Update to the latest version |
 
@@ -170,6 +172,7 @@ The `--name` flag overrides the name from `.json`, and `--group` is additive. Ru
 | [Getting Started](docs/getting-started.md) | Concepts, scopes, visibility rules, data storage |
 | [CLI Reference](docs/cli.md) | All commands and options in detail |
 | [MCP Server](docs/mcp-server.md) | MCP tools, protocol, and integration guide |
+| [Contributing](docs/contributing.md) | Development setup, testing, pull requests |
 
 ## Installation
 
