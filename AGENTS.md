@@ -78,3 +78,15 @@ After completing any implementation, always run the following commands in order:
 2. `cargo clippy` — lint code
 3. `cargo test` — run tests
 4. `cargo audit` — check dependencies for vulnerabilities
+
+## Release Checklist
+Before tagging a release, ALWAYS bump the version first. The CLI `--version` output is derived from `CARGO_PKG_VERSION` (set in `Cargo.toml`) via clap's `#[command(version)]`. Tagging without bumping ships a binary that misreports its version (see issue #2 — v0.4.0 binary printed `0.3.0`).
+
+Steps in order:
+1. Bump `version = "X.Y.Z"` in `Cargo.toml`.
+2. Run `cargo build` to update the `ai-workspace` entry in `Cargo.lock`.
+3. Verify: `./target/debug/ai-workspace --version` prints the new version.
+4. Commit both `Cargo.toml` and `Cargo.lock` (e.g. `chore: bump version to X.Y.Z`).
+5. Push to `main`, then create the matching tag `vX.Y.Z` and push it. The release workflow (`.github/workflows/release.yml`) builds artifacts on tag push.
+
+Tag and `Cargo.toml` version MUST match. If they diverge, do not retag — cut the next patch version instead.
