@@ -33,14 +33,22 @@ fn run(db: &PathBuf, dir: &std::path::Path, args: &[&str]) -> (String, String, b
 fn cli_search_finds_indexed_md_file() {
     let (_dbdir, db) = temp_db();
     let proj = tempfile::tempdir().unwrap();
-    fs::write(proj.path().join("notes.md"), "The quick brown fox token_xyz").unwrap();
+    fs::write(
+        proj.path().join("notes.md"),
+        "The quick brown fox token_xyz",
+    )
+    .unwrap();
 
     assert!(run(&db, proj.path(), &["init", "--name", "p"]).2);
     assert!(run(&db, proj.path(), &["share", "notes.md"]).2);
 
     let (stdout, _, ok) = run(&db, proj.path(), &["search", "token_xyz"]);
     assert!(ok, "search should succeed");
-    assert!(stdout.contains("notes.md"), "expected hit for notes.md: {}", stdout);
+    assert!(
+        stdout.contains("notes.md"),
+        "expected hit for notes.md: {}",
+        stdout
+    );
     assert!(stdout.contains("token_xyz") || stdout.contains("[token_xyz]"));
 }
 
@@ -49,9 +57,17 @@ fn cli_search_dir_share_indexes_children() {
     let (_dbdir, db) = temp_db();
     let proj = tempfile::tempdir().unwrap();
     fs::create_dir_all(proj.path().join("docs")).unwrap();
-    fs::write(proj.path().join("docs/a.md"), "alpha_topic rust programming").unwrap();
+    fs::write(
+        proj.path().join("docs/a.md"),
+        "alpha_topic rust programming",
+    )
+    .unwrap();
     fs::write(proj.path().join("docs/b.md"), "bravo_topic sqlite fts5").unwrap();
-    fs::write(proj.path().join("docs/c.txt"), "not markdown should be skipped").unwrap();
+    fs::write(
+        proj.path().join("docs/c.txt"),
+        "not markdown should be skipped",
+    )
+    .unwrap();
 
     run(&db, proj.path(), &["init", "--name", "p"]);
     run(&db, proj.path(), &["share", "docs"]);
@@ -78,7 +94,11 @@ fn cli_search_cyrillic_query() {
 
     let (stdout, _, ok) = run(&db, proj.path(), &["search", "кириллицей"]);
     assert!(ok);
-    assert!(stdout.contains("ru.md"), "cyrillic search failed: {}", stdout);
+    assert!(
+        stdout.contains("ru.md"),
+        "cyrillic search failed: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -130,7 +150,11 @@ fn cli_unshare_removes_from_index() {
 
     run(&db, proj.path(), &["rm", "u.md"]);
     let (stdout, _, _) = run(&db, proj.path(), &["search", "unshare_me_soon_marker"]);
-    assert!(!stdout.contains("u.md"), "should be removed from index: {}", stdout);
+    assert!(
+        !stdout.contains("u.md"),
+        "should be removed from index: {}",
+        stdout
+    );
 }
 
 #[test]

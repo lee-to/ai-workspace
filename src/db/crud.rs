@@ -1094,10 +1094,7 @@ impl Db {
 
     /// Get (abs_path, mtime, size) of an indexed file, if present.
     #[allow(dead_code)]
-    pub fn get_file_index_meta(
-        &self,
-        shared_item_id: i64,
-    ) -> Result<Option<(String, i64, i64)>> {
+    pub fn get_file_index_meta(&self, shared_item_id: i64) -> Result<Option<(String, i64, i64)>> {
         let row = self
             .conn
             .query_row(
@@ -1118,9 +1115,9 @@ impl Db {
     /// List all indexed files (for reindex / refresh passes).
     /// Returns (shared_item_id, abs_path, mtime, size).
     pub fn list_file_index_meta(&self) -> Result<Vec<(i64, String, i64, i64)>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT shared_item_id, abs_path, mtime, size FROM files_fts_meta",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT shared_item_id, abs_path, mtime, size FROM files_fts_meta")?;
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -2086,8 +2083,15 @@ mod tests {
         let db = test_db();
         let pid = db.create_project("p", "/tmp/p").unwrap();
         let id = db.share_file(pid, "doc.md", None).unwrap();
-        db.index_file(id, "doc.md", "/tmp/p/doc.md", "hello rustaceans world", 100, 22)
-            .unwrap();
+        db.index_file(
+            id,
+            "doc.md",
+            "/tmp/p/doc.md",
+            "hello rustaceans world",
+            100,
+            22,
+        )
+        .unwrap();
 
         let hits = db.search_files("rustaceans", 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -2101,8 +2105,10 @@ mod tests {
         let db = test_db();
         let pid = db.create_project("p", "/tmp/p").unwrap();
         let id = db.share_file(pid, "a.md", None).unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "alpha", 1, 5).unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "bravo", 2, 5).unwrap();
+        db.index_file(id, "a.md", "/tmp/p/a.md", "alpha", 1, 5)
+            .unwrap();
+        db.index_file(id, "a.md", "/tmp/p/a.md", "bravo", 2, 5)
+            .unwrap();
 
         let hits = db.search_files("bravo", 10).unwrap();
         assert_eq!(hits.len(), 1);
@@ -2118,7 +2124,8 @@ mod tests {
         let db = test_db();
         let pid = db.create_project("p", "/tmp/p").unwrap();
         let id = db.share_file(pid, "x.md", None).unwrap();
-        db.index_file(id, "x.md", "/tmp/p/x.md", "lorem ipsum", 1, 11).unwrap();
+        db.index_file(id, "x.md", "/tmp/p/x.md", "lorem ipsum", 1, 11)
+            .unwrap();
         db.delete_file_index(id).unwrap();
         assert!(db.search_files("lorem", 10).unwrap().is_empty());
         assert!(db.get_file_index_meta(id).unwrap().is_none());

@@ -451,7 +451,10 @@ fn workspace_search_fulltext(
     limit: usize,
     db: &Db,
 ) -> JsonRpcResponse {
-    info!("workspace_search_fulltext: query='{}' limit={}", query, limit);
+    info!(
+        "workspace_search_fulltext: query='{}' limit={}",
+        query, limit
+    );
 
     // Bounded lazy refresh so on-disk edits are reflected.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {

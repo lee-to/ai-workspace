@@ -671,6 +671,129 @@ fn test_init_reads_json() {
 }
 
 #[test]
+fn test_init_group_updates_existing_json_without_removing_group() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("Makefile"), "all:").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Readme").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "obs"]);
+    run_cmd_in_dir(&db_path, project_dir.path(), &["export"]);
+
+    let config_path = project_dir.path().join(".ai-workspace.json");
+    let before = fs::read_to_string(&config_path).unwrap();
+    assert!(
+        !before.contains("\"groups\""),
+        "empty groups should be omitted before the regression step: {before}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--group", "integra"],
+    );
+    assert!(
+        success,
+        "init --group should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Joined group 'integra'"));
+    assert!(
+        !stdout.contains("groups +0 -1"),
+        "init --group must not remove the CLI group\nstdout:\n{stdout}"
+    );
+
+    let (status, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(
+        status.contains("integra"),
+        "status should retain the joined group\nstatus:\n{status}"
+    );
+
+    let after = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&after).unwrap();
+    let groups = config["groups"].as_array().unwrap();
+    assert_eq!(
+        groups.as_slice(),
+        &[serde_json::Value::String("integra".to_string())],
+        "config should persist the CLI group after init --group: {after}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--group", "integra"],
+    );
+    assert!(
+        success,
+        "re-running init --group should stay idempotent\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("groups +0 -1"),
+        "idempotent init --group must not remove the group\nstdout:\n{stdout}"
+    );
+
+    let after_second = fs::read_to_string(&config_path).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&after_second).unwrap();
+    let groups = config["groups"].as_array().unwrap();
+    assert_eq!(
+        groups.as_slice(),
+        &[serde_json::Value::String("integra".to_string())],
+        "config should not duplicate the CLI group: {after_second}"
+    );
+}
+
+#[test]
+fn test_init_group_is_additive_to_existing_json_groups() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let config = r#"{
+        "name": "from-json",
+        "groups": ["team-a"],
+        "share": ["README.md"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Readme").unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--group", "integra"],
+    );
+    assert!(
+        success,
+        "init --group with existing JSON groups should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Joined group 'integra'"));
+    assert!(
+        !stdout.contains("groups +0 -1"),
+        "init --group must not remove any JSON groups\nstdout:\n{stdout}"
+    );
+
+    let (status, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(
+        status.contains("team-a"),
+        "status should retain the group from JSON\nstatus:\n{status}"
+    );
+    assert!(
+        status.contains("integra"),
+        "status should include the CLI group\nstatus:\n{status}"
+    );
+
+    let after = fs::read_to_string(project_dir.path().join(".ai-workspace.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&after).unwrap();
+    let groups = config["groups"].as_array().unwrap();
+    assert_eq!(
+        groups.as_slice(),
+        &[
+            serde_json::Value::String("team-a".to_string()),
+            serde_json::Value::String("integra".to_string()),
+        ],
+        "config should contain both JSON and CLI groups: {after}"
+    );
+}
+
+#[test]
 fn test_init_name_flag_overrides_json() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();

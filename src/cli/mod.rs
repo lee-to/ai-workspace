@@ -343,7 +343,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Check for .ai-workspace.json
             let config_path = cwd.join(".ai-workspace.json");
-            let config = if config_path.exists() {
+            let mut config = if config_path.exists() {
                 info!("Found .ai-workspace.json at {}", config_path.display());
                 Some(crate::models::WorkspaceConfig::load(&config_path)?)
             } else {
@@ -391,11 +391,24 @@ pub fn run(cmd: Command) -> Result<()> {
                 id
             };
 
+            let mut config_changed_by_cli_group = false;
+
             // --group is additive to .json groups
             if let Some(group_name) = group {
                 let group_id = db.get_or_create_group(&group_name)?;
                 db.add_project_to_group(project_id, group_id)?;
                 print_success(format!("Joined group '{}'", group_name));
+
+                if let Some(ref mut cfg) = config
+                    && !cfg.groups.contains(&group_name)
+                {
+                    debug!(
+                        "Adding CLI group '{}' to loaded .ai-workspace.json config",
+                        group_name
+                    );
+                    cfg.groups.push(group_name);
+                    config_changed_by_cli_group = true;
+                }
             }
 
             // Auto-share key files when NO .ai-workspace.json exists
@@ -429,6 +442,14 @@ pub fn run(cmd: Command) -> Result<()> {
                     ));
                 } else {
                     print_info("Config already in sync with database.");
+                }
+
+                if config_changed_by_cli_group {
+                    cfg.save(&config_path)?;
+                    info!(
+                        "Updated .ai-workspace.json with CLI group at {}",
+                        config_path.display()
+                    );
                 }
             }
 
