@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/), and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-05-01
+
+### Changed
+
+- **MSRV bumped to Rust 1.88+** (was 1.85+). Now enforced via `rust-version` in `Cargo.toml`.
+- `self_update` upgraded to 0.44 with the `ureq` backend, dropping heavy transitive dependencies (`reqwest`, `hyper`, `aws-lc-rs`, `cmake`, `jni`, `cookie`, `security-framework`) on host targets.
+- `rustls-webpki` bumped to 0.103.13 to clear `cargo audit` advisories.
+
+### Fixed
+
+- `ai-workspace init --group <name>` now merges the CLI group into an existing `.ai-workspace.json` before config sync runs, so the group is no longer dropped on the next sync. Idempotent on re-run; additive to groups already declared in JSON.
+
 ## [0.3.0] - 2026-03-24
 
 ### Added
