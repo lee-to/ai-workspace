@@ -2,6 +2,7 @@
 name = "ai-workspace"
 version = "0.4.1"
 edition = "2024"
+rust-version = "1.88"
 authors = ["Danil Shutsky <thecutcode@gmail.com>"]
 description = "Cross-project shared context for AI coding agents via CLI and MCP server"
 license = "MIT"
@@ -26,7 +27,7 @@ dirs = "6"
 anyhow = "1"
 ignore = "0.4"
 regex = "1"
-self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "reqwest", "rustls"] }
+self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "ureq", "rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
