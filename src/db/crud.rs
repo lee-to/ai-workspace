@@ -580,12 +580,17 @@ impl Db {
         );
 
         // 1. Try as numeric ID
-        if let Ok(id) = target.parse::<i64>()
-            && let Some(item) = self.get_item_by_id(id)?
-            && (item.project_id == Some(project_id)
-                || item.created_by_project_id == Some(project_id))
-        {
-            return Ok(Some(item));
+        let numeric_item = if let Ok(id) = target.parse::<i64>() {
+            self.get_item_by_id(id)?
+        } else {
+            None
+        };
+        if let Some(item) = numeric_item {
+            let belongs_to_project = item.project_id == Some(project_id)
+                || item.created_by_project_id == Some(project_id);
+            if belongs_to_project {
+                return Ok(Some(item));
+            }
         }
 
         // 2. Try as label
@@ -763,10 +768,13 @@ impl Db {
                 }
                 SharedItemKind::Note => {
                     // Only project-scoped notes (project_id is set, group_id is None)
-                    if item.project_id.is_some()
-                        && item.group_id.is_none()
-                        && let Some(ref content) = item.content
-                    {
+                    let project_note_content =
+                        if item.project_id.is_some() && item.group_id.is_none() {
+                            item.content.as_ref()
+                        } else {
+                            None
+                        };
+                    if let Some(content) = project_note_content {
                         notes.push(NoteEntry {
                             content: content.clone(),
                             label: item.label.clone(),

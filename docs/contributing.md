@@ -17,7 +17,7 @@ Thank you for your interest in contributing! Here's how you can help.
 
 ## Prerequisites
 
-- Rust 1.85+ (edition 2024)
+- Rust 1.88+ (edition 2024)
 - No external dependencies required (SQLite is bundled)
 
 ## Development
