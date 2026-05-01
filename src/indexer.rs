@@ -99,11 +99,7 @@ fn index_single(
 /// Index a single shared item. For `kind='file'` with .md → index one file.
 /// For `kind='dir'` → walk the directory and index every .md file under it.
 /// Notes and non-.md files are skipped.
-pub fn index_shared_item(
-    db: &Db,
-    item: &SharedItem,
-    project_root: &Path,
-) -> Result<IndexStats> {
+pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
     match item.kind {
         SharedItemKind::File => {
@@ -213,7 +209,9 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
                     continue;
                 }
                 let abs = project_root.join(&entry.path);
-                let Ok(meta) = std::fs::metadata(&abs) else { continue };
+                let Ok(meta) = std::fs::metadata(&abs) else {
+                    continue;
+                };
                 if meta.len() > MAX_INDEX_FILE_SIZE {
                     continue;
                 }
@@ -258,7 +256,11 @@ pub fn reindex_all(db: &Db) -> Result<IndexStats> {
 
     info!(
         "reindex_all: indexed={} skipped_size={} skipped_non_utf8={} skipped_missing={} in {:?}",
-        stats.indexed, stats.skipped_size, stats.skipped_non_utf8, stats.skipped_missing, start.elapsed()
+        stats.indexed,
+        stats.skipped_size,
+        stats.skipped_non_utf8,
+        stats.skipped_missing,
+        start.elapsed()
     );
     Ok(stats)
 }
@@ -292,7 +294,11 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
             }
         }
     }
-    debug!("refresh_stale: refreshed {} files in {:?}", refreshed, start.elapsed());
+    debug!(
+        "refresh_stale: refreshed {} files in {:?}",
+        refreshed,
+        start.elapsed()
+    );
     Ok(refreshed)
 }
 

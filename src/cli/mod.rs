@@ -177,19 +177,13 @@ fn make_table_row(row: &[String], widths: &[usize]) -> String {
 }
 
 fn use_color_output() -> bool {
-    if let Ok(value) = env::var("NO_COLOR")
-        && !value.is_empty()
-    {
+    if matches!(env::var("NO_COLOR"), Ok(value) if !value.is_empty()) {
         return false;
     }
-    if let Ok(value) = env::var("CLICOLOR")
-        && value == "0"
-    {
+    if matches!(env::var("CLICOLOR"), Ok(value) if value == "0") {
         return false;
     }
-    if let Ok(value) = env::var("CLICOLOR_FORCE")
-        && value != "0"
-    {
+    if matches!(env::var("CLICOLOR_FORCE"), Ok(value) if value != "0") {
         return true;
     }
     std::io::stdout().is_terminal()
@@ -343,7 +337,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Check for .ai-workspace.json
             let config_path = cwd.join(".ai-workspace.json");
-            let config = if config_path.exists() {
+            let mut config = if config_path.exists() {
                 info!("Found .ai-workspace.json at {}", config_path.display());
                 Some(crate::models::WorkspaceConfig::load(&config_path)?)
             } else {
@@ -391,11 +385,25 @@ pub fn run(cmd: Command) -> Result<()> {
                 id
             };
 
+            let mut config_changed_by_cli_group = false;
+
             // --group is additive to .json groups
             if let Some(group_name) = group {
                 let group_id = db.get_or_create_group(&group_name)?;
                 db.add_project_to_group(project_id, group_id)?;
                 print_success(format!("Joined group '{}'", group_name));
+
+                match config.as_mut() {
+                    Some(cfg) if !cfg.groups.contains(&group_name) => {
+                        debug!(
+                            "Adding CLI group '{}' to loaded .ai-workspace.json config",
+                            group_name
+                        );
+                        cfg.groups.push(group_name);
+                        config_changed_by_cli_group = true;
+                    }
+                    _ => {}
+                }
             }
 
             // Auto-share key files when NO .ai-workspace.json exists
@@ -429,6 +437,14 @@ pub fn run(cmd: Command) -> Result<()> {
                     ));
                 } else {
                     print_info("Config already in sync with database.");
+                }
+
+                if config_changed_by_cli_group {
+                    cfg.save(&config_path)?;
+                    info!(
+                        "Updated .ai-workspace.json with CLI group at {}",
+                        config_path.display()
+                    );
                 }
             }
 
@@ -598,12 +614,13 @@ pub fn run(cmd: Command) -> Result<()> {
             let project = require_project(&db)?;
 
             // Try as numeric ID first (scoped to current project)
-            if let Ok(id) = target.parse::<i64>()
-                && db.remove_shared_item_for_project(id, project.id)?
-            {
-                print_success(format!("Removed item id={}", id));
-                update_workspace_json_if_exists(&db, &project)?;
-                return Ok(());
+            if let Ok(id) = target.parse::<i64>() {
+                let removed = db.remove_shared_item_for_project(id, project.id)?;
+                if removed {
+                    print_success(format!("Removed item id={}", id));
+                    update_workspace_json_if_exists(&db, &project)?;
+                    return Ok(());
+                }
             }
 
             // Try as label

@@ -4,7 +4,7 @@
 
 ## Prerequisites
 
-- Rust toolchain (1.85+ for edition 2024)
+- Rust toolchain (1.88+ for edition 2024)
 - SQLite is bundled — no separate install needed
 
 ## Installation

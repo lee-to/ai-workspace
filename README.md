@@ -44,7 +44,7 @@ Group projects together. Share files and notes. Your agent sees everything.
 cargo install --path .
 ```
 
-Requires Rust 1.85+ (edition 2024). SQLite is bundled — no extra dependencies.
+Requires Rust 1.88+ (edition 2024). SQLite is bundled — no extra dependencies.
 
 ### Set up projects
 
@@ -229,7 +229,7 @@ cargo install --path .
 ```
 </details>
 
-Requires Rust 1.85+ (edition 2024). SQLite is bundled — no extra dependencies.
+Requires Rust 1.88+ (edition 2024). SQLite is bundled — no extra dependencies.
 
 ### Update
 
