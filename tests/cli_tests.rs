@@ -32,6 +32,15 @@ fn run_cmd_in_dir(
     (stdout, stderr, output.status.success())
 }
 
+fn parse_id(stdout: &str) -> i64 {
+    let start = stdout.find("(id=").expect("stdout should contain id") + 4;
+    let end = stdout[start..]
+        .find(')')
+        .expect("id should be closed by paren")
+        + start;
+    stdout[start..end].parse().expect("id should be numeric")
+}
+
 #[test]
 fn test_init_creates_project() {
     let (_db_dir, db_path) = temp_db();
@@ -325,6 +334,80 @@ fn test_list_no_project_required() {
     let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, other_dir.path(), &["list"]);
     assert!(success, "list should work outside project dir");
     assert!(stdout.contains("remote-proj"));
+}
+
+#[test]
+fn test_destroy_orphaned_project_by_registered_path() {
+    let (_db_dir, db_path) = temp_db();
+    let root_dir = tempfile::tempdir().unwrap();
+    let old_path = root_dir.path().join("project-old");
+    let new_path = root_dir.path().join("project-new");
+    let other_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(&old_path).unwrap();
+    run_cmd_in_dir(&db_path, &old_path, &["init", "--name", "old-proj"]);
+    let registered_old_path = old_path.canonicalize().unwrap();
+
+    fs::rename(&old_path, &new_path).unwrap();
+    run_cmd_in_dir(&db_path, &new_path, &["init", "--name", "new-proj"]);
+
+    let old_path_string = registered_old_path.to_string_lossy().to_string();
+    let (stdout, _stderr, success) = run_cmd_in_dir(
+        &db_path,
+        other_dir.path(),
+        &["destroy", "--target", &old_path_string],
+    );
+    assert!(
+        success,
+        "destroy --target path should remove orphaned project"
+    );
+    assert!(stdout.contains("Removed project 'old-proj'"));
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, other_dir.path(), &["list"]);
+    assert!(success, "list should succeed");
+    assert!(!stdout.contains("old-proj"));
+    assert!(stdout.contains("new-proj"));
+}
+
+#[test]
+fn test_destroy_project_by_id_outside_project_dir() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "doomed"]);
+    assert!(success, "init should succeed");
+    let id = parse_id(&stdout).to_string();
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, other_dir.path(), &["destroy", &id]);
+    assert!(success, "destroy id should work outside project dir");
+    assert!(stdout.contains("Removed project 'doomed'"));
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, other_dir.path(), &["list"]);
+    assert!(success, "list should succeed");
+    assert!(!stdout.contains("doomed"));
+}
+
+#[test]
+fn test_destroy_project_with_group_note() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--group", "g1"],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["note", "--group", "g1", "--label", "ctx", "group note"],
+    );
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["destroy"]);
+    assert!(success, "destroy should remove project-created group notes");
+    assert!(stdout.contains("Removed project 'proj'"));
 }
 
 // --- Edit ---

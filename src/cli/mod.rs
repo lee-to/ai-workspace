@@ -92,8 +92,14 @@ pub enum Command {
         #[arg(value_enum, default_value = "all")]
         what: ListTarget,
     },
-    /// Remove current project from ai-workspace (keeps files on disk)
-    Destroy,
+    /// Remove a project from ai-workspace (keeps files on disk)
+    Destroy {
+        /// Project ID or registered path to remove (defaults to current project)
+        target: Option<String>,
+        /// Project ID or registered path to remove (alternative flag form)
+        #[arg(long = "target", value_name = "PROJECT")]
+        target_flag: Option<String>,
+    },
     /// Show project status
     Status,
     /// Export project config to .ai-workspace.json
@@ -675,9 +681,22 @@ pub fn run(cmd: Command) -> Result<()> {
             Ok(())
         }
 
-        Command::Destroy => {
+        Command::Destroy {
+            target,
+            target_flag,
+        } => {
             let db = Db::open_default()?;
-            let project = require_project(&db)?;
+            if target.is_some() && target_flag.is_some() {
+                bail!("Specify either <target> or --target, not both.");
+            }
+
+            let project = match target.or(target_flag) {
+                Some(target) => db
+                    .resolve_project_target(&target)?
+                    .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", target))?,
+                None => require_project(&db)?,
+            };
+
             db.delete_project(project.id)?;
             print_success(format!(
                 "Removed project '{}' from ai-workspace (files on disk are untouched)",

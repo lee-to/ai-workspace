@@ -133,7 +133,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `rm <target>` | Remove a shared item |
 | `leave <group>` | Remove project from a group |
 | `delete-group <group>` | Delete a group entirely |
-| `destroy` | Remove current project from ai-workspace (keeps files) |
+| `destroy [target]` | Remove current or targeted project from ai-workspace (keeps files) |
 | `status` | Show project info, groups, and items |
 | `export` | Export project config to `.ai-workspace.json` |
 | `sync` | Clean up stale files + reconcile `.ai-workspace.json` |

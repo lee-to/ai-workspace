@@ -12,7 +12,7 @@ Commands that operate on the "current project" must be run inside an initialized
 - `edit`
 - `rm`
 - `leave`
-- `destroy`
+- `destroy` without a target
 - `status`
 - `export`
 
@@ -20,6 +20,7 @@ If no project matches the current directory, these commands fail with:
 `No project found for current directory. Run ai-workspace init first.`
 
 Commands that work from any directory (no project required):
+- `destroy <target>` or `destroy --target <target>`
 - `list`
 - `delete-group`
 - `sync`
@@ -133,11 +134,20 @@ This removes all project associations with the group, all group-scoped notes, an
 
 ### `destroy`
 
-Remove the current project from ai-workspace entirely.
+Remove a project from ai-workspace entirely.
 
 ```bash
 ai-workspace destroy
+ai-workspace destroy <target>
+ai-workspace destroy --target <target>
 ```
+
+| Option | Description |
+|--------|-------------|
+| `<target>` | Project ID or exact registered path |
+| `--target <target>` | Project ID or exact registered path |
+
+When no target is provided, `destroy` removes the current project and must be run inside an initialized project directory. When a target is provided, it can be run from any directory. This is useful for removing orphaned project records whose directories were renamed or deleted.
 
 Deletes the project record, all its shared items (files, directories, project-scoped notes), group memberships, and group-scoped notes created by this project. **Files on disk are not affected.**
 

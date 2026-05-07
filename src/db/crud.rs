@@ -85,19 +85,26 @@ impl Db {
 
     pub fn delete_project(&self, project_id: i64) -> Result<()> {
         info!("Deleting project {}", project_id);
+        let tx = self.conn.unchecked_transaction()?;
+
         // Clean up FTS entries for project-scoped notes
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
             params![project_id],
         )?;
         // Clean up FTS entries for group-scoped notes created by this project
-        self.conn.execute(
+        tx.execute(
             "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
             params![project_id],
         )?;
-        // shared_items and project_groups cascade-deleted via FK
-        self.conn
-            .execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        // created_by_project_id does not cascade in the schema, so remove those first.
+        tx.execute(
+            "DELETE FROM shared_items WHERE created_by_project_id = ?1",
+            params![project_id],
+        )?;
+        // shared_items.project_id and project_groups cascade-delete via FK.
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
+        tx.commit()?;
         Ok(())
     }
 
@@ -157,6 +164,17 @@ impl Db {
             Some(row) => Ok(Some(row?)),
             None => Ok(None),
         }
+    }
+
+    /// Resolve a project by numeric ID or exact registered path.
+    pub fn resolve_project_target(&self, target: &str) -> Result<Option<Project>> {
+        if let Ok(id) = target.parse::<i64>()
+            && let Some(project) = self.get_project_by_id(id)?
+        {
+            return Ok(Some(project));
+        }
+
+        self.get_project_by_path(target)
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -1213,6 +1231,23 @@ mod tests {
         let p = db.get_project_by_id(id).unwrap().unwrap();
         assert_eq!(p.name, "proj");
         assert!(db.get_project_by_id(9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn delete_project_removes_group_notes_created_by_project() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let gid = db.get_or_create_group("grp").unwrap();
+        db.add_project_to_group(pid, gid).unwrap();
+        let note_id = db
+            .add_group_note(gid, pid, "group note", Some("ctx"))
+            .unwrap();
+
+        db.delete_project(pid).unwrap();
+
+        assert!(db.get_project_by_id(pid).unwrap().is_none());
+        assert!(db.get_item_by_id(note_id).unwrap().is_none());
+        assert!(db.search_items("group note").unwrap().is_empty());
     }
 
     #[test]
