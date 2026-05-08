@@ -10,6 +10,26 @@ ai-workspace serve
 
 ## Configuration
 
+### Project-wide MCP tools opt-in
+
+By default, MCP tools expose only explicit shared scopes: shared files, shared directories, and notes. Project-wide reads, tree walks, grep, and absolute project path metadata are disabled unless you opt in.
+
+Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process to restore full project access:
+
+```json
+{
+  "mcpServers": {
+    "ai-workspace": {
+      "command": "ai-workspace",
+      "args": ["serve"],
+      "env": {
+        "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS": "1"
+      }
+    }
+  }
+}
+```
+
 ### Claude Code (CLI)
 
 ```bash
@@ -51,7 +71,7 @@ Get workspace metadata: all projects, their groups, and shared items (no file co
 
 **Parameters:** none
 
-**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label). Each group includes its member projects and group notes (with preview).
+**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label). Each group includes its member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ### `workspace_read`
 
@@ -71,7 +91,10 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - **File:** returns file content as text (max 10 MB)
 - **Directory:** returns listing of filenames
 - **Note:** returns note content (only via `item_id`)
-- Path traversal protection: rejects paths outside the project directory
+- `item_id` reads continue to work for shared files and directories
+- `project_id`+`rel_path` is limited to an explicitly shared file or a path inside an explicitly shared directory by default
+- Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads
+- Path traversal protection: rejects absolute paths, parent-directory traversal, and paths outside the project directory
 
 ### `workspace_search`
 
@@ -124,30 +147,29 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 
 ### `project_tree`
 
-List the file tree of a project, respecting `.gitignore` rules.
+List the shared file tree of a project, respecting `.gitignore` rules. By default this only returns explicitly shared files, explicitly shared directories, and visible ancestors needed to display them. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to list the full project tree.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
 | `project_id` | integer | yes | The project ID |
-| `subdir` | string | no | Subdirectory to list (relative to project root) |
+| `subdir` | string | no | Subdirectory to list. By default it must intersect a shared scope |
 | `max_depth` | integer | no | Maximum traversal depth (1 = immediate children only, default: unlimited) |
 
 **Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.
 
 **Example output:**
 ```
-Cargo.toml
-README.md
 src/
-  main.rs
   lib.rs
+docs/
+  guide.md
 ```
 
 ### `project_grep`
 
-Search project files for a regex pattern, respecting `.gitignore` rules.
+Search shared project files for a regex pattern, respecting `.gitignore` rules. By default this scans only explicitly shared files and files inside explicitly shared directories. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to search the full project.
 
 **Parameters:**
 
@@ -157,7 +179,7 @@ Search project files for a regex pattern, respecting `.gitignore` rules.
 | `pattern` | string | yes | Regex pattern to search for |
 | `glob` | string | no | Glob to filter files (e.g. `*.rs`) |
 
-**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files and files larger than 1 MB.
+**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files and files larger than 1 MB. Unshared files are not opened in the default mode.
 
 **Example output:**
 ```
@@ -175,7 +197,7 @@ List all groups with their member projects.
 
 **Parameters:** none
 
-**Returns:** Array of groups, each with id, name, and projects (id, name, path).
+**Returns:** Array of groups, each with id, name, and projects (id, name). Project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ### `list_projects`
 
@@ -183,7 +205,7 @@ List all projects with their groups.
 
 **Parameters:** none
 
-**Returns:** Array of projects, each with id, name, path, and groups (id, name).
+**Returns:** Array of projects, each with id, name, and groups (id, name). Project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ## Error Handling
 
