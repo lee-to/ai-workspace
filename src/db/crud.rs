@@ -7,7 +7,7 @@ use std::path::Path;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::models::{
-    ArtifactDependency, ArtifactDependencyKind, ArtifactReaction, EventArtifact,
+    ArtifactDependency, ArtifactDependencyKind, ArtifactReaction, DependencyEntry, EventArtifact,
     EventArtifactStatus, EventSeverity, EventStatus, EventTarget, EventTargetRelationKind,
     EventTargetStatus, FileSearchHit, Group, NoteEntry, Project, ServiceLink, ServiceLinkKind,
     ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig, WorkspaceEvent,
@@ -165,6 +165,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn delete_project(&self, project_id: i64) -> Result<()> {
         info!("Deleting project {}", project_id);
         let tx = self.conn.unchecked_transaction()?;
@@ -188,6 +189,189 @@ impl Db {
         tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])?;
         tx.commit()?;
         Ok(())
+    }
+
+    pub fn destroy_project_with_service_deleted_event(&self, project_id: i64) -> Result<i64> {
+        debug!(
+            "Destroying project id={} with service_deleted event snapshot",
+            project_id
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        let source = tx
+            .query_row(
+                "SELECT id, name, slug, path, created_at FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        slug: row.get(2)?,
+                        path: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .with_context(|| format!("Failed to load project id={project_id} for destroy"))?;
+        let group_id: Option<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        if group_id.is_none() {
+            warn!(
+                "Destroy event source slug='{}' has no group; impact may be limited",
+                source.slug
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO workspace_events (
+                 source_project_id,
+                 source_project_slug,
+                 source_project_name,
+                 group_id,
+                 kind,
+                 title,
+                 severity
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                source.id,
+                source.slug,
+                source.name,
+                group_id,
+                WorkspaceEventKind::ServiceDeleted.as_str(),
+                format!("Service deleted: {}", source.name),
+                EventSeverity::Warning.as_str()
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to create destroy event kind={} source_slug='{}'",
+                WorkspaceEventKind::ServiceDeleted,
+                source.slug
+            )
+        })?;
+        let event_id = tx.last_insert_rowid();
+
+        let linked_count = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT from_project_id AS affected_project_id
+                 FROM service_links
+                 WHERE to_project_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
+            let mut count = 0;
+            for affected_project_id in rows {
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_targets (
+                         event_id,
+                         affected_project_id,
+                         relation_kind
+                     )
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        event_id,
+                        affected_project_id?,
+                        EventTargetRelationKind::LinkedService.as_str()
+                    ],
+                )?;
+                count += 1;
+            }
+            count
+        };
+
+        let artifact_count = {
+            let mut stmt = tx.prepare(
+                "SELECT ad.shared_item_id, ad.reaction, si.project_id, si.path, ad.kind
+                 FROM artifact_dependencies ad
+                 JOIN shared_items si ON si.id = ad.shared_item_id
+                 WHERE ad.depends_on_project_slug_snapshot = ?1
+                   AND si.project_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![source.slug], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut count = 0;
+            for row in rows {
+                let (shared_item_id, reaction, affected_project_id, path, dep_kind) = row?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_targets (
+                         event_id,
+                         affected_project_id,
+                         relation_kind
+                     )
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        event_id,
+                        affected_project_id,
+                        EventTargetRelationKind::ArtifactDependency.as_str()
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO event_artifacts (
+                         event_id,
+                         affected_project_id,
+                         shared_item_id,
+                         path_snapshot,
+                         reaction,
+                         reason
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        event_id,
+                        affected_project_id,
+                        shared_item_id,
+                        path,
+                        reaction,
+                        format!("{} depends on {}", dep_kind, source.slug)
+                    ],
+                )?;
+                count += 1;
+            }
+            count
+        };
+        if linked_count == 0 && artifact_count == 0 {
+            warn!(
+                "Destroy event id={} source_slug='{}' has no affected services or artifacts",
+                event_id, source.slug
+            );
+        }
+
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )
+        .context("Failed to clean project note FTS rows during destroy")?;
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )
+        .context("Failed to clean group note FTS rows during destroy")?;
+        tx.execute(
+            "DELETE FROM shared_items WHERE created_by_project_id = ?1",
+            params![project_id],
+        )
+        .context("Failed to delete project-created shared items during destroy")?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+            .context("Failed to delete project row during destroy")?;
+        tx.commit()?;
+        info!(
+            "Destroyed project id={} slug='{}' with event id={} affected_services={} affected_artifacts={}",
+            project_id, source.slug, event_id, linked_count, artifact_count
+        );
+        Ok(event_id)
     }
 
     pub fn get_project_by_path(&self, path: &str) -> Result<Option<Project>> {
@@ -546,6 +730,51 @@ impl Db {
             );
         }
         Ok(affected > 0)
+    }
+
+    pub fn delete_service_link_by_id(&self, id: i64) -> Result<Option<ServiceLink>> {
+        debug!("Deleting service link by id={}", id);
+        let existing = self.get_service_link_by_id(id)?;
+        if existing.is_none() {
+            warn!("Service link id={} not found for deletion", id);
+            return Ok(None);
+        }
+
+        self.conn
+            .execute("DELETE FROM service_links WHERE id = ?1", params![id])
+            .with_context(|| format!("Failed to delete service link id={id}"))?;
+        if let Some(link) = existing.as_ref() {
+            info!(
+                "Deleted service link id={} from_project_id={} to_project_id={} kind={}",
+                link.id, link.from_project_id, link.to_project_id, link.kind
+            );
+        }
+        Ok(existing)
+    }
+
+    pub fn get_service_link_by_id(&self, id: i64) -> Result<Option<ServiceLink>> {
+        debug!("Looking up service link by id={}", id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::map_service_link)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_service_links(&self) -> Result<Vec<ServiceLink>> {
+        debug!("Listing all service links");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], Self::map_service_link)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     #[allow(dead_code)]
@@ -1227,13 +1456,9 @@ impl Db {
             event_id, source_id
         );
         let mut stmt = self.conn.prepare(
-            "SELECT DISTINCT
-                 CASE
-                     WHEN from_project_id = ?1 THEN to_project_id
-                     ELSE from_project_id
-                 END AS affected_project_id
+            "SELECT DISTINCT from_project_id AS affected_project_id
              FROM service_links
-             WHERE from_project_id = ?1 OR to_project_id = ?1",
+             WHERE to_project_id = ?1",
         )?;
         let rows = stmt.query_map(params![source_id], |row| row.get::<_, i64>(0))?;
         let mut count = 0;
@@ -1819,12 +2044,20 @@ impl Db {
             match item.kind {
                 SharedItemKind::File | SharedItemKind::Dir => {
                     if let Some(ref path) = item.path {
-                        let entry = match &item.label {
-                            Some(label) => ShareEntry::WithLabel {
-                                path: path.clone(),
-                                label: label.clone(),
-                            },
-                            None => ShareEntry::PathOnly(path.clone()),
+                        let dependencies = self
+                            .list_artifact_dependencies_for_item(project_id, path)?
+                            .into_iter()
+                            .map(|dep| DependencyEntry {
+                                service: dep.depends_on_project_slug_snapshot,
+                                kind: dep.kind,
+                                reaction: dep.reaction,
+                            })
+                            .collect::<Vec<_>>();
+                        let entry = ShareEntry::WithMetadata {
+                            path: path.clone(),
+                            label: item.label.clone(),
+                            kind: Some(item.kind),
+                            dependencies: Some(dependencies),
                         };
                         shares.push(entry);
                     }
@@ -1850,6 +2083,7 @@ impl Db {
 
         Ok(WorkspaceConfig {
             name: project.name,
+            slug: Some(project.slug),
             groups: group_names,
             share: shares,
             notes,
@@ -1868,6 +2102,9 @@ impl Db {
             "Syncing project {} from config '{}'",
             project_id, config.name
         );
+        let project = self
+            .get_project_by_id(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
         let mut report = SyncReport::default();
 
         let tx = self.conn.unchecked_transaction()?;
@@ -1936,45 +2173,214 @@ impl Db {
         }
 
         // --- Shares (files/dirs) ---
-        let current_shares: Vec<(i64, String, Option<String>)> = {
+        let current_shares: Vec<(i64, String, SharedItemKind, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, path, label FROM shared_items
+                "SELECT id, path, kind, label FROM shared_items
                  WHERE project_id = ?1 AND kind IN ('file', 'dir')",
             )?;
             let rows = stmt.query_map(params![project_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                let kind_text: String = row.get(2)?;
+                let kind = kind_text.parse::<SharedItemKind>().map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            err.to_string(),
+                        )),
+                    )
+                })?;
+                Ok((row.get(0)?, row.get(1)?, kind, row.get(3)?))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let current_share_paths: std::collections::HashSet<String> =
-            current_shares.iter().map(|(_, p, _)| p.clone()).collect();
+        let current_share_paths: std::collections::HashSet<String> = current_shares
+            .iter()
+            .map(|(_, p, _, _)| p.clone())
+            .collect();
         let desired_share_paths: std::collections::HashSet<String> =
             config.share.iter().map(|s| s.path().to_string()).collect();
 
         // Add missing shares (INSERT OR IGNORE to handle UNIQUE constraint)
         for entry in &config.share {
+            let desired_kind = entry.kind().unwrap_or_else(|| {
+                let full_path = Path::new(&project.path).join(entry.path());
+                if full_path.is_dir() {
+                    SharedItemKind::Dir
+                } else {
+                    SharedItemKind::File
+                }
+            });
             if !current_share_paths.contains(entry.path()) {
-                debug!("sync: adding share '{}'", entry.path());
-                // Determine kind by checking if path looks like a dir (ends with /)
-                // or fall back to 'file'. The actual kind is determined at share time,
-                // but in config we store what was shared, so we re-insert as file.
-                // The share command handles file vs dir detection.
+                debug!(
+                    "sync: adding share '{}' kind={}",
+                    entry.path(),
+                    desired_kind
+                );
                 tx.execute(
-                    "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES ('file', ?1, ?2, ?3)",
-                    params![entry.path(), project_id, entry.label()],
+                    "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES (?1, ?2, ?3, ?4)",
+                    params![desired_kind.as_str(), entry.path(), project_id, entry.label()],
                 )?;
                 if tx.changes() > 0 {
                     report.shares_added += 1;
                 }
+            } else if let Some((id, _path, current_kind, current_label)) = current_shares
+                .iter()
+                .find(|(_, path, _, _)| path == entry.path())
+                && (*current_kind != desired_kind || current_label.as_deref() != entry.label())
+            {
+                debug!(
+                    "sync: updating share '{}' kind {} -> {}, label {:?} -> {:?}",
+                    entry.path(),
+                    current_kind,
+                    desired_kind,
+                    current_label,
+                    entry.label()
+                );
+                tx.execute(
+                    "UPDATE shared_items
+                     SET kind = ?1, label = ?2, updated_at = datetime('now')
+                     WHERE id = ?3",
+                    params![desired_kind.as_str(), entry.label(), id],
+                )?;
             }
         }
 
         // Remove shares not in config
-        for (id, path, _label) in &current_shares {
+        for (id, path, _kind, _label) in &current_shares {
             if !desired_share_paths.contains(path) {
                 debug!("sync: removing share '{}'", path);
                 tx.execute("DELETE FROM shared_items WHERE id = ?1", params![id])?;
                 report.shares_removed += 1;
+            }
+        }
+
+        // --- Artifact dependencies for project-owned shares ---
+        for entry in &config.share {
+            let Some(desired_dependencies) = entry.dependencies() else {
+                continue;
+            };
+            debug!(
+                "sync: reconciling {} dependencies for share '{}'",
+                desired_dependencies.len(),
+                entry.path()
+            );
+            let item_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM shared_items
+                     WHERE project_id = ?1 AND path = ?2 AND kind IN ('file', 'dir')",
+                    params![project_id, entry.path()],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(item_id) = item_id else {
+                warn!(
+                    "Config dependency sync skipped for missing share '{}'",
+                    entry.path()
+                );
+                continue;
+            };
+
+            let current_dependencies: Vec<ArtifactDependency> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, shared_item_id, depends_on_project_id,
+                            depends_on_project_slug_snapshot, kind, reaction,
+                            created_at, updated_at
+                     FROM artifact_dependencies
+                     WHERE shared_item_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![item_id], Self::map_artifact_dependency)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+
+            let desired_keys = desired_dependencies
+                .iter()
+                .map(|dep| (normalize_project_slug(&dep.service), dep.kind))
+                .collect::<std::collections::HashSet<_>>();
+
+            for dep in desired_dependencies {
+                let service_slug = normalize_project_slug(&dep.service);
+                let target_project_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM projects WHERE slug = ?1",
+                        params![service_slug],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if target_project_id.is_none() {
+                    warn!(
+                        "Config dependency target slug '{}' is unknown for share '{}'",
+                        service_slug,
+                        entry.path()
+                    );
+                }
+                let existing = current_dependencies.iter().find(|current| {
+                    current.depends_on_project_slug_snapshot == service_slug
+                        && current.kind == dep.kind
+                });
+                if let Some(existing) = existing {
+                    if existing.reaction != dep.reaction
+                        || existing.depends_on_project_id != target_project_id
+                    {
+                        debug!(
+                            "sync: updating dependency id={} service='{}' kind={} reaction {} -> {}",
+                            existing.id, service_slug, dep.kind, existing.reaction, dep.reaction
+                        );
+                        tx.execute(
+                            "UPDATE artifact_dependencies
+                             SET depends_on_project_id = ?1,
+                                 reaction = ?2,
+                                 updated_at = datetime('now')
+                             WHERE id = ?3",
+                            params![target_project_id, dep.reaction.as_str(), existing.id],
+                        )?;
+                        report.dependencies_updated += 1;
+                    }
+                } else {
+                    debug!(
+                        "sync: adding dependency share='{}' service='{}' kind={} reaction={}",
+                        entry.path(),
+                        service_slug,
+                        dep.kind,
+                        dep.reaction
+                    );
+                    tx.execute(
+                        "INSERT INTO artifact_dependencies (
+                             shared_item_id,
+                             depends_on_project_id,
+                             depends_on_project_slug_snapshot,
+                             kind,
+                             reaction
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            item_id,
+                            target_project_id,
+                            service_slug,
+                            dep.kind.as_str(),
+                            dep.reaction.as_str()
+                        ],
+                    )?;
+                    report.dependencies_added += 1;
+                }
+            }
+
+            for current in &current_dependencies {
+                let current_key = (
+                    current.depends_on_project_slug_snapshot.clone(),
+                    current.kind,
+                );
+                if !desired_keys.contains(&current_key) {
+                    debug!(
+                        "sync: removing dependency id={} service='{}' kind={}",
+                        current.id, current.depends_on_project_slug_snapshot, current.kind
+                    );
+                    tx.execute(
+                        "DELETE FROM artifact_dependencies WHERE id = ?1",
+                        params![current.id],
+                    )?;
+                    report.dependencies_removed += 1;
+                }
             }
         }
 
@@ -2066,11 +2472,14 @@ impl Db {
 
         tx.commit()?;
         info!(
-            "Sync complete: groups +{} -{}, shares +{} -{}, notes +{} -{} ~{}",
+            "Sync complete: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
             report.groups_added,
             report.groups_removed,
             report.shares_added,
             report.shares_removed,
+            report.dependencies_added,
+            report.dependencies_removed,
+            report.dependencies_updated,
             report.notes_added,
             report.notes_removed,
             report.notes_updated,
@@ -3552,12 +3961,15 @@ mod tests {
 
         let config = db.export_project_config(pid).unwrap();
         assert_eq!(config.name, "proj");
+        assert_eq!(config.slug.as_deref(), Some("proj"));
         assert_eq!(config.groups, vec!["team"]);
         assert_eq!(config.share.len(), 2);
         assert_eq!(config.share[0].path(), "src/main.rs");
         assert_eq!(config.share[0].label(), Some("main"));
+        assert_eq!(config.share[0].kind(), Some(SharedItemKind::File));
         assert_eq!(config.share[1].path(), "docs");
         assert!(config.share[1].label().is_none());
+        assert_eq!(config.share[1].kind(), Some(SharedItemKind::Dir));
         assert_eq!(config.notes.len(), 1);
         assert_eq!(config.notes[0].content, "important");
         assert_eq!(config.notes[0].label.as_deref(), Some("info"));
@@ -3578,6 +3990,33 @@ mod tests {
         assert_eq!(config.notes[0].content, "proj note");
     }
 
+    #[test]
+    fn export_project_config_includes_artifact_dependencies() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-config", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-config", Some("auth"))
+            .unwrap();
+        db.share_file(api, "docs/auth.md", Some("auth docs"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "docs/auth.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = db.export_project_config(api).unwrap();
+        let deps = config.share[0].dependencies().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].service, "auth");
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+    }
+
     // --- Sync from Config ---
 
     #[test]
@@ -3587,12 +4026,15 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec!["team-a".to_string(), "team-b".to_string()],
             share: vec![
                 ShareEntry::PathOnly("README.md".to_string()),
-                ShareEntry::WithLabel {
+                ShareEntry::WithMetadata {
                     path: "api.json".to_string(),
-                    label: "API spec".to_string(),
+                    label: Some("API spec".to_string()),
+                    kind: Some(SharedItemKind::File),
+                    dependencies: None,
                 },
             ],
             notes: vec![],
@@ -3610,6 +4052,90 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_configured_share_kind() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs".to_string(),
+                label: None,
+                kind: Some(SharedItemKind::Dir),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+        assert_eq!(items[0].path.as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn sync_reconciles_artifact_dependencies_from_config() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-sync", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-sync", Some("auth"))
+            .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: Some("api".to_string()),
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs/auth.md".to_string(),
+                label: Some("auth docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: Some(vec![DependencyEntry {
+                    service: "auth".to_string(),
+                    kind: ArtifactDependencyKind::References,
+                    reaction: ArtifactReaction::Update,
+                }]),
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        assert_eq!(report.dependencies_added, 1);
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_project_slug_snapshot, "auth");
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+
+        let mut updated_config = config.clone();
+        if let ShareEntry::WithMetadata {
+            dependencies: Some(deps),
+            ..
+        } = &mut updated_config.share[0]
+        {
+            deps[0].reaction = ArtifactReaction::Inspect;
+        }
+        let report = db.sync_from_config(api, &updated_config).unwrap();
+        assert_eq!(report.dependencies_updated, 1);
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps[0].reaction, ArtifactReaction::Inspect);
+
+        if let ShareEntry::WithMetadata { dependencies, .. } = &mut updated_config.share[0] {
+            *dependencies = Some(vec![]);
+        }
+        let report = db.sync_from_config(api, &updated_config).unwrap();
+        assert_eq!(report.dependencies_removed, 1);
+        assert!(
+            db.list_artifact_dependencies_for_project(api)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sync_removes_extra_groups_and_shares() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -3619,6 +4145,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![],
@@ -3641,6 +4168,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![
@@ -3676,6 +4204,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![NoteEntry {
@@ -3700,6 +4229,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![ShareEntry::PathOnly("existing.txt".to_string())],
             notes: vec![],
@@ -3720,6 +4250,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec!["team".to_string()],
             share: vec![ShareEntry::PathOnly("file.txt".to_string())],
             notes: vec![NoteEntry {

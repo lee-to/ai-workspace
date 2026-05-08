@@ -10,6 +10,16 @@ disable-model-invocation: true
 
 Run a result-focused iterative loop with strict phase contracts, evaluation rules, and persistent state between sessions.
 
+## Step 0: Load Config
+
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.roadmap`, `paths.research`, `paths.plan`, `paths.plans`, and `paths.evolution`
+- **Language:** `language.ui` for prompts, `language.artifacts` for generated content
+
+If config.yaml doesn't exist, use defaults:
+- Paths: `.ai-factory/` for all artifacts
+- Language: `en` (English)
+
 Terminology:
 
 - **loop** = one full execution for a task alias (stored in `run.json`, identified by `run_id`)
@@ -51,13 +61,13 @@ Stop when quality is good enough, no major issues remain, or iteration limit is 
 
 ## Persistence Contract
 
-Use exactly 3+1 files for state (where `current.json` exists only while a loop is active):
+Use exactly 3+1 files for state inside the resolved evolution directory (where `current.json` exists only while a loop is active):
 
 ```text
-.ai-factory/evolution/current.json
-.ai-factory/evolution/<task-alias>/run.json
-.ai-factory/evolution/<task-alias>/history.jsonl
-.ai-factory/evolution/<task-alias>/artifact.md
+<resolved evolution dir>/current.json
+<resolved evolution dir>/<task-alias>/run.json
+<resolved evolution dir>/<task-alias>/history.jsonl
+<resolved evolution dir>/<task-alias>/artifact.md
 ```
 
 Do not create extra index files or per-iteration folder trees unless user explicitly asks.
@@ -87,9 +97,9 @@ If no task and no active loop exists, ask user for task prompt.
 
 Read these files if present:
 
-- `.ai-factory/DESCRIPTION.md`
-- `.ai-factory/ARCHITECTURE.md`
-- `.ai-factory/RULES.md`
+- the resolved description path
+- the resolved architecture path
+- the resolved RULES.md path
 
 Use them to keep outputs aligned with project conventions.
 
@@ -119,7 +129,7 @@ If command is `status`, `stop`, `list`, `history`, or `clean`, execute and stop:
 
 - **`status`**: read `current.json`; if file exists, read pointed `run.json` and display `alias | status | iteration | phase | current_step | last_score | updated_at`; if file is missing, report that no loop is active
 - **`stop [reason]`**: stop active running loop only; set `run.json.status = "stopped"` and `run.json.stop.reason = <reason or "user_stop">`, append `stopped` event to `history.jsonl`, then delete `current.json` (active pointer cleared) and exit
-- **`list`**: scan `.ai-factory/evolution/` directories, read each `run.json`, display table of `alias | status | iteration | last_score | updated_at`
+- **`list`**: scan the resolved evolution directory, read each `run.json`, display table of `alias | status | iteration | last_score | updated_at`
 - **`history [alias]`**: read `history.jsonl` for the alias (or active loop), display formatted event timeline
 - **`clean [alias|--all]`**: show what will be deleted, ask for explicit user confirmation via `AskUserQuestion`, then delete loop directory. Only clean stopped/completed/failed loops — refuse to clean running loops. Update `current.json` if needed.
 
@@ -128,7 +138,7 @@ If command is `status`, `stop`, `list`, `history`, or `clean`, execute and stop:
 ### 1.1 Ensure directories
 
 ```bash
-mkdir -p .ai-factory/evolution
+mkdir -p <resolved evolution dir>
 ```
 
 ### 1.2 Alias and IDs (new loop)
@@ -363,7 +373,7 @@ After the loop stops (any reason):
    - numeric gap to threshold (`threshold - score`, floor at `0`)
    - remaining failed `fail`-severity rule count + blocking rule IDs
    - rules progress (`passed_rules / total_rules`)
-3. Ask user where to save the final artifact (default: keep in `.ai-factory/evolution/<alias>/artifact.md`)
+3. Ask user where to save the final artifact (default: keep it in `<resolved evolution dir>/<alias>/artifact.md`)
 4. Offer to copy artifact to a user-specified path
 5. Suggest next skills based on artifact type:
    - API spec -> `/aif-plan` to implement it
@@ -393,7 +403,7 @@ Hash: {first 8 chars of artifact SHA-256}
 Changed: {list of added/modified sections, or "initial generation"}
 Failed: {comma-separated rule IDs, or "none"}
 Warnings: {comma-separated rule IDs, or "none"}
-Artifact: .ai-factory/evolution/<alias>/artifact.md
+Artifact: <resolved evolution dir>/<alias>/artifact.md
 ```
 
 - `Hash` — lets the user verify which version they're looking at without reading the full artifact

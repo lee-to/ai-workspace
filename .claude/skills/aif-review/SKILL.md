@@ -1,14 +1,26 @@
 ---
 name: aif-review
 description: Perform code review on staged changes or a pull request. Checks for bugs, security issues, performance problems, and best practices. Use when user says "review code", "check my code", "review PR", or "is this code okay".
-argument-hint: "[PR number or empty]"
-allowed-tools: Bash(git *) Bash(gh *) Read Glob Grep
+argument-hint: "[PR number | branch/commit/tag | empty]"
+allowed-tools: Bash(git *) Bash(gh *) Read Glob Grep AskUserQuestion
 disable-model-invocation: false
 ---
 
 # Code Review Assistant
 
 Perform thorough code reviews focusing on correctness, security, performance, and maintainability.
+
+## Step 0: Load Config
+
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.roadmap`, and `paths.rules`
+- **Language:** `language.ui` for review summary language
+- **Git:** `git.base_branch` for branch comparison guidance
+
+If config.yaml doesn't exist, use defaults:
+- Paths: `.ai-factory/` for all artifacts
+- Language: `en` (English)
+- Git: `base_branch: main`
 
 ## Behavior
 
@@ -24,17 +36,98 @@ Perform thorough code reviews focusing on correctness, security, performance, an
 2. Use `gh pr diff <number>` to get the diff
 3. Review all changes in the PR
 
+### With Git Ref (Commits Mode)
+
+Argument routing chain:
+1. **Empty** → staged review (see above)
+2. **Digits or `#N`** → PR mode (see above)
+3. **Everything else** → validate via `git rev-parse --verify` → commits mode or ask user
+
+Validation:
+```bash
+git rev-parse --verify <argument> 2>/dev/null
+```
+
+- **Valid ref** → enter commits mode (steps below)
+- **Invalid ref** → do NOT fall back to staged review silently. Ask the user to clarify:
+
+  ```
+  AskUserQuestion: `<argument>` is not a valid git ref. What did you mean?
+
+  Options:
+  1. Review staged changes instead
+  2. Cancel
+  ```
+
+  **Based on choice:**
+  - "Review staged changes" → run staged review (default mode)
+  - "Cancel" → inform the user that review was cancelled → **STOP**
+  - "Other" → user provides corrected ref → re-validate via `rev-parse`
+
+> Edge case: a branch with a purely numeric name (e.g. `123`) will be interpreted as a PR number — acceptable compromise.
+
+**Steps:**
+
+1. **Get commit list** between the ref and HEAD:
+   ```bash
+   git log --oneline --reverse <ref>..HEAD
+   ```
+   If no commits found (HEAD is at or behind `<ref>`), inform the user and **stop**.
+
+2. **Check commit count:**
+   If more than 20 commits, ask the user before proceeding:
+
+   ```
+   AskUserQuestion: Found <N> commits to review. Reviewing all of them will be slow and consume significant context. How to proceed?
+
+   Options:
+   1. Review all <N> commits
+   2. Review only the last 20
+   3. Cancel
+   ```
+
+   **Based on choice:**
+   - "Review all" → continue with the full commit list
+   - "Review only the last 20" → truncate the list to the 20 most recent commits (keep chronological order)
+   - "Cancel" → inform the user that review was cancelled → **STOP**
+
+3. **Review each commit:**
+   ```bash
+   git show <commit-hash> --stat
+   git show <commit-hash>
+   ```
+   For each commit check:
+   - Does the commit message match the actual changes?
+   - Are changes atomic (single logical unit per commit)?
+   - Are there any issues introduced in this specific commit?
+
+4. **Provide combined summary** with per-commit notes
+
 ## Context Gates (Read-Only)
 
 Before finalizing review findings, run read-only context gates:
 
-- Check `.ai-factory/ARCHITECTURE.md` (if present) for boundary/dependency alignment issues.
-- Check `.ai-factory/RULES.md` (if present) for explicit convention violations.
-- Check `.ai-factory/ROADMAP.md` (if present) for milestone alignment and mention missing linkage for likely `feat`/`fix`/`perf` work.
+- Check the resolved architecture artifact (if present) for boundary/dependency alignment issues.
+- Check the resolved RULES.md artifact (if present) for explicit convention violations.
+- Check the resolved roadmap artifact (if present) for milestone alignment and mention missing linkage for likely `feat`/`fix`/`perf` work.
 
-Gate result severity:
+Human gate result severity:
 - `WARN` for non-blocking inconsistencies or missing optional files.
 - `ERROR` only for explicit blocking criteria requested by the user/review policy.
+
+If the user wants a standalone rules-only pass, suggest `/aif-rules-check`. Keep human `/aif-review` gate labels at `WARN` / `ERROR`, then append the standard machine-readable gate result with `pass|warn|fail` status.
+
+Machine-readable gate result:
+- Append one final fenced `aif-gate-result` JSON block after the human-readable review.
+- Use `"gate": "review"`.
+- Use `"status": "pass|warn|fail"` where:
+  - `fail` = review findings should block merge, including critical correctness, security, data-loss, performance, or explicit blocking context-gate issues.
+  - `warn` = only non-blocking findings, suggestions, missing optional context, or review uncertainty remain.
+  - `pass` = no material review findings remain.
+- Use `"blocking": true|false`.
+- Include merge-blocking review findings only in `"blockers": [`.
+- Include reviewed or implicated paths in `"affected_files": [`.
+- Set `"suggested_next": {` to `/aif-fix`, `/aif-rules`, `/aif-architecture`, `/aif-roadmap`, `/aif-commit`, or `null`.
 
 `/aif-review` is read-only for context artifacts by default. Do not modify context files unless user explicitly asks.
 
@@ -123,6 +216,25 @@ If any rule is violated — fix the output before presenting it to the user.
 [Good patterns observed]
 ```
 
+Append the final machine-readable result after the markdown summary:
+
+```aif-gate-result
+{
+  "schema_version": 1,
+  "gate": "review",
+  "status": "pass",
+  "blocking": false,
+  "blockers": [],
+  "affected_files": [],
+  "suggested_next": {
+    "command": "/aif-commit",
+    "reason": "Review found no blocking issues."
+  }
+}
+```
+
+Schema reminder: `"status": "pass|warn|fail"`, `"blocking": true|false`, `"blockers": [`, `"affected_files": [`, `"suggested_next": {`.
+
 ## Review Style
 
 - Be constructive, not critical
@@ -142,6 +254,15 @@ Review PR #123 using GitHub CLI.
 
 **User:** `/aif-review https://github.com/org/repo/pull/123`
 Review PR from URL.
+
+**User:** `/aif-review 2.x`
+Review all commits on the current branch compared to branch `2.x`.
+
+**User:** `/aif-review main`
+Review all commits on the current branch compared to `main` (or to whatever branch is configured as `git.base_branch` in this repository).
+
+**User:** `/aif-review v1.0.0`
+Review all commits on the current branch compared to tag `v1.0.0`.
 
 ## Integration
 

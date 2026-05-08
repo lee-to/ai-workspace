@@ -24,7 +24,7 @@ enhance skills with project-specific rules, guards, and patterns
 
 Use a two-layer learning model:
 
-1. **Raw patches** (`.ai-factory/patches/*.md`) are the source material.
+1. **Raw patches** (`paths.patches`, default: `.ai-factory/patches/*.md`) are the source material.
 2. **Skill-context rules** (`.ai-factory/skill-context/*`) are the compact, reusable output.
 
 Policy across workflow skills:
@@ -73,10 +73,28 @@ all skills, or specify a valid skill name."
 
 #### Step 0.2: Load Context
 
-**Read `.ai-factory/DESCRIPTION.md`** to understand:
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.rules`, `paths.patches`, and `paths.evolutions`
+- **Language:** `language.ui` for prompts and `language.artifacts` for generated reports
+- **Rules hierarchy:** `rules.base` plus any named `rules.<area>` entries
+
+If config.yaml doesn't exist, use defaults:
+- DESCRIPTION.md: `.ai-factory/DESCRIPTION.md`
+- ARCHITECTURE.md: `.ai-factory/ARCHITECTURE.md`
+- RULES.md: `.ai-factory/RULES.md`
+- rules/: `.ai-factory/rules/`
+- patches/: `.ai-factory/patches/`
+- evolutions/: `.ai-factory/evolutions/`
+- Language: `en` (English)
+
+**Note:** `.ai-factory/skill-context/` remains a fixed internal AI Factory path in the current schema. Patch and evolution-log locations are configurable via `paths.patches` and `paths.evolutions`.
+
+**THEN:** Read `.ai-factory/DESCRIPTION.md` (use path from config) to understand:
 - Tech stack
 - Architecture
 - Conventions
+
+**Also read `.ai-factory/ARCHITECTURE.md`** (use path from config) and the configured rules hierarchy when present. This context informs convention analysis and gap detection but does not change artifact ownership.
 
 **Read skill-context files for target skills:**
 
@@ -112,13 +130,13 @@ If any rule is violated — fix the output before presenting it to the user.
 **1.1: Read patches incrementally (cursor-based)**
 
 ```
-Glob: .ai-factory/patches/*.md
+Glob: <resolved patches dir>/*.md
 ```
 
 Cursor file:
 
 ```
-.ai-factory/evolutions/patch-cursor.json
+<resolved evolutions dir>/patch-cursor.json
 ```
 
 Recommended shape:
@@ -138,7 +156,7 @@ Processing rules:
 4. If cursor file exists but referenced patch is missing (deleted/renamed) → emit `WARN [evolve]` and do a full rescan.
 5. Historical edits/deletes for patches older than cursor are not reliably detectable without a saved baseline (snapshot/hash manifest). Do NOT emit this warning by default.
 6. Emit `WARN [evolve]` for historical drift only when a reliable baseline exists and drift is actually detected.
-7. Full rescan procedure: delete `.ai-factory/evolutions/patch-cursor.json`, then run `/aif-evolve` again.
+7. Full rescan procedure: delete `<resolved evolutions dir>/patch-cursor.json`, then run `/aif-evolve` again.
 8. **Do not advance cursor in Step 1.1.** Cursor is updated only after successful apply/log write in Step 7.3.
 
 **Overlap window (anti-miss guard):**
@@ -434,10 +452,13 @@ For improvements — ask:
 - Let me pick
 - No, just save report (no changes applied)
 
-**If user chooses "Let me pick":** present improvements in batches of up to 4
-per `AskUserQuestion` call (same approach as Step 4 stale rules). For each
-improvement, options: Apply / Skip. Continue until all improvements are resolved.
-Then proceed to 7.2 with only approved improvements.
+**Based on choice:**
+- "Yes, apply all improvements" → proceed to 7.2 with all improvements
+- "Let me pick" → present improvements in batches of up to 4
+  per `AskUserQuestion` call (same approach as Step 4 stale rules). For each
+  improvement, options: Apply / Skip. Continue until all improvements are resolved.
+  Then proceed to 7.2 with only approved improvements.
+- "No, just save report" → no changes applied, **STOP**
 
 **Do NOT apply any changes until the user answers.**
 
@@ -490,10 +511,10 @@ For each approved improvement, determine the target:
 
 **7.3: Save evolution log**
 
-Create `.ai-factory/evolutions/YYYY-MM-DD-HH.mm.md`:
+Create `<resolved evolutions dir>/YYYY-MM-DD-HH.mm.md`:
 
 ```bash
-mkdir -p .ai-factory/evolutions
+mkdir -p <resolved evolutions dir>
 ```
 
 After saving the evolution log, update cursor state:
@@ -558,6 +579,12 @@ Improvements applied: Y
 
 ### Context Cleanup
 
+## Artifact Ownership
+
+- Primary ownership: `.ai-factory/skill-context/*`, `<resolved evolutions dir>/*.md`, and `<resolved evolutions dir>/patch-cursor.json`.
+- Config use is partial here: `config.yaml` resolves description, rules, patches, and evolution-log paths, but skill-context remains a fixed AI Factory internal path.
+- Read-only context: roadmap, rules, research, and plan artifacts unless the user explicitly requests otherwise.
+
 After completing evolution, suggest `/clear` or `/compact` — context is heavy after patch analysis and skill processing.
 
 ## Rules
@@ -576,7 +603,7 @@ After completing evolution, suggest `/clear` or `/compact` — context is heavy 
     Merges in Step 7 (combining narrow rules into a broader one) are allowed as long
     as all prevention points are preserved in the merged rule.
 12. **Installed only** — do not evolve skills not installed in the project
-13. **Ownership boundary** — this command owns `.ai-factory/evolutions/*.md`, `.ai-factory/evolutions/patch-cursor.json`, and `.ai-factory/skill-context/*`; treat roadmap/rules/research/plan artifacts as read-only context unless explicitly asked
+13. **Ownership boundary** — this command owns `<resolved evolutions dir>/*.md`, `<resolved evolutions dir>/patch-cursor.json`, and `.ai-factory/skill-context/*`; treat roadmap/rules/research/plan artifacts as read-only context unless explicitly asked
 
 ## Example
 

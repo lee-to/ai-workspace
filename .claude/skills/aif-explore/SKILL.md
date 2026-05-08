@@ -8,7 +8,19 @@ disable-model-invocation: true
 
 Enter explore mode. Think deeply. Visualize freely. Follow the conversation wherever it goes.
 
-**IMPORTANT: Explore mode is for thinking, not implementing.** You may read files, search code, and investigate the codebase, but you must NEVER implement features or modify project code. If the user asks to implement something, remind them to exit explore mode first (e.g., start with `/aif-plan`). If the user asks to persist exploration context, write/edit **only** `.ai-factory/RESEARCH.md` (this is capturing thinking, not implementing).
+**IMPORTANT: Explore mode is for thinking, not implementing.** You may read files, search code, and investigate the codebase, but you must NEVER implement features or modify project code. If the user asks to implement something, remind them to exit explore mode first (e.g., start with `/aif-plan`). If the user asks to persist exploration context, write/edit **only** the resolved research path (default: `.ai-factory/RESEARCH.md`) - this is capturing thinking, not implementing.
+
+---
+
+## Step 0: Load Config
+
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.roadmap`, `paths.research`, `paths.plan`, `paths.plans`, and `paths.rules`
+- **Language:** `language.ui` for communication
+
+If config.yaml doesn't exist, use defaults:
+- Paths: `.ai-factory/` for all artifacts
+- Language: `en` (English)
 
 **This is a stance, not a workflow.** There are no fixed steps, no required sequence, no mandatory outputs. You're a thinking partner helping the user explore.
 
@@ -16,8 +28,8 @@ Enter explore mode. Think deeply. Visualize freely. Follow the conversation wher
 
 ## Artifact Ownership
 
-- Primary ownership in explore mode: `.ai-factory/RESEARCH.md` only.
-- All other context artifacts (`DESCRIPTION.md`, `ARCHITECTURE.md`, `ROADMAP.md`, `RULES.md`, plan files) are read-only in this mode.
+- Primary ownership in explore mode: the resolved research path (default: `.ai-factory/RESEARCH.md`) only.
+- All other context artifacts (`paths.description`, `paths.architecture`, `paths.roadmap`, `paths.rules_file`, plan files) are read-only in this mode.
 - If a discovery should affect another artifact, capture it in RESEARCH now and route follow-up to the owner command later.
 
 ---
@@ -110,11 +122,11 @@ At the start, read these files if present:
 
 - `.ai-factory/DESCRIPTION.md` — project description, tech stack, constraints
 - `.ai-factory/ARCHITECTURE.md` — architecture decisions, folder structure
-- `.ai-factory/RULES.md` — project conventions and rules
-- `.ai-factory/RESEARCH.md` — persisted exploration notes (so you can `/clear` and still keep context)
-- `.ai-factory/PLAN.md` — active fast plan (if any)
-- `.ai-factory/plans/<branch>.md` — active full plans (if any)
-- `.ai-factory/ROADMAP.md` — strategic milestones (if any)
+- the resolved RULES.md path – project conventions and rules
+- the resolved RESEARCH.md path – persisted exploration notes (so you can `/clear` and still keep context)
+- the resolved fast plan path – active fast plan (if any)
+- `<configured plans dir>/<branch>.md` – active full plans (if any)
+- the resolved ROADMAP.md path – strategic milestones (if any)
 
 This tells you:
 - What the project is about
@@ -143,8 +155,8 @@ Think freely. When insights crystallize, you might offer:
 If the user mentions a plan or you detect one is relevant:
 
 1. **Read existing plan for context**
-   - `.ai-factory/PLAN.md` (fast mode)
-   - `.ai-factory/plans/<branch>.md` (full mode)
+   - the resolved fast plan path (fast mode)
+   - `<configured plans dir>/<branch>.md` (full mode)
 
 2. **Reference it naturally in conversation**
    - "Your plan mentions adding Redis, but we just realized SQLite fits better..."
@@ -152,35 +164,35 @@ If the user mentions a plan or you detect one is relevant:
 
 3. **Offer to capture when decisions are made**
 
-   Default in explore mode: capture everything in `.ai-factory/RESEARCH.md` so it survives `/clear`.
+   Default in explore mode: capture everything in the resolved research path so it survives `/clear`.
    Later (during planning), you can migrate stabilized decisions into the appropriate context file.
 
    | Insight Type | Capture Now (Explore) | Later (Optional) |
    |--------------|------------------------|------------------|
-   | New requirement | `.ai-factory/RESEARCH.md` | `.ai-factory/DESCRIPTION.md` |
-   | Architecture decision | `.ai-factory/RESEARCH.md` | `.ai-factory/ARCHITECTURE.md` |
-   | Project convention | `.ai-factory/RESEARCH.md` | `.ai-factory/RULES.md` |
-   | Strategic direction | `.ai-factory/RESEARCH.md` | `.ai-factory/ROADMAP.md` |
-   | Assumption invalidated | `.ai-factory/RESEARCH.md` | Relevant file |
-   | Exploration context (persisted) | `.ai-factory/RESEARCH.md` | (keep in RESEARCH) |
-   | New task/feature | Run `/aif-plan` | `.ai-factory/PLAN.md` or `.ai-factory/plans/<branch>.md` |
+   | New requirement | `paths.research` | `paths.description` |
+   | Architecture decision | `paths.research` | `paths.architecture` |
+   | Project convention | `paths.research` | `paths.rules_file` |
+   | Strategic direction | `paths.research` | `paths.roadmap` |
+   | Assumption invalidated | `paths.research` | Relevant file |
+   | Exploration context (persisted) | `paths.research` | (keep in research) |
+   | New task/feature | Run `/aif-plan` | `paths.plan` or `paths.plans/<branch-or-slug>.md` |
 
    Example offers:
-   - "Want me to save this to `.ai-factory/RESEARCH.md` so you can `/clear` and come back later?"
+   - "Want me to save this to the resolved research path so you can `/clear` and come back later?"
    - "That's an architecture decision — save it to RESEARCH now and we can migrate it to ARCHITECTURE during planning."
 
 4. **The user decides** - Offer and move on. Don't pressure. Don't auto-capture.
 
-### Optional: Persist exploration context (`.ai-factory/RESEARCH.md`)
+### Optional: Persist exploration context (`paths.research`)
 
 If the conversation is crystallizing (you're about to plan, you want to `/clear`, or you want to continue later), offer to save a compact, durable research snapshot.
 
-**Hard rule in explore mode:** If the user chooses to save, you may write/edit **only** `.ai-factory/RESEARCH.md` (and create the `.ai-factory/` directory if missing). Do not write or modify any other project files.
+**Hard rule in explore mode:** If the user chooses to save, you may write/edit **only** the resolved research path (and create its parent directory if missing). Do not write or modify any other project files.
 
 Ask:
 
 ```
-Save these exploration results to .ai-factory/RESEARCH.md so we can /clear and /aif-plan can reuse them?
+Save these exploration results to the resolved research path so we can /clear and /aif-plan can reuse them?
 
 Options:
 1. Yes — update Active Summary + append a new Session (recommended)
@@ -189,8 +201,8 @@ Options:
 ```
 
 If user selects (1) or (2):
-- Ensure `.ai-factory/` exists (`mkdir -p .ai-factory`)
-- If `.ai-factory/RESEARCH.md` does not exist, create it with this skeleton:
+- Ensure the parent directory of the resolved research path exists (`mkdir -p "$(dirname "<resolved research path>")"`)
+- If the resolved research path does not exist, create it with this skeleton:
 
 ```markdown
 # Research

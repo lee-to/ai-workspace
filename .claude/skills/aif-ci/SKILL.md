@@ -498,3 +498,9 @@ Display summary using format from `references/AUDIT-REPORT.md` (Summary Display 
 ### 7.2 Suggest Follow-Up Skills
 
 Suggest: `/aif-build-automation` for CI targets in Makefile/Taskfile, `/aif-dockerize` for containerization.
+
+## Artifact Ownership and Config Policy
+
+- Primary ownership: CI pipeline artifacts such as `.github/workflows/*` and `.gitlab-ci.yml`.
+- Allowed companion updates: none by default outside CI files.
+- Config policy: config-agnostic by design. This skill relies on repository detection and explicit user choices, not `config.yaml`.

@@ -525,6 +525,425 @@ fn test_list_no_project_required() {
 }
 
 #[test]
+fn test_link_add_list_and_rm_by_slug() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Auth Service",
+            "--slug",
+            "auth",
+            "--group",
+            "platform",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Billing API",
+            "--slug",
+            "billing",
+            "--group",
+            "platform",
+        ],
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &[
+            "link",
+            "add",
+            "billing",
+            "auth",
+            "--kind",
+            "depends_on",
+            "--label",
+            "JWT",
+        ],
+    );
+    assert!(success, "link add should succeed: {stderr}");
+    assert!(stdout.contains("Linked billing -> auth"));
+    let link_id = parse_id(&stdout);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, billing_dir.path(), &["link", "list"]);
+    assert!(success, "link list should succeed: {stderr}");
+    assert!(stdout.contains("billing"));
+    assert!(stdout.contains("auth"));
+    assert!(stdout.contains("depends_on"));
+    assert!(stdout.contains("JWT"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &["link", "list", "--project", "auth"],
+    );
+    assert!(success, "link list --project should succeed: {stderr}");
+    assert!(stdout.contains("Incoming links for auth"));
+    assert!(stdout.contains("billing"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &["link", "rm", &link_id.to_string()],
+    );
+    assert!(success, "link rm should succeed: {stderr}");
+    assert!(stdout.contains("Removed link billing -> auth"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, billing_dir.path(), &["link", "list"]);
+    assert!(success, "link list after rm should succeed: {stderr}");
+    assert!(stdout.contains("Service links: (none)"));
+}
+
+#[test]
+fn test_link_rejects_invalid_kind_with_clap_values() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let billing_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &["init", "--name", "Auth Service", "--slug", "auth"],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &["init", "--name", "Billing API", "--slug", "billing"],
+    );
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        billing_dir.path(),
+        &["link", "add", "billing", "auth", "--kind", "invalid"],
+    );
+    assert!(!success, "invalid link kind should fail");
+    assert!(stderr.contains("depends_on"));
+    assert!(stderr.contains("related_to"));
+}
+
+#[test]
+fn test_artifact_dependency_commands_and_status_summary() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Auth Service",
+            "--slug",
+            "auth",
+            "--group",
+            "platform",
+        ],
+    );
+    fs::write(api_dir.path().join("auth.md"), "# Auth contract").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "init",
+            "--name",
+            "API Service",
+            "--slug",
+            "api",
+            "--group",
+            "platform",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "auth.md", "--label", "auth-contract"],
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "auth-contract",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    assert!(success, "artifact depends should succeed: {stderr}");
+    assert!(stdout.contains("depending on 'auth'"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["artifact", "deps"]);
+    assert!(success, "artifact deps should succeed: {stderr}");
+    assert!(stdout.contains("auth.md"));
+    assert!(stdout.contains("auth"));
+    assert!(stdout.contains("references"));
+    assert!(stdout.contains("update"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["status"]);
+    assert!(success, "status should succeed: {stderr}");
+    assert!(stdout.contains("Dependencies"));
+    assert!(stdout.contains("auth:references:update"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "undepend",
+            "auth-contract",
+            "auth",
+            "--kind",
+            "references",
+        ],
+    );
+    assert!(success, "artifact undepend should succeed: {stderr}");
+    assert!(stdout.contains("Removed 1 artifact dependency"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["artifact", "deps"]);
+    assert!(
+        success,
+        "artifact deps after undepend should succeed: {stderr}"
+    );
+    assert!(stdout.contains("Artifact dependencies: (none)"));
+}
+
+#[test]
+fn test_artifact_dependency_rejects_invalid_reaction_with_clap_values() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &["init", "--name", "Auth Service", "--slug", "auth"],
+    );
+    fs::write(api_dir.path().join("auth.md"), "# Auth contract").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["init", "--name", "API Service", "--slug", "api"],
+    );
+    run_cmd_in_dir(&db_path, api_dir.path(), &["share", "auth.md"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "auth.md",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "invalid",
+        ],
+    );
+    assert!(!success, "invalid reaction should fail");
+    assert!(stderr.contains("inspect"));
+    assert!(stderr.contains("remove_reference"));
+}
+
+#[test]
+fn test_event_commands_create_inbox_close_and_rm() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Auth Service",
+            "--slug",
+            "auth",
+            "--group",
+            "platform",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "init",
+            "--name",
+            "API Service",
+            "--slug",
+            "api",
+            "--group",
+            "platform",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["link", "add", "api", "auth", "--kind", "depends_on"],
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "event",
+            "create",
+            "--kind",
+            "service_changed",
+            "--source",
+            "auth",
+            "--severity",
+            "warning",
+            "--title",
+            "Auth changed",
+            "--body",
+            "Token format changed",
+        ],
+    );
+    assert!(success, "event create should succeed: {stderr}");
+    assert!(stdout.contains("Created event 'Auth changed'"));
+    assert!(stdout.contains("Affected services"));
+    assert!(stdout.contains("api"));
+    let event_id = parse_id(&stdout);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["event", "inbox"]);
+    assert!(success, "event inbox should succeed: {stderr}");
+    assert!(stdout.contains("Auth changed"));
+    assert!(stdout.contains("service_changed"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["event", "show", &event_id.to_string()],
+    );
+    assert!(success, "event show should succeed: {stderr}");
+    assert!(stdout.contains("Token format changed"));
+    assert!(stdout.contains("linked_service"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["event", "close", &event_id.to_string()],
+    );
+    assert!(success, "event close should succeed: {stderr}");
+    assert!(stdout.contains("Closed event"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["event", "list", "--source", "auth", "--status", "closed"],
+    );
+    assert!(success, "event list should succeed: {stderr}");
+    assert!(stdout.contains("closed"));
+    assert!(stdout.contains("Auth changed"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["event", "rm", &event_id.to_string()],
+    );
+    assert!(success, "event rm should succeed: {stderr}");
+    assert!(stdout.contains("Removed event"));
+}
+
+#[test]
+fn test_destroy_generates_service_deleted_event_with_artifacts() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Auth Service",
+            "--slug",
+            "auth",
+            "--group",
+            "platform",
+        ],
+    );
+    fs::write(api_dir.path().join("auth.md"), "# Auth contract").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "init",
+            "--name",
+            "API Service",
+            "--slug",
+            "api",
+            "--group",
+            "platform",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "auth.md", "--label", "auth-contract"],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["link", "add", "api", "auth", "--kind", "depends_on"],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "auth-contract",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["destroy", "auth"]);
+    assert!(success, "destroy should succeed: {stderr}");
+    assert!(stdout.contains("Removed project 'Auth Service'"));
+    assert!(stdout.contains("event id="));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["event", "list", "--source", "auth"],
+    );
+    assert!(success, "event list after destroy should succeed: {stderr}");
+    assert!(stdout.contains("service_deleted"));
+    assert!(stdout.contains("Service deleted: Auth Service"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["event", "inbox"]);
+    assert!(
+        success,
+        "event inbox after destroy should succeed: {stderr}"
+    );
+    assert!(stdout.contains("service_deleted"));
+    assert!(stdout.contains("Service deleted: Auth Service"));
+}
+
+#[test]
 fn test_destroy_orphaned_project_by_registered_path() {
     let (_db_dir, db_path) = temp_db();
     let root_dir = tempfile::tempdir().unwrap();
@@ -908,11 +1327,18 @@ fn test_export_creates_json() {
     assert!(config_path.exists(), ".ai-workspace.json should be created");
 
     let content = fs::read_to_string(&config_path).unwrap();
-    assert!(content.contains("\"my-proj\""));
-    assert!(content.contains("team"));
-    assert!(content.contains("readme.md"));
-    assert!(content.contains("docs"));
-    assert!(content.contains("important note"));
+    let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(config["name"], "my-proj");
+    assert_eq!(config["slug"], "my-proj");
+    assert_eq!(config["groups"][0], "team");
+    assert_eq!(config["share"][0]["path"], "readme.md");
+    assert_eq!(config["share"][0]["label"], "docs");
+    assert_eq!(config["share"][0]["kind"], "file");
+    assert_eq!(
+        config["share"][0]["dependencies"].as_array().unwrap().len(),
+        0
+    );
+    assert_eq!(config["notes"][0]["content"], "important note");
 }
 
 #[test]
@@ -923,6 +1349,7 @@ fn test_init_reads_json() {
     // Write .ai-workspace.json before init
     let config = r#"{
         "name": "from-json",
+        "slug": "from-json-slug",
         "groups": ["team-a"],
         "share": ["README.md"],
         "notes": [{"content": "hello from json", "label": "greeting"}]
@@ -933,12 +1360,61 @@ fn test_init_reads_json() {
     let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
     assert!(success, "init with json should succeed");
     assert!(stdout.contains("from-json"));
+    assert!(stdout.contains("slug=from-json-slug"));
 
     // Verify state via status
     let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
     assert!(stdout.contains("from-json"));
+    assert!(stdout.contains("from-json-slug"));
     assert!(stdout.contains("team-a"));
     assert!(stdout.contains("greeting"));
+}
+
+#[test]
+fn test_init_syncs_config_share_kind_and_dependencies() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &["init", "--name", "Auth", "--slug", "auth"],
+    );
+    fs::create_dir(api_dir.path().join("docs")).unwrap();
+    fs::write(api_dir.path().join("docs/auth.md"), "# Auth").unwrap();
+
+    let config = r#"{
+        "name": "API",
+        "slug": "api",
+        "share": [
+            {
+                "path": "docs",
+                "kind": "dir",
+                "dependencies": [
+                    {
+                        "service": "auth",
+                        "kind": "references",
+                        "reaction": "update"
+                    }
+                ]
+            }
+        ]
+    }"#;
+    fs::write(api_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["init"]);
+    assert!(
+        success,
+        "init should sync config dependencies\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("dependencies +1 -0 ~0"));
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, api_dir.path(), &["status"]);
+    assert!(success, "status should succeed");
+    assert!(stdout.contains("docs"));
+    assert!(stdout.contains("dir"));
+    assert!(stdout.contains("auth:references:update"));
 }
 
 #[test]

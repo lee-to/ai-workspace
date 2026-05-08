@@ -525,3 +525,9 @@ See supporting files for more details:
 - [references/LEARN-MODE.md](references/LEARN-MODE.md) - Learn Mode: self-learning from URLs
 - [scripts/security-scan.py](scripts/security-scan.py) - Security scanner for prompt injection detection
 - [templates/](templates/) - Starter templates
+
+## Artifact Ownership and Config Policy
+
+- Primary ownership: generated skill packages (`SKILL.md`, `references/*`, `scripts/*`, `templates/*`, `assets/*`) in the target skill directory.
+- Allowed companion updates: none outside the generated skill package by default.
+- Config policy: config-agnostic by design. Skill generation and validation are driven by user input, external sources, and the Agent Skills spec rather than `config.yaml`.

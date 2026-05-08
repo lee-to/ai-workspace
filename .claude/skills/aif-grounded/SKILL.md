@@ -103,10 +103,15 @@ To reach 100:
 - <1–3 concrete asks or commands for the user to run and paste output>
 ```
 
+## Artifact Ownership and Config Policy
+
+- Primary ownership: none. This skill is a reliability gate for answers, not an artifact-producing workflow.
+- Write policy: do not create or modify project artifacts by default.
+- Config policy: config-agnostic by design. Evidence comes from the repo, command outputs, provided docs, and authoritative sources, not from `config.yaml`.
+
 ## Implementation guardrail
 
 If the user asks for code changes:
 - You may explore the repo and propose what evidence is needed.
 - Only apply patches once confidence can be 100 (e.g., requirements are precise + you can verify build/tests or equivalent checks).
 - If the repo lacks a verification path (no build/tests and behavior can’t be validated), do not claim 100; return INSUFFICIENT INFORMATION and propose the minimal validation needed.
-

@@ -12,6 +12,17 @@ Generate commit messages following the [Conventional Commits](https://www.conven
 
 ## Workflow
 
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.roadmap`, and `paths.rules`
+- **Language:** `language.ui` for prompts and commit message conventions
+- **Git preference:** `git.skip_push_after_commit` for post-commit push behavior
+- **Rules hierarchy:** `rules.base` plus any named `rules.<area>` entries
+
+If config.yaml doesn't exist, use defaults:
+- Paths: `.ai-factory/` for all artifacts
+- Language: `en` (English)
+- Git preference: `skip_push_after_commit: false`
+
 **Read `.ai-factory/skill-context/aif-commit/SKILL.md`** — MANDATORY if the file exists.
 
 This file contains project-specific rules accumulated by `/aif-evolve` from patches,
@@ -38,10 +49,12 @@ If any rule is violated — fix the output before presenting it to the user.
    - If nothing staged, show warning and suggest staging
 
 2. **Run Context Gates (Read-Only)**
-   - Check `.ai-factory/ARCHITECTURE.md` and `.ai-factory/DESCRIPTION.md` (if present) to catch obvious scope/boundary drift
-   - Check `.ai-factory/RULES.md` and `.ai-factory/ROADMAP.md` (if present) to catch rule and milestone alignment issues
+   - Check the resolved architecture and description artifacts (use paths from config) to catch obvious scope/boundary drift
+   - Check the resolved RULES.md and roadmap artifacts (use paths from config) to catch rule and milestone alignment issues
+   - Check rules hierarchy (resolved `paths.rules_file` + `rules.base` + named `rules.<area>`) for commit conventions
    - Missing optional files (`ROADMAP.md`, `RULES.md`) are `WARN`, not blockers
    - Never modify context artifacts from this command
+   - If the user wants a standalone rules-only pass, suggest `/aif-rules-check`; keep `/aif-commit` gate labels at `WARN` / `ERROR`
 
 3. **Determine Commit Type**
    - `feat`: New feature
@@ -128,23 +141,27 @@ When invoked:
    - **Cancel** → stop, do NOT commit. End the workflow
 
 8. Execute `git commit` with the confirmed message
-9. After a successful commit, offer to push:
-   - Show branch/ahead status: `git status -sb`
-   - If the branch has no upstream, use: `git push -u origin <branch>`
-   - Otherwise: `git push`
+9. Post-commit push handling:
+   - If `git.skip_push_after_commit = true` in resolved config:
+     - Skip push prompt entirely
+     - End workflow after successful local commit
+   - Otherwise (default behavior), offer to push:
+     - Show branch/ahead status: `git status -sb`
+     - If the branch has no upstream, use: `git push -u origin <branch>`
+     - Otherwise: `git push`
 
-   ```
-   AskUserQuestion: Push to remote?
+     ```
+     AskUserQuestion: Push to remote?
 
-   Options:
-   1. Push now
-   2. Skip push
-   ```
+     Options:
+     1. Push now
+     2. Skip push
+     ```
 
-   - **Push now** → execute push command based on upstream status:
-     - if branch has no upstream → `git push -u origin <branch>`
-     - otherwise → `git push`
-   - **Skip push** → end the workflow
+     - **Push now** → execute push command based on upstream status:
+       - if branch has no upstream → `git push -u origin <branch>`
+       - otherwise → `git push`
+     - **Skip push** → end the workflow
 
 If argument provided (e.g., `/aif-commit auth`):
 - Use it as the scope
@@ -155,7 +172,7 @@ If argument provided (e.g., `/aif-commit auth`):
 - Never commit secrets or credentials
 - Review large diffs carefully before committing
 - `/aif-commit` has no implicit strict mode — context gates are warning-first unless user explicitly requests blocking behavior
-- Treat `.ai-factory/ARCHITECTURE.md`, `.ai-factory/ROADMAP.md`, `.ai-factory/RULES.md`, and `.ai-factory/DESCRIPTION.md` as read-only context in this command
+- Treat the resolved architecture, roadmap, RULES.md, and description artifacts as read-only context in this command
 - If staged changes contain unrelated work (e.g., a feature + a bugfix, or changes to independent modules), suggest splitting into separate commits:
   1. Show which files/hunks belong to which commit
   2. Confirm split plan with the user:

@@ -517,3 +517,9 @@ Templates: `templates/deploy.sh`, `templates/update.sh`, `templates/logs.sh`, `t
 Display a summary of all created/updated files using the format from `references/SUMMARY-FORMAT.md`.
 
 Suggest follow-up: `/aif-build-automation` for Docker targets, `/aif-docs` for documentation.
+
+## Artifact Ownership and Config Policy
+
+- Primary ownership: Docker artifacts (`Dockerfile`, `compose*.yml`, `.dockerignore`, `docker/*`, `deploy/scripts/*`, and related `.env.example` scaffolding when created by this skill).
+- Allowed companion updates: none outside Docker and deployment artifacts by default.
+- Config policy: config-agnostic by design. This skill uses repository detection, explicit infrastructure choices, and fixed AI Factory context files rather than `config.yaml`.

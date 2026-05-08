@@ -274,3 +274,9 @@ or using optional chaining: `user?.profile?.name`"
 | Errors | Specific types, never swallow, log context |
 | Tests | AAA pattern, test behavior, descriptive names |
 | Reviews | Be specific, suggest solutions, be kind |
+
+## Artifact Ownership and Config Policy
+
+- Primary ownership: none. This skill is advisory and reference-only.
+- Write policy: do not create or modify project artifacts by default.
+- Config policy: config-agnostic by design. Follow repository context, `.ai-factory/ARCHITECTURE.md`, and skill-context overrides instead of reading `config.yaml`.

@@ -90,7 +90,7 @@ macro_rules! string_enum {
     ) => {
         $(#[$meta])*
         #[allow(dead_code)]
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
         #[serde(rename_all = "snake_case")]
         pub enum $name {
             $($variant),+
@@ -300,29 +300,63 @@ pub struct FileSearchHit {
 
 // --- Workspace Config (for .ai-workspace.json) ---
 
+/// An artifact dependency entry in the config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyEntry {
+    pub service: String,
+    pub kind: ArtifactDependencyKind,
+    pub reaction: ArtifactReaction,
+}
+
+fn option_vec_is_none<T>(value: &Option<Vec<T>>) -> bool {
+    value.is_none()
+}
+
 /// A shared item entry in the config file.
-/// String form = path only (no label). Object form = path + label.
+/// String form = legacy path only. Object form can include label, kind, and dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ShareEntry {
     /// Just a path string, no label
     PathOnly(String),
-    /// Object with path and optional label
-    WithLabel { path: String, label: String },
+    /// Object with path and optional metadata
+    WithMetadata {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SharedItemKind>,
+        #[serde(default, skip_serializing_if = "option_vec_is_none")]
+        dependencies: Option<Vec<DependencyEntry>>,
+    },
 }
 
 impl ShareEntry {
     pub fn path(&self) -> &str {
         match self {
             ShareEntry::PathOnly(p) => p,
-            ShareEntry::WithLabel { path, .. } => path,
+            ShareEntry::WithMetadata { path, .. } => path,
         }
     }
 
     pub fn label(&self) -> Option<&str> {
         match self {
             ShareEntry::PathOnly(_) => None,
-            ShareEntry::WithLabel { label, .. } => Some(label),
+            ShareEntry::WithMetadata { label, .. } => label.as_deref(),
+        }
+    }
+
+    pub fn kind(&self) -> Option<SharedItemKind> {
+        match self {
+            ShareEntry::PathOnly(_) => None,
+            ShareEntry::WithMetadata { kind, .. } => *kind,
+        }
+    }
+
+    pub fn dependencies(&self) -> Option<&[DependencyEntry]> {
+        match self {
+            ShareEntry::PathOnly(_) => None,
+            ShareEntry::WithMetadata { dependencies, .. } => dependencies.as_deref(),
         }
     }
 }
@@ -339,6 +373,8 @@ pub struct NoteEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -354,6 +390,9 @@ pub struct SyncReport {
     pub groups_removed: usize,
     pub shares_added: usize,
     pub shares_removed: usize,
+    pub dependencies_added: usize,
+    pub dependencies_removed: usize,
+    pub dependencies_updated: usize,
     pub notes_added: usize,
     pub notes_removed: usize,
     pub notes_updated: usize,
@@ -546,9 +585,11 @@ mod tests {
 
     #[test]
     fn share_entry_with_label_serde() {
-        let entry = ShareEntry::WithLabel {
+        let entry = ShareEntry::WithMetadata {
             path: "config.yml".to_string(),
-            label: "deploy config".to_string(),
+            label: Some("deploy config".to_string()),
+            kind: None,
+            dependencies: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: ShareEntry = serde_json::from_str(&json).unwrap();
@@ -557,15 +598,39 @@ mod tests {
     }
 
     #[test]
+    fn share_entry_with_kind_and_dependencies_serde() {
+        let entry = ShareEntry::WithMetadata {
+            path: "docs/auth.md".to_string(),
+            label: Some("auth docs".to_string()),
+            kind: Some(SharedItemKind::File),
+            dependencies: Some(vec![DependencyEntry {
+                service: "auth".to_string(),
+                kind: ArtifactDependencyKind::References,
+                reaction: ArtifactReaction::Update,
+            }]),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"kind\":\"file\""));
+        assert!(json.contains("\"service\":\"auth\""));
+        let parsed: ShareEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path(), "docs/auth.md");
+        assert_eq!(parsed.kind(), Some(SharedItemKind::File));
+        assert_eq!(parsed.dependencies().unwrap()[0].service, "auth");
+    }
+
+    #[test]
     fn workspace_config_serde_roundtrip() {
         let config = WorkspaceConfig {
             name: "my-project".to_string(),
+            slug: Some("my-project".to_string()),
             groups: vec!["team-a".to_string()],
             share: vec![
                 ShareEntry::PathOnly("README.md".to_string()),
-                ShareEntry::WithLabel {
+                ShareEntry::WithMetadata {
                     path: "api.json".to_string(),
-                    label: "API spec".to_string(),
+                    label: Some("API spec".to_string()),
+                    kind: Some(SharedItemKind::File),
+                    dependencies: None,
                 },
             ],
             notes: vec![NoteEntry {
@@ -582,6 +647,7 @@ mod tests {
     fn workspace_config_empty_fields_omitted() {
         let config = WorkspaceConfig {
             name: "minimal".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![],
@@ -599,6 +665,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "test-proj".to_string(),
+            slug: None,
             groups: vec!["grp".to_string()],
             share: vec![ShareEntry::PathOnly("file.txt".to_string())],
             notes: vec![NoteEntry {

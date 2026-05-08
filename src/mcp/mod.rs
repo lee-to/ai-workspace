@@ -224,6 +224,77 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         },
                         "required": ["query"]
                     }
+                },
+                {
+                    "name": "workspace_service_graph",
+                    "description": "Inspect directional service links for all projects, one group, or a project's group graph",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional project id, slug, or registered path whose group graph should be returned"
+                            },
+                            "project_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Optional project ID whose group graph should be returned"
+                            },
+                            "group_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Optional group ID whose service graph should be returned"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "workspace_events",
+                    "description": "List workspace events or a project's open event inbox",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional project id, slug, or registered path for inbox mode"
+                            },
+                            "project_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Optional project ID for inbox mode"
+                            },
+                            "source": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional source service slug filter for list mode"
+                            },
+                            "status": {
+                                "type": "string",
+                                "enum": ["open", "closed"],
+                                "description": "Optional event status filter for list mode"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "workspace_event_details",
+                    "description": "Get an event with affected services and affected artifacts",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "event_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Workspace event ID"
+                            }
+                        },
+                        "required": ["event_id"],
+                        "additionalProperties": false
+                    }
                 }
             ]
         }),
@@ -255,11 +326,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_eight_tools() {
+    fn handle_tools_list_returns_eleven_tools() {
         let resp = handle_tools_list(json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 11);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
         assert!(names.contains(&"workspace_read"));
@@ -269,6 +340,9 @@ mod tests {
         assert!(names.contains(&"project_tree"));
         assert!(names.contains(&"project_grep"));
         assert!(names.contains(&"workspace_search_fulltext"));
+        assert!(names.contains(&"workspace_service_graph"));
+        assert!(names.contains(&"workspace_events"));
+        assert!(names.contains(&"workspace_event_details"));
     }
 
     #[test]

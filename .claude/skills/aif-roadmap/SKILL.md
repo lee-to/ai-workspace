@@ -1,6 +1,6 @@
 ---
 name: aif-roadmap
-description: Create or update a project roadmap with major milestones. Generates .ai-factory/ROADMAP.md — a strategic checklist of high-level goals. Use when user says "roadmap", "project plan", "milestones", or "what to build next".
+description: Create or update a project roadmap with major milestones. Generates the configured roadmap artifact (default .ai-factory/ROADMAP.md) — a strategic checklist of high-level goals. Use when user says "roadmap", "project plan", "milestones", or "what to build next".
 argument-hint: "[check | project vision or requirements]"
 allowed-tools: Read Write Edit Glob Grep Bash(git *) AskUserQuestion Questions
 disable-model-invocation: true
@@ -14,12 +14,20 @@ Create and maintain a high-level project roadmap with major milestones.
 
 ### Step 0: Load Project Context
 
-**Read `.ai-factory/DESCRIPTION.md`** if it exists to understand:
+**FIRST:** Read `.ai-factory/config.yaml` if it exists to resolve:
+- **Paths:** `paths.description`, `paths.architecture`, `paths.rules_file`, `paths.roadmap`, `paths.research`, and `paths.rules`
+- **Language:** `language.ui` for prompts, `language.artifacts` for generated content
+
+If config.yaml doesn't exist, use defaults:
+- Paths: `.ai-factory/` for all artifacts
+- Language: `en` (English)
+
+**Read `.ai-factory/DESCRIPTION.md`** (use path from config) if it exists to understand:
 - Tech stack (language, framework, database, ORM)
 - Project architecture and conventions
 - Non-functional requirements
 
-**Read `.ai-factory/ARCHITECTURE.md`** if it exists to understand:
+**Read the resolved architecture artifact** if it exists (`paths.architecture`, default: `.ai-factory/ARCHITECTURE.md`) to understand:
 - Chosen architecture pattern and folder structure
 - Module boundaries and communication patterns
 
@@ -45,9 +53,9 @@ If any rule is violated — fix the output before presenting it to the user.
 
 ### Step 1: Determine Mode
 
-If argument is `check` → Mode 3: Check Progress (requires ROADMAP.md)
+If argument is `check` → Mode 3: Check Progress (requires the resolved roadmap path)
 
-Otherwise check if `.ai-factory/ROADMAP.md` exists:
+Otherwise check if the resolved roadmap path exists (`paths.roadmap`, default: `.ai-factory/ROADMAP.md`):
 - **Does NOT exist** → Mode 1: Create Roadmap
 - **Exists** → Mode 2: Update Roadmap
 
@@ -72,7 +80,9 @@ Options:
 3. Both — I'll describe, you'll add what's missing
 ```
 
-If user chooses to describe → ask follow-up:
+**Based on choice:**
+- "Analyze codebase and suggest milestones" → proceed to Step 1.2
+- "Let me describe the vision" or "Both" → collect user description (if "Both", also add codebase analysis in Step 1.2), then ask follow-up:
 
 ```
 AskUserQuestion: Any priorities or deadlines?
@@ -92,7 +102,7 @@ Scan the project to understand what's already built:
 
 **1.3: Generate ROADMAP.md**
 
-Create `.ai-factory/ROADMAP.md` with this format:
+Create the resolved roadmap artifact (default: `.ai-factory/ROADMAP.md`) with this format:
 
 ```markdown
 # Project Roadmap
@@ -133,7 +143,7 @@ Options:
 4. Rewrite — let me give better input
 ```
 
-Apply changes if requested, then save to `.ai-factory/ROADMAP.md`.
+Apply changes if requested, then save to the resolved roadmap path.
 
 ---
 
@@ -141,8 +151,8 @@ Apply changes if requested, then save to `.ai-factory/ROADMAP.md`.
 
 **2.1: Read Current State**
 
-- Read `.ai-factory/ROADMAP.md`
-- Read `.ai-factory/DESCRIPTION.md` for context
+- Read the resolved roadmap path
+- Read `.ai-factory/DESCRIPTION.md` (use path from config) for context
 - Explore codebase briefly to check what's changed since last update
 
 **2.2: Determine Action**
@@ -185,17 +195,17 @@ If confirmed:
 
 - Ask user to describe new milestones
 - Insert them in logical order among existing milestones
-- Update `.ai-factory/ROADMAP.md`
+- Update the resolved roadmap path
 
 **2.5: Reprioritize (if chosen)**
 
 - Show current order
 - Ask user for new order or let them describe priority changes
-- Reorder milestones in `.ai-factory/ROADMAP.md`
+- Reorder milestones in the resolved roadmap path
 
 **2.6: Save Changes**
 
-Update `.ai-factory/ROADMAP.md` with all modifications.
+Update the resolved roadmap path with all modifications.
 
 Show summary:
 ```
@@ -206,7 +216,7 @@ Completed: X/N
 Next up: **Milestone Name**
 
 To start working on the next milestone:
-/aif-plan <milestone description>  → creates branch + plan
+/aif-plan <milestone description>  → creates a plan and optional branch/worktree flow
 /aif-implement                     → executes the plan
 ```
 
@@ -216,12 +226,12 @@ To start working on the next milestone:
 
 Automated scan — analyze the codebase and mark completed milestones without interactive questions.
 
-**Requires** `.ai-factory/ROADMAP.md` to exist. If it doesn't — tell the user to run `/aif-roadmap` first.
+**Requires** the resolved roadmap path to exist. If it doesn't — tell the user to run `/aif-roadmap` first.
 
 **3.1: Read roadmap and project context**
 
-- Read `.ai-factory/ROADMAP.md`
-- Read `.ai-factory/DESCRIPTION.md` for tech stack context
+- Read the resolved roadmap path
+- Read `.ai-factory/DESCRIPTION.md` (use path from config) for tech stack context
 
 **3.2: Analyze each unchecked milestone**
 

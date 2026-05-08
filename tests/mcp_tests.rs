@@ -272,6 +272,93 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+fn seed_service_event_data(db_path: &PathBuf) -> (tempfile::TempDir, tempfile::TempDir) {
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(api_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        api_dir.path().join("docs/auth.md"),
+        "Auth integration notes",
+    )
+    .unwrap();
+
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(dir)
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command failed: {:?}\nstdout={}\nstderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "platform",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "init", "--name", "API", "--slug", "api", "--group", "platform",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &["share", "docs/auth.md", "--label", "auth-doc"],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "link",
+            "add",
+            "api",
+            "auth",
+            "--kind",
+            "depends_on",
+            "--label",
+            "JWT",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "docs/auth.md",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "event",
+            "create",
+            "--kind",
+            "service_changed",
+            "--source",
+            "auth",
+            "--severity",
+            "warning",
+            "--title",
+            "Auth changed",
+        ],
+    );
+
+    (auth_dir, api_dir)
+}
+
 #[test]
 fn test_mcp_initialize() {
     let (_db_dir, db_path) = temp_db();
@@ -315,6 +402,9 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"workspace_search"));
     assert!(tool_names.contains(&"list_groups"));
     assert!(tool_names.contains(&"list_projects"));
+    assert!(tool_names.contains(&"workspace_service_graph"));
+    assert!(tool_names.contains(&"workspace_events"));
+    assert!(tool_names.contains(&"workspace_event_details"));
 }
 
 #[test]
@@ -346,6 +436,106 @@ fn test_mcp_workspace_context() {
     // Verify labels appear in shared_items
     let shared_items = context["projects"][0]["shared_items"].as_array().unwrap();
     assert!(shared_items.iter().any(|i| i["label"] == "readme"));
+}
+
+#[test]
+fn test_mcp_service_graph_events_and_event_details() {
+    let (_db_dir, db_path) = temp_db();
+    let (_auth_dir, _api_dir) = seed_service_event_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_context",
+                    "arguments": {}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_service_graph",
+                    "arguments": { "project": "api" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_events",
+                    "arguments": { "project": "api" }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 3);
+
+    let context_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(context_text).unwrap();
+    let api = context["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["slug"] == "api")
+        .unwrap();
+    let auth_doc = api["shared_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == "docs/auth.md")
+        .unwrap();
+    assert_eq!(auth_doc["dependencies"][0]["service"], "auth");
+    assert_eq!(auth_doc["dependencies"][0]["reaction"], "update");
+
+    let graph_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let graph: serde_json::Value = serde_json::from_str(graph_text).unwrap();
+    assert_eq!(graph["scope"]["project"], "api");
+    assert_eq!(graph["links"][0]["from"], "api");
+    assert_eq!(graph["links"][0]["to"], "auth");
+    assert_eq!(graph["links"][0]["kind"], "depends_on");
+
+    let events_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let events: serde_json::Value = serde_json::from_str(events_text).unwrap();
+    assert_eq!(events[0]["source_project_slug"], "auth");
+    assert_eq!(events[0]["kind"], "service_changed");
+    let event_id = events[0]["id"].as_i64().unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_event_details",
+                "arguments": { "event_id": event_id }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let details_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let details: serde_json::Value = serde_json::from_str(details_text).unwrap();
+    assert_eq!(details["event"]["id"], event_id);
+    assert_eq!(details["affected_services"][0]["project"], "api");
+    assert_eq!(details["affected_artifacts"][0]["path"], "docs/auth.md");
+    assert_eq!(details["affected_artifacts"][0]["reaction"], "update");
 }
 
 #[test]

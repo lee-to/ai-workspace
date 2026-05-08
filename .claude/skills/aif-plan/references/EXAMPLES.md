@@ -71,7 +71,7 @@
 -> Asks about tests (No)
 -> Explores codebase
 -> Creates 4 tasks
--> Saves plan to .ai-factory/PLAN.md
+-> Saves plan to `paths.plan` (default: `.ai-factory/PLAN.md`)
 -> STOP
 ```
 
@@ -82,13 +82,14 @@
 
 -> mode=full
 -> Quick reconnaissance
--> Branch: feature/user-authentication
+-> Plan slug: user-authentication
+-> Branch: feature/user-authentication (if git branch creation is enabled)
 -> If ROADMAP.md exists: asks about milestone linkage, user picks one (or skips)
 -> Asks about tests (Yes), logging (Verbose), docs (Yes)
--> Creates branch
+-> Creates branch only when `git.enabled=true` and `git.create_branches=true`
 -> Explores codebase deeply
 -> Creates 8 tasks with commit checkpoints
--> Saves plan to .ai-factory/plans/feature-user-authentication.md
+-> Saves plan to `paths.plans/feature-user-authentication.md` (or `paths.plans/user-authentication.md` when no branch is created)
 -> STOP - user runs /aif-implement when ready
 ```
 
@@ -106,7 +107,7 @@
 -> Copies context files, cd into worktree
 -> Explores codebase deeply
 -> Creates 6 tasks
--> Saves plan to .ai-factory/plans/feature-stripe-checkout.md
+-> Saves plan to `paths.plans/feature-stripe-checkout.md`
 -> Auto-invokes /aif-implement (parallel = autonomous)
 ```
 

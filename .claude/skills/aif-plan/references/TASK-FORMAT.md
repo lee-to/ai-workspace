@@ -3,6 +3,9 @@
 ## Plan File Template
 
 ```markdown
+<!-- handoff:task:<HANDOFF_TASK_ID> -->
+<!-- ↑ First line: only when HANDOFF_MODE=1 and HANDOFF_TASK_ID is non-empty -->
+
 # Implementation Plan: [Feature Name]
 
 Branch: [current branch or "none"]
