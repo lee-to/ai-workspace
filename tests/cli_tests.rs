@@ -152,9 +152,11 @@ fn run_cmd_in_dir(
 
 fn parse_id(stdout: &str) -> i64 {
     let start = stdout.find("(id=").expect("stdout should contain id") + 4;
-    let end = stdout[start..]
-        .find(')')
-        .expect("id should be closed by paren")
+    let tail = &stdout[start..];
+    let end = tail
+        .find(',')
+        .or_else(|| tail.find(')'))
+        .expect("id should be followed by comma or paren")
         + start;
     stdout[start..end].parse().expect("id should be numeric")
 }
@@ -181,7 +183,7 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 3);
     let file_meta_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM files_fts_meta", [], |row| row.get(0))
         .unwrap();
@@ -200,6 +202,45 @@ fn test_init_creates_project() {
     );
     assert!(success, "init should succeed");
     assert!(stdout.contains("Initialized project 'test-project'"));
+    assert!(stdout.contains("slug=test-project"));
+}
+
+#[test]
+fn test_init_with_explicit_slug() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "Auth Service", "--slug", "auth-api"],
+    );
+    assert!(success, "init with slug should succeed");
+    assert!(stdout.contains("Initialized project 'Auth Service'"));
+    assert!(stdout.contains("slug=auth-api"));
+
+    let (stdout, _stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed");
+    assert!(stdout.contains("Slug: auth-api"));
+}
+
+#[test]
+fn test_destroy_project_by_slug_outside_project_dir() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+
+    let (_stdout, _stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "Auth Service", "--slug", "auth"],
+    );
+    assert!(success, "init should succeed");
+
+    let (stdout, _stderr, success) =
+        run_cmd_in_dir(&db_path, other_dir.path(), &["destroy", "auth"]);
+    assert!(success, "destroy slug should work outside project dir");
+    assert!(stdout.contains("Removed project 'Auth Service'"));
 }
 
 #[test]

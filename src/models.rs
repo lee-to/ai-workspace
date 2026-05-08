@@ -7,8 +7,34 @@ use std::path::Path;
 pub struct Project {
     pub id: i64,
     pub name: String,
+    pub slug: String,
     pub path: String,
     pub created_at: String,
+}
+
+pub fn normalize_project_slug(input: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for ch in input.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,6 +79,192 @@ impl std::str::FromStr for SharedItemKind {
             _ => Err(anyhow::anyhow!("unknown shared item kind: {}", s)),
         }
     }
+}
+
+macro_rules! string_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $value:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[allow(dead_code)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        #[allow(dead_code)]
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = anyhow::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(anyhow::anyhow!(
+                        "unknown {} value: {}",
+                        stringify!($name),
+                        s
+                    )),
+                }
+            }
+        }
+    };
+}
+
+string_enum! {
+    pub enum ServiceLinkKind {
+        DependsOn => "depends_on",
+        RelatedTo => "related_to",
+    }
+}
+
+string_enum! {
+    pub enum ArtifactDependencyKind {
+        References => "references",
+        ConsumesApi => "consumes_api",
+        Documents => "documents",
+        Configures => "configures",
+    }
+}
+
+string_enum! {
+    pub enum ArtifactReaction {
+        Inspect => "inspect",
+        Update => "update",
+        Delete => "delete",
+        RemoveReference => "remove_reference",
+    }
+}
+
+string_enum! {
+    pub enum WorkspaceEventKind {
+        ServiceDeleted => "service_deleted",
+        ServiceChanged => "service_changed",
+        ArtifactChanged => "artifact_changed",
+    }
+}
+
+string_enum! {
+    pub enum EventSeverity {
+        Info => "info",
+        Warning => "warning",
+        Error => "error",
+        Critical => "critical",
+    }
+}
+
+string_enum! {
+    pub enum EventStatus {
+        Open => "open",
+        Closed => "closed",
+    }
+}
+
+string_enum! {
+    pub enum EventTargetRelationKind {
+        LinkedService => "linked_service",
+        ArtifactDependency => "artifact_dependency",
+    }
+}
+
+string_enum! {
+    pub enum EventTargetStatus {
+        Open => "open",
+        Resolved => "resolved",
+    }
+}
+
+string_enum! {
+    pub enum EventArtifactStatus {
+        Open => "open",
+        Resolved => "resolved",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ServiceLink {
+    pub id: i64,
+    pub from_project_id: i64,
+    pub to_project_id: i64,
+    pub kind: ServiceLinkKind,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ArtifactDependency {
+    pub id: i64,
+    pub shared_item_id: i64,
+    pub depends_on_project_id: Option<i64>,
+    pub depends_on_project_slug_snapshot: String,
+    pub kind: ArtifactDependencyKind,
+    pub reaction: ArtifactReaction,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceEvent {
+    pub id: i64,
+    pub source_project_id: Option<i64>,
+    pub source_project_slug: String,
+    pub source_project_name: String,
+    pub group_id: Option<i64>,
+    pub kind: WorkspaceEventKind,
+    pub title: String,
+    pub body: Option<String>,
+    pub severity: EventSeverity,
+    pub status: EventStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EventTarget {
+    pub id: i64,
+    pub event_id: i64,
+    pub affected_project_id: Option<i64>,
+    pub relation_kind: EventTargetRelationKind,
+    pub status: EventTargetStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EventArtifact {
+    pub id: i64,
+    pub event_id: i64,
+    pub affected_project_id: Option<i64>,
+    pub shared_item_id: Option<i64>,
+    pub path_snapshot: String,
+    pub reaction: ArtifactReaction,
+    pub reason: String,
+    pub status: EventArtifactStatus,
+    pub created_at: String,
+    pub updated_at: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +449,7 @@ mod tests {
         let project = Project {
             id: 1,
             name: "test".to_string(),
+            slug: "test".to_string(),
             path: "/tmp/test".to_string(),
             created_at: "2024-01-01".to_string(),
         };
@@ -244,6 +457,58 @@ mod tests {
         let parsed: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, 1);
         assert_eq!(parsed.name, "test");
+        assert_eq!(parsed.slug, "test");
+    }
+
+    #[test]
+    fn normalize_project_slug_handles_names() {
+        assert_eq!(normalize_project_slug("Auth Service"), "auth-service");
+        assert_eq!(normalize_project_slug("  Billing_API!! "), "billing-api");
+        assert_eq!(normalize_project_slug("!!!"), "project");
+    }
+
+    #[test]
+    fn service_event_enums_roundtrip() {
+        assert_eq!(ServiceLinkKind::DependsOn.as_str(), "depends_on");
+        assert_eq!(
+            ServiceLinkKind::from_str("depends_on").unwrap(),
+            ServiceLinkKind::DependsOn
+        );
+        assert_eq!(ArtifactDependencyKind::ConsumesApi.as_str(), "consumes_api");
+        assert_eq!(
+            ArtifactReaction::RemoveReference.as_str(),
+            "remove_reference"
+        );
+        assert_eq!(
+            WorkspaceEventKind::ServiceDeleted.as_str(),
+            "service_deleted"
+        );
+        assert_eq!(EventSeverity::Warning.as_str(), "warning");
+        assert_eq!(EventStatus::Closed.as_str(), "closed");
+        assert_eq!(
+            EventTargetRelationKind::ArtifactDependency.as_str(),
+            "artifact_dependency"
+        );
+        assert_eq!(EventTargetStatus::Resolved.as_str(), "resolved");
+        assert_eq!(EventArtifactStatus::Open.as_str(), "open");
+        assert!(WorkspaceEventKind::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn service_link_serde_uses_snake_case_kind() {
+        let link = ServiceLink {
+            id: 1,
+            from_project_id: 10,
+            to_project_id: 20,
+            kind: ServiceLinkKind::DependsOn,
+            label: Some("runtime dependency".to_string()),
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+        };
+        let json = serde_json::to_string(&link).unwrap();
+        assert!(json.contains("\"kind\":\"depends_on\""));
+        let parsed: ServiceLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, ServiceLinkKind::DependsOn);
     }
 
     #[test]

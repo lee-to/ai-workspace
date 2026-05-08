@@ -1,8 +1,10 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info};
-use rusqlite::Connection;
+use rusqlite::{Connection, params};
 
-const CURRENT_SCHEMA_VERSION: i64 = 1;
+use crate::models::normalize_project_slug;
+
+const CURRENT_SCHEMA_VERSION: i64 = 3;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -76,6 +78,14 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
             debug!("Migration v1: baseline schema compatibility check");
             ensure_current_schema_objects(conn)
         }
+        2 => {
+            debug!("Migration v2: add project slugs");
+            migrate_projects_slug(conn)
+        }
+        3 => {
+            debug!("Migration v3: add service graph and event tables");
+            ensure_event_schema_objects(conn)
+        }
         _ => {
             error!("No migration registered for schema version {}", version);
             anyhow::bail!("No migration registered for schema version {}", version);
@@ -91,6 +101,7 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name TEXT NOT NULL,
+            slug TEXT NOT NULL UNIQUE,
             path TEXT NOT NULL UNIQUE,
             created_at DATETIME NOT NULL DEFAULT (datetime('now'))
         );
@@ -154,7 +165,100 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
         ",
     )?;
     debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
+    ensure_event_schema_objects(conn)?;
     Ok(())
+}
+
+fn migrate_projects_slug(conn: &Connection) -> Result<()> {
+    if project_has_column(conn, "slug")? {
+        debug!("projects.slug already exists; continuing migration");
+    } else {
+        execute_schema_step(
+            conn,
+            "projects.slug column",
+            "ALTER TABLE projects ADD COLUMN slug TEXT;",
+        )?;
+    }
+
+    backfill_project_slugs(conn)?;
+
+    execute_schema_step(
+        conn,
+        "projects.slug unique index",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_projects_slug ON projects(slug);",
+    )?;
+
+    Ok(())
+}
+
+fn project_has_column(conn: &Connection, column_name: &str) -> Result<bool> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(projects)")
+        .context("Failed to inspect projects table columns")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(columns.iter().any(|column| column == column_name))
+}
+
+fn backfill_project_slugs(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("SELECT id, name, path FROM projects WHERE slug IS NULL OR slug = '' ORDER BY id")
+        .context("Failed to prepare projects slug backfill query")?;
+    let projects = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .context("Failed to read projects for slug backfill")?;
+    drop(stmt);
+
+    let mut used_slugs = existing_project_slugs(conn)?;
+    for (id, name, path) in projects {
+        let source = if name.trim().is_empty() {
+            std::path::Path::new(&path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string())
+        } else {
+            name
+        };
+        let slug = unique_slug(&normalize_project_slug(&source), &mut used_slugs);
+        debug!("Backfilling project id={} with slug={}", id, slug);
+        conn.execute(
+            "UPDATE projects SET slug = ?1 WHERE id = ?2",
+            params![slug, id],
+        )
+        .with_context(|| format!("Failed to backfill slug for project id={id}"))?;
+    }
+
+    Ok(())
+}
+
+fn existing_project_slugs(conn: &Connection) -> Result<std::collections::HashSet<String>> {
+    let mut stmt = conn
+        .prepare("SELECT slug FROM projects WHERE slug IS NOT NULL AND slug != ''")
+        .context("Failed to prepare existing project slug query")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    Ok(rows
+        .collect::<std::result::Result<Vec<_>, _>>()?
+        .into_iter()
+        .collect())
+}
+
+fn unique_slug(base: &str, used_slugs: &mut std::collections::HashSet<String>) -> String {
+    let mut candidate = base.to_string();
+    let mut suffix = 2;
+    while used_slugs.contains(&candidate) {
+        candidate = format!("{base}-{suffix}");
+        suffix += 1;
+    }
+    used_slugs.insert(candidate.clone());
+    candidate
 }
 
 fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<()> {
@@ -165,6 +269,91 @@ fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<
             err
         })
         .with_context(|| format!("Failed to initialize schema object: {step_name}"))
+}
+
+fn ensure_event_schema_objects(conn: &Connection) -> Result<()> {
+    execute_schema_step(
+        conn,
+        "service graph and event tables",
+        "
+        CREATE TABLE IF NOT EXISTS service_links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            to_project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN ('depends_on', 'related_to')),
+            label TEXT,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            CHECK (from_project_id != to_project_id),
+            UNIQUE (from_project_id, to_project_id, kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS artifact_dependencies (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shared_item_id INTEGER NOT NULL REFERENCES shared_items(id) ON DELETE CASCADE,
+            depends_on_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            depends_on_project_slug_snapshot TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('references', 'consumes_api', 'documents', 'configures')),
+            reaction TEXT NOT NULL CHECK (reaction IN ('inspect', 'update', 'delete', 'remove_reference')),
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (shared_item_id, depends_on_project_slug_snapshot, kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS workspace_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            source_project_slug TEXT NOT NULL,
+            source_project_name TEXT NOT NULL,
+            group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('service_deleted', 'service_changed', 'artifact_changed')),
+            title TEXT NOT NULL,
+            body TEXT,
+            severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')) DEFAULT 'info',
+            status TEXT NOT NULL CHECK (status IN ('open', 'closed')) DEFAULT 'open',
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS event_targets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES workspace_events(id) ON DELETE CASCADE,
+            affected_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            relation_kind TEXT NOT NULL CHECK (relation_kind IN ('linked_service', 'artifact_dependency')),
+            status TEXT NOT NULL CHECK (status IN ('open', 'resolved')) DEFAULT 'open',
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            UNIQUE (event_id, affected_project_id, relation_kind)
+        );
+
+        CREATE TABLE IF NOT EXISTS event_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES workspace_events(id) ON DELETE CASCADE,
+            affected_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+            shared_item_id INTEGER REFERENCES shared_items(id) ON DELETE SET NULL,
+            path_snapshot TEXT NOT NULL,
+            reaction TEXT NOT NULL CHECK (reaction IN ('inspect', 'update', 'delete', 'remove_reference')),
+            reason TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('open', 'resolved')) DEFAULT 'open',
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_service_links_from ON service_links(from_project_id);
+        CREATE INDEX IF NOT EXISTS idx_service_links_to ON service_links(to_project_id);
+        CREATE INDEX IF NOT EXISTS idx_artifact_dependencies_item ON artifact_dependencies(shared_item_id);
+        CREATE INDEX IF NOT EXISTS idx_artifact_dependencies_project ON artifact_dependencies(depends_on_project_id);
+        CREATE INDEX IF NOT EXISTS idx_workspace_events_source ON workspace_events(source_project_id);
+        CREATE INDEX IF NOT EXISTS idx_workspace_events_status ON workspace_events(status);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_event ON event_targets(event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_targets_project ON event_targets(affected_project_id);
+        CREATE INDEX IF NOT EXISTS idx_event_artifacts_event ON event_artifacts(event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_artifacts_project ON event_artifacts(affected_project_id);
+        CREATE INDEX IF NOT EXISTS idx_event_artifacts_item ON event_artifacts(shared_item_id);
+        ",
+    )?;
+    info!("Service graph and event tables initialized");
+    Ok(())
 }
 
 #[cfg(test)]
@@ -191,6 +380,11 @@ mod tests {
         assert!(tables.contains(&"project_groups".to_string()));
         assert!(tables.contains(&"shared_items".to_string()));
         assert!(tables.contains(&"files_fts_meta".to_string()));
+        assert!(tables.contains(&"service_links".to_string()));
+        assert!(tables.contains(&"artifact_dependencies".to_string()));
+        assert!(tables.contains(&"workspace_events".to_string()));
+        assert!(tables.contains(&"event_targets".to_string()));
+        assert!(tables.contains(&"event_artifacts".to_string()));
     }
 
     #[test]
@@ -255,7 +449,7 @@ mod tests {
     fn check_constraint_file_requires_path_and_project() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -271,7 +465,7 @@ mod tests {
     fn check_constraint_note_requires_content() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -287,7 +481,7 @@ mod tests {
     fn valid_file_insert() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -302,7 +496,7 @@ mod tests {
     fn valid_project_note_insert() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -317,7 +511,7 @@ mod tests {
     fn valid_group_note_insert() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -334,7 +528,7 @@ mod tests {
     fn unique_index_project_path() {
         let conn = mem_conn();
         conn.execute(
-            "INSERT INTO projects (name, path) VALUES ('p', '/tmp/p')",
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
             [],
         )
         .unwrap();
@@ -348,5 +542,59 @@ mod tests {
             [],
         );
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn service_links_reject_invalid_kind() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO projects (name, slug, path) VALUES ('a', 'a', '/tmp/a')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, slug, path) VALUES ('b', 'b', '/tmp/b')",
+            [],
+        )
+        .unwrap();
+        let result = conn.execute(
+            "INSERT INTO service_links (from_project_id, to_project_id, kind) VALUES (1, 2, 'invalid')",
+            [],
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn workspace_events_preserve_source_snapshot_after_project_delete() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspace_events (source_project_id, source_project_slug, source_project_name, kind, title)
+             VALUES (1, 'p', 'p', 'service_deleted', 'deleted')",
+            [],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM projects WHERE id = 1", [])
+            .unwrap();
+        let snapshot: String = conn
+            .query_row(
+                "SELECT source_project_slug FROM workspace_events WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let source_project_id: Option<i64> = conn
+            .query_row(
+                "SELECT source_project_id FROM workspace_events WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(snapshot, "p");
+        assert_eq!(source_project_id, None);
     }
 }

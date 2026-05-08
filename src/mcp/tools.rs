@@ -231,6 +231,7 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         projects_arr.push(serde_json::json!({
             "id": p.id,
             "name": p.name,
+            "slug": p.slug,
             "path": p.path,
             "groups": project_groups.iter().map(|g| &g.name).collect::<Vec<_>>(),
             "shared_items": items.iter().map(|i| serde_json::json!({
@@ -265,7 +266,11 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         groups_arr.push(serde_json::json!({
             "id": g.id,
             "name": g.name,
-            "projects": group_projects.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            "projects": group_projects.iter().map(|p| serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "slug": p.slug,
+            })).collect::<Vec<_>>(),
             "notes": note_items
         }));
     }
@@ -500,6 +505,7 @@ fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
                 "projects": projects.iter().map(|p| serde_json::json!({
                     "id": p.id,
                     "name": p.name,
+                    "slug": p.slug,
                     "path": p.path
                 })).collect::<Vec<_>>()
             })
@@ -631,6 +637,7 @@ fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
             serde_json::json!({
                 "id": p.id,
                 "name": p.name,
+                "slug": p.slug,
                 "path": p.path,
                 "groups": groups.iter().map(|g| serde_json::json!({
                     "id": g.id,

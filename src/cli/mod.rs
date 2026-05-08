@@ -28,6 +28,9 @@ pub enum Command {
         /// Project name (defaults to directory name)
         #[arg(short, long)]
         name: Option<String>,
+        /// Stable service slug (defaults to a normalized project name)
+        #[arg(long)]
+        slug: Option<String>,
         /// Group to join or create
         #[arg(short, long)]
         group: Option<String>,
@@ -337,7 +340,7 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Serve => crate::mcp::serve(),
 
-        Command::Init { name, group } => {
+        Command::Init { name, slug, group } => {
             let cwd = env::current_dir()?;
             let cwd_str = cwd.to_string_lossy().to_string();
 
@@ -367,6 +370,14 @@ pub fn run(cmd: Command) -> Result<()> {
 
             // Check if already initialized
             let project_id = if let Some(existing) = db.get_project_by_path(&cwd_str)? {
+                if let Some(slug) = slug.as_deref()
+                    && existing.slug != crate::models::normalize_project_slug(slug)
+                {
+                    bail!(
+                        "Project already initialized with slug '{}'. Slug changes are not supported yet.",
+                        existing.slug
+                    );
+                }
                 // Only rename if --name was explicitly provided
                 if name_from_flag && existing.name != project_name {
                     db.rename_project(existing.id, &project_name)?;
@@ -376,16 +387,19 @@ pub fn run(cmd: Command) -> Result<()> {
                     ));
                 } else {
                     print_info(format!(
-                        "Project '{}' already initialized (id={})",
-                        existing.name, existing.id
+                        "Project '{}' already initialized (id={}, slug={})",
+                        existing.name, existing.id, existing.slug
                     ));
                 }
                 existing.id
             } else {
-                let id = db.create_project(&project_name, &cwd_str)?;
+                let id = db.create_project_with_slug(&project_name, &cwd_str, slug.as_deref())?;
+                let project = db
+                    .get_project_by_id(id)?
+                    .ok_or_else(|| anyhow::anyhow!("Project {} not found after create", id))?;
                 print_success(format!(
-                    "Initialized project '{}' (id={})",
-                    project_name, id
+                    "Initialized project '{}' (id={}, slug={})",
+                    project_name, id, project.slug
                 ));
                 print_info(format!("Path: {}", cwd_str));
                 id
@@ -732,11 +746,12 @@ pub fn run(cmd: Command) -> Result<()> {
                         rows.push(vec![
                             p.id.to_string(),
                             p.name,
+                            p.slug,
                             truncate_for_cell(&p.path, 56),
                             truncate_for_cell(&group_names, 30),
                         ]);
                     }
-                    print_table(&["ID", "Project", "Path", "Groups"], &rows);
+                    print_table(&["ID", "Project", "Slug", "Path", "Groups"], &rows);
                 }
             }
 
@@ -758,7 +773,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         } else {
                             members
                                 .iter()
-                                .map(|p| p.name.as_str())
+                                .map(|p| p.slug.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         };
@@ -768,7 +783,7 @@ pub fn run(cmd: Command) -> Result<()> {
                             truncate_for_cell(&member_names, 48),
                         ]);
                     }
-                    print_table(&["ID", "Group", "Members"], &rows);
+                    print_table(&["ID", "Group", "Member slugs"], &rows);
                 }
             }
 
@@ -779,6 +794,7 @@ pub fn run(cmd: Command) -> Result<()> {
             let db = Db::open_default()?;
             let project = require_project(&db)?;
             println!("Project: {} (id={})", project.name, project.id);
+            println!("Slug: {}", project.slug);
             println!("Path: {}", project.path);
 
             let groups = db.get_groups_for_project(project.id)?;

@@ -236,7 +236,7 @@ fn test_mcp_migrates_legacy_database_and_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 1);
+    assert_eq!(version, 3);
 }
 
 /// Seed a project with a file tree suitable for project_tree/project_grep tests
@@ -342,6 +342,7 @@ fn test_mcp_workspace_context() {
     let context: serde_json::Value = serde_json::from_str(content).unwrap();
     assert!(context["projects"].as_array().unwrap().len() > 0);
     assert_eq!(context["projects"][0]["name"], "seed-proj");
+    assert_eq!(context["projects"][0]["slug"], "seed-proj");
     // Verify labels appear in shared_items
     let shared_items = context["projects"][0]["shared_items"].as_array().unwrap();
     assert!(shared_items.iter().any(|i| i["label"] == "readme"));
@@ -431,6 +432,7 @@ fn test_mcp_list_groups() {
     let groups: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert_eq!(groups[0]["name"], "seed-group");
     assert!(groups[0]["projects"].as_array().unwrap().len() > 0);
+    assert_eq!(groups[0]["projects"][0]["slug"], "seed-proj");
 }
 
 #[test]
@@ -457,6 +459,7 @@ fn test_mcp_list_projects() {
         .unwrap();
     let projects: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert_eq!(projects[0]["name"], "seed-proj");
+    assert_eq!(projects[0]["slug"], "seed-proj");
     assert!(projects[0]["groups"].as_array().unwrap().len() > 0);
 }
 
