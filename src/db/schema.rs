@@ -1,15 +1,92 @@
-use anyhow::Result;
-use log::{debug, info};
+use anyhow::{Context as _, Result};
+use log::{debug, error, info};
 use rusqlite::Connection;
+
+const CURRENT_SCHEMA_VERSION: i64 = 1;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
 
-    conn.execute_batch("PRAGMA journal_mode = WAL;")?;
-    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    conn.execute_batch("PRAGMA journal_mode = WAL;")
+        .context("Failed to configure SQLite journal mode")?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .context("Failed to enable SQLite foreign keys")?;
     debug!("WAL mode enabled, foreign keys enforced");
 
-    conn.execute_batch(
+    let detected_version = schema_version(conn)?;
+    debug!("Detected database schema version {}", detected_version);
+
+    ensure_current_schema_objects(conn)?;
+    migrate_schema(conn, detected_version)?;
+
+    info!("Database schema initialized");
+    Ok(())
+}
+
+fn schema_version(conn: &Connection) -> Result<i64> {
+    conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+        .context("Failed to read SQLite PRAGMA user_version")
+}
+
+fn set_schema_version(conn: &Connection, version: i64) -> Result<()> {
+    let sql = format!("PRAGMA user_version = {version}");
+    conn.execute_batch(&sql)
+        .with_context(|| format!("Failed to set schema version to {version}"))
+}
+
+fn migrate_schema(conn: &Connection, from_version: i64) -> Result<()> {
+    if from_version > CURRENT_SCHEMA_VERSION {
+        error!(
+            "Database schema version {} is newer than supported version {}",
+            from_version, CURRENT_SCHEMA_VERSION
+        );
+        anyhow::bail!(
+            "Database schema version {} is newer than supported version {}",
+            from_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    let mut version = from_version;
+    while version < CURRENT_SCHEMA_VERSION {
+        let next_version = version + 1;
+        debug!(
+            "Applying schema migration step {} -> {}",
+            version, next_version
+        );
+        migrate_to_version(conn, next_version)
+            .with_context(|| format!("Migration to schema version {next_version} failed"))?;
+        set_schema_version(conn, next_version)?;
+        version = next_version;
+    }
+
+    if from_version < CURRENT_SCHEMA_VERSION {
+        info!(
+            "Migrated database schema from version {} to {}",
+            from_version, CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    Ok(())
+}
+
+fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
+    match version {
+        1 => {
+            debug!("Migration v1: baseline schema compatibility check");
+            ensure_current_schema_objects(conn)
+        }
+        _ => {
+            error!("No migration registered for schema version {}", version);
+            anyhow::bail!("No migration registered for schema version {}", version);
+        }
+    }
+}
+
+fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
+    execute_schema_step(
+        conn,
+        "baseline tables and indexes",
         "
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -77,9 +154,17 @@ pub fn init_db(conn: &Connection) -> Result<()> {
         ",
     )?;
     debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
-
-    info!("Database schema initialized");
     Ok(())
+}
+
+fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<()> {
+    debug!("Executing schema step: {}", step_name);
+    conn.execute_batch(sql)
+        .map_err(|err| {
+            error!("Schema step '{}' failed: {}", step_name, err);
+            err
+        })
+        .with_context(|| format!("Failed to initialize schema object: {step_name}"))
 }
 
 #[cfg(test)]
@@ -132,6 +217,29 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         init_db(&conn).unwrap(); // second call should not fail
+    }
+
+    #[test]
+    fn init_db_records_schema_version() {
+        let conn = mem_conn();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn init_db_rejects_newer_schema_version() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA user_version = 999").unwrap();
+        let result = init_db(&conn);
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("newer than supported")
+        );
     }
 
     #[test]

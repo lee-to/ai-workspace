@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use rusqlite::{Connection, params};
+
 fn binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/debug/ai-workspace");
@@ -41,6 +43,122 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     (dir, db_path)
 }
 
+fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE project_groups (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (project_id, group_id)
+        );
+
+        CREATE TABLE shared_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'note')),
+            path TEXT,
+            content TEXT,
+            label TEXT,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+            created_by_project_id INTEGER REFERENCES projects(id),
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            CHECK (
+                (kind IN ('file', 'dir') AND path IS NOT NULL AND project_id IS NOT NULL AND content IS NULL AND group_id IS NULL)
+                OR
+                (kind = 'note' AND content IS NOT NULL AND project_id IS NOT NULL AND group_id IS NULL AND path IS NULL)
+                OR
+                (kind = 'note' AND content IS NOT NULL AND group_id IS NOT NULL AND project_id IS NULL AND path IS NULL AND created_by_project_id IS NOT NULL)
+            )
+        );
+
+        CREATE VIRTUAL TABLE notes_fts USING fts5(label, content);
+        CREATE VIRTUAL TABLE files_fts USING fts5(
+            path,
+            content,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE files_fts_meta (
+            shared_item_id INTEGER PRIMARY KEY REFERENCES shared_items(id) ON DELETE CASCADE,
+            abs_path TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX idx_shared_items_project_path
+        ON shared_items (project_id, path) WHERE path IS NOT NULL;
+        CREATE TRIGGER trg_shared_items_delete_fts
+        AFTER DELETE ON shared_items
+        BEGIN
+            DELETE FROM files_fts WHERE rowid = OLD.id;
+        END;
+        ",
+    )
+    .unwrap();
+
+    let project_path = project_path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    conn.execute(
+        "INSERT INTO projects (id, name, path) VALUES (1, 'legacy-proj', ?1)",
+        params![project_path],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO groups (id, name) VALUES (1, 'legacy-group')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project_groups (project_id, group_id) VALUES (1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (id, kind, path, label, project_id) VALUES (1, 'file', 'readme.md', 'legacy-readme', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (id, kind, content, label, group_id, created_by_project_id) VALUES (2, 'note', 'legacy note content', 'legacy-note', 1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO notes_fts (rowid, label, content) VALUES (2, 'legacy-note', 'legacy note content')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (1, 'readme.md', 'legacy file token')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (1, '/tmp/legacy/readme.md', 1, 17)",
+        [],
+    )
+    .unwrap();
+}
+
 /// Seed a project and group via CLI before MCP tests
 fn seed_data(db_path: &PathBuf) -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().unwrap();
@@ -67,6 +185,58 @@ fn seed_data(db_path: &PathBuf) -> tempfile::TempDir {
     ]);
 
     project_dir
+}
+
+#[test]
+fn test_mcp_migrates_legacy_database_and_read_paths_work() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(project_dir.path().join("readme.md"), "legacy file token").unwrap();
+    create_legacy_db(&db_path, project_dir.path());
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_context",
+                "arguments": {}
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(context["projects"][0]["name"], "legacy-proj");
+    assert_eq!(context["groups"][0]["name"], "legacy-group");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search",
+                "arguments": { "query": "legacy" }
+            }
+        })],
+    );
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("legacy note content"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 1);
 }
 
 /// Seed a project with a file tree suitable for project_tree/project_grep tests
