@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use crate::db::Db;
 use crate::models::{SharedItem, SharedItemKind};
-use crate::walk::walk_project_tree;
+use crate::walk::{WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
 pub const MAX_INDEX_FILE_SIZE: u64 = 1_024 * 1_024;
@@ -119,7 +119,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
             let Some(rel) = item.path.as_deref() else {
                 return Ok(stats);
             };
-            let entries = walk_project_tree(project_root, Some(rel), None);
+            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
             let mut aggregate = String::new();
             let mut total_size: u64 = 0;
             let mut latest_mtime: i64 = 0;
@@ -201,7 +201,7 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
         }
         SharedItemKind::Dir => {
             // For directories we re-scan and compare aggregate mtime/size.
-            let entries = walk_project_tree(project_root, Some(rel), None);
+            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
             let mut total_size: u64 = 0;
             let mut latest_mtime: i64 = 0;
             for entry in entries {
@@ -282,16 +282,14 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
             // Aggregate directories — cheaper to skip unless user ran reindex
             continue;
         }
-        if meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime {
-            if let Some(item) = db.get_item_by_id(id)? {
-                if let Some(pid) = item.project_id {
-                    if let Some(project) = db.get_project_by_id(pid)? {
-                        let root = PathBuf::from(&project.path);
-                        index_shared_item(db, &item, &root)?;
-                        refreshed += 1;
-                    }
-                }
-            }
+        if (meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime)
+            && let Some(item) = db.get_item_by_id(id)?
+            && let Some(pid) = item.project_id
+            && let Some(project) = db.get_project_by_id(pid)?
+        {
+            let root = PathBuf::from(&project.path);
+            index_shared_item(db, &item, &root)?;
+            refreshed += 1;
         }
     }
     debug!(

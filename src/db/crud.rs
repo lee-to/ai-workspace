@@ -27,6 +27,14 @@ pub struct Db {
     conn: Connection,
 }
 
+fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{}", rest))
+    } else {
+        path.strip_prefix(r"\\?\").map(|rest| rest.to_string())
+    }
+}
+
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("AI_WORKSPACE_DB") {
@@ -174,7 +182,17 @@ impl Db {
             return Ok(Some(project));
         }
 
-        self.get_project_by_path(target)
+        if let Some(project) = self.get_project_by_path(target)? {
+            return Ok(Some(project));
+        }
+
+        if let Some(path) = strip_windows_verbatim_prefix(target)
+            && path != target
+        {
+            return self.get_project_by_path(&path);
+        }
+
+        Ok(None)
     }
 
     pub fn list_projects(&self) -> Result<Vec<Project>> {
@@ -1231,6 +1249,21 @@ mod tests {
         let p = db.get_project_by_id(id).unwrap().unwrap();
         assert_eq!(p.name, "proj");
         assert!(db.get_project_by_id(9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_project_target_accepts_windows_verbatim_path() {
+        let db = test_db();
+        let id = db
+            .create_project("proj", r"C:\tmp\ai-workspace-project")
+            .unwrap();
+
+        let p = db
+            .resolve_project_target(r"\\?\C:\tmp\ai-workspace-project")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(p.id, id);
     }
 
     #[test]

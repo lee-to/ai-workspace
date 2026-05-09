@@ -90,6 +90,20 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
         "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n",
     )
     .unwrap();
+    std::fs::write(project_dir.path().join("visible.txt"), "visible_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".hidden.txt"), "hidden_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".env"), "secret_env_marker\n").unwrap();
+    std::fs::write(
+        project_dir.path().join("private.key"),
+        "secret_key_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join(".ssh")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".ssh").join("id_rsa"),
+        "ssh_secret_marker\n",
+    )
+    .unwrap();
 
     // Init project via CLI
     Command::new(binary_path())
@@ -145,6 +159,22 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"workspace_search"));
     assert!(tool_names.contains(&"list_groups"));
     assert!(tool_names.contains(&"list_projects"));
+
+    for name in ["workspace_read", "project_tree", "project_grep"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool should be present: {name}"));
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(
+            properties["include_hidden"].is_object(),
+            "{name} should expose include_hidden"
+        );
+        assert!(
+            properties["include_sensitive"].is_object(),
+            "{name} should expose include_sensitive"
+        );
+    }
 }
 
 #[test]
@@ -372,6 +402,93 @@ fn test_mcp_project_tree_invalid_project() {
     assert!(text.contains("not found"));
 }
 
+#[test]
+fn test_mcp_project_tree_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_still_hides_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "include_hidden": true }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_and_sensitive_shows_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": {
+                    "project_id": 1,
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains(".ssh"));
+    assert!(content.contains("id_rsa"));
+    assert!(content.contains("private.key"));
+}
+
 // --- workspace_read by project_id+path tests ---
 
 #[test]
@@ -498,6 +615,92 @@ fn test_mcp_workspace_read_both_params_error() {
     assert_eq!(responses[0]["error"]["code"], -32602);
 }
 
+#[test]
+fn test_mcp_workspace_read_by_path_blocks_hidden_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": ".env" }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Access denied")
+    );
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_allows_hidden_sensitive_with_opt_in() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": ".env",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "secret_env_marker\n");
+}
+
+#[test]
+fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "." }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
 // --- project_grep tests ---
 
 #[test]
@@ -599,4 +802,62 @@ fn test_mcp_project_grep_no_matches() {
         .as_str()
         .unwrap();
     assert_eq!(content, "");
+}
+
+#[test]
+fn test_mcp_project_grep_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "marker" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains("private.key"));
+    assert!(!content.contains("id_rsa"));
+}
+
+#[test]
+fn test_mcp_project_grep_include_hidden_and_sensitive_finds_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "secret_env_marker",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains("secret_env_marker"));
 }

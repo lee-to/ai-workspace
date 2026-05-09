@@ -118,6 +118,14 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                                 "type": "string",
                                 "minLength": 1,
                                 "description": "Relative file location within the project (use with project_id)"
+                            },
+                            "include_hidden": {
+                                "type": "boolean",
+                                "description": "Include hidden/dotfile paths (default: false)"
+                            },
+                            "include_sensitive": {
+                                "type": "boolean",
+                                "description": "Include credential-like paths such as .env, .ssh, .aws, *.pem, and *.key (default: false)"
                             }
                         },
                         "additionalProperties": false,
@@ -179,6 +187,14 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                                 "type": "integer",
                                 "minimum": 1,
                                 "description": "Maximum traversal depth (1 = immediate children only, default: unlimited)"
+                            },
+                            "include_hidden": {
+                                "type": "boolean",
+                                "description": "Include hidden/dotfile paths (default: false)"
+                            },
+                            "include_sensitive": {
+                                "type": "boolean",
+                                "description": "Include credential-like paths such as .env, .ssh, .aws, *.pem, and *.key (default: false)"
                             }
                         },
                         "required": ["project_id"],
@@ -202,6 +218,14 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                             "glob": {
                                 "type": "string",
                                 "description": "Optional glob to filter files (e.g. \"*.rs\")"
+                            },
+                            "include_hidden": {
+                                "type": "boolean",
+                                "description": "Include hidden/dotfile paths (default: false)"
+                            },
+                            "include_sensitive": {
+                                "type": "boolean",
+                                "description": "Include credential-like paths such as .env, .ssh, .aws, *.pem, and *.key (default: false)"
                             }
                         },
                         "required": ["project_id", "pattern"]
