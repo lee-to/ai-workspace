@@ -116,6 +116,61 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+/// Seed a project with markdown content for workspace_search_fulltext policy tests.
+fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        project_dir.path().join("visible.md"),
+        "visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join(".env.md"),
+        "hidden_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "directory_visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("private.key.md"),
+        "directory_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "directory_hidden_fulltext_marker\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(project_dir.path())
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command should succeed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(&["init", "--name", "fulltext-policy-proj"]);
+    run(&["share", "visible.md"]);
+    run(&["share", ".env.md"]);
+    run(&["share", "docs"]);
+
+    project_dir
+}
+
 #[test]
 fn test_mcp_initialize() {
     let (_db_dir, db_path) = temp_db();
@@ -264,6 +319,72 @@ fn test_mcp_workspace_search() {
     );
     // Verify label in search results
     assert_eq!(results[0]["label"], "deploy-note");
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_hides_direct_hidden_sensitive_file() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "hidden_sensitive_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "hidden/sensitive direct .md share should be filtered: {content}"
+    );
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_children() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "directory_visible_fulltext_marker OR directory_sensitive_fulltext_marker OR directory_hidden_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "only public directory markdown should match: {content}"
+    );
+    assert_eq!(results[0]["path"], "docs");
+    assert!(!content.contains("directory_sensitive_fulltext_marker"));
+    assert!(!content.contains("directory_hidden_fulltext_marker"));
 }
 
 #[test]

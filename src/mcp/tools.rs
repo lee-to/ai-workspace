@@ -471,15 +471,18 @@ fn workspace_search_fulltext(
         query, limit
     );
 
-    // Bounded lazy refresh so on-disk edits are reflected.
+    // Bounded lazy refresh also removes stale hidden/sensitive FTS rows.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {
         log::warn!("refresh_stale failed: {}", e);
+        return tool_error(id, "Fulltext search refresh failed");
     }
 
     match db.search_files(query, limit) {
         Ok(hits) => {
+            let options = walk::WalkOptions::default();
             let results: Vec<_> = hits
                 .iter()
+                .filter(|h| walk::path_allowed_by_options(Path::new(&h.path), options))
                 .map(|h| {
                     serde_json::json!({
                         "shared_item_id": h.shared_item_id,

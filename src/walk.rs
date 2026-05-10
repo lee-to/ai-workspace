@@ -46,23 +46,26 @@ fn is_hidden_path(path: &Path) -> bool {
 
 fn is_sensitive_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        ".env"
-            | ".npmrc"
-            | ".pypirc"
-            | ".netrc"
-            | ".aws"
-            | ".ssh"
-            | "id_rsa"
-            | "id_dsa"
-            | "id_ecdsa"
-            | "id_ed25519"
-    ) || lower.starts_with(".env.")
-        || lower.ends_with(".pem")
-        || lower.ends_with(".key")
-        || lower.ends_with(".p12")
-        || lower.ends_with(".pfx")
+    const SENSITIVE_NAMES: &[&str] = &[
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".aws",
+        ".ssh",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    ];
+    const SENSITIVE_EXTENSIONS: &[&str] = &[".pem", ".key", ".p12", ".pfx"];
+
+    SENSITIVE_NAMES
+        .iter()
+        .any(|sensitive| lower == *sensitive || lower.starts_with(&format!("{sensitive}.")))
+        || SENSITIVE_EXTENSIONS
+            .iter()
+            .any(|extension| lower.ends_with(extension) || lower.contains(&format!("{extension}.")))
 }
 
 fn is_sensitive_path(path: &Path) -> bool {
@@ -327,7 +330,13 @@ mod tests {
         assert!(path_allowed_by_options(Path::new("src/main.rs"), options));
         assert!(!path_allowed_by_options(Path::new(".hidden.txt"), options));
         assert!(!path_allowed_by_options(Path::new(".env"), options));
+        assert!(!path_allowed_by_options(Path::new(".env.md"), options));
         assert!(!path_allowed_by_options(Path::new("private.key"), options));
+        assert!(!path_allowed_by_options(
+            Path::new("private.key.md"),
+            options
+        ));
+        assert!(!path_allowed_by_options(Path::new("id_rsa.md"), options));
         assert!(!path_allowed_by_options(Path::new(".ssh/id_rsa"), options));
     }
 
