@@ -476,15 +476,16 @@ impl Db {
             return Ok(Some(project));
         }
 
-        let slug = normalize_project_slug(target);
-        if let Some(project) = self.get_project_by_slug(&slug)? {
+        if let Some(path) = strip_windows_verbatim_prefix(target)
+            && path != target
+            && let Some(project) = self.get_project_by_path(&path)?
+        {
             return Ok(Some(project));
         }
 
-        if let Some(path) = strip_windows_verbatim_prefix(target)
-            && path != target
-        {
-            return self.get_project_by_path(&path);
+        let slug = normalize_project_slug(target);
+        if let Some(project) = self.get_project_by_slug(&slug)? {
+            return Ok(Some(project));
         }
 
         Ok(None)
@@ -2754,6 +2755,27 @@ mod tests {
     #[test]
     fn resolve_project_target_accepts_windows_verbatim_path() {
         let db = test_db();
+        let id = db
+            .create_project("proj", r"C:\tmp\ai-workspace-project")
+            .unwrap();
+
+        let p = db
+            .resolve_project_target(r"\\?\C:\tmp\ai-workspace-project")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(p.id, id);
+    }
+
+    #[test]
+    fn resolve_project_target_prefers_stripped_windows_path_over_normalized_slug() {
+        let db = test_db();
+        db.create_project_with_slug(
+            "slug collision",
+            "/tmp/collision",
+            Some("c-tmp-ai-workspace-project"),
+        )
+        .unwrap();
         let id = db
             .create_project("proj", r"C:\tmp\ai-workspace-project")
             .unwrap();

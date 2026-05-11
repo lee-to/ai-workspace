@@ -308,11 +308,39 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
 
     let projects_arr = context["projects"].as_array_mut().unwrap();
     for p in &projects {
-        let project_groups = db.get_groups_for_project(p.id).unwrap_or_default();
-        let items = db.get_shared_items_for_project(p.id).unwrap_or_default();
-        let deps = db
-            .list_artifact_dependencies_for_project(p.id)
-            .unwrap_or_default();
+        let project_groups = match db.get_groups_for_project(p.id) {
+            Ok(groups) => groups,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load groups for project '{}': {}", p.slug, e),
+                );
+            }
+        };
+        let items = match db.get_shared_items_for_project(p.id) {
+            Ok(items) => items,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!(
+                        "Failed to load shared items for project '{}': {}",
+                        p.slug, e
+                    ),
+                );
+            }
+        };
+        let deps = match db.list_artifact_dependencies_for_project(p.id) {
+            Ok(deps) => deps,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!(
+                        "Failed to load artifact dependencies for project '{}': {}",
+                        p.slug, e
+                    ),
+                );
+            }
+        };
         projects_arr.push(serde_json::json!({
             "id": p.id,
             "name": p.name,
@@ -338,8 +366,24 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
 
     let groups_arr = context["groups"].as_array_mut().unwrap();
     for g in &groups {
-        let group_projects = db.get_projects_for_group(g.id).unwrap_or_default();
-        let notes = db.get_all_items_for_group(g.id).unwrap_or_default();
+        let group_projects = match db.get_projects_for_group(g.id) {
+            Ok(projects) => projects,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load projects for group '{}': {}", g.name, e),
+                );
+            }
+        };
+        let notes = match db.get_all_items_for_group(g.id) {
+            Ok(notes) => notes,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load shared items for group '{}': {}", g.name, e),
+                );
+            }
+        };
         let mut seen_contents = std::collections::HashSet::new();
         let note_items: Vec<_> = notes
             .iter()
@@ -368,8 +412,10 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         }));
     }
 
-    let text = serde_json::to_string_pretty(&context).unwrap_or_default();
-    tool_result(id, text)
+    match serde_json::to_string_pretty(&context) {
+        Ok(text) => tool_result(id, text),
+        Err(e) => tool_error(id, &format!("Failed to serialize workspace context: {}", e)),
+    }
 }
 
 const PATH_POLICY_DENIED: &str = "Access denied: hidden or sensitive path requires explicit opt-in";
