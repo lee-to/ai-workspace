@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use rusqlite::{Connection, params};
@@ -55,6 +55,16 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+#[cfg(unix)]
+fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dst)
 }
 
 fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
@@ -1851,6 +1861,45 @@ fn test_mcp_project_grep_searches_only_shared_scopes_by_default() {
     assert!(!content.contains("secret_token"));
     assert!(!content.contains("private.rs"));
     assert!(!content.contains("private_src_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_shared_dir_skips_symlink_escape_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "outside_secret_token\n").unwrap();
+    let link_path = project_dir.path().join("docs").join("outside-link.txt");
+
+    if let Err(err) = symlink_file(outside.path(), &link_path) {
+        eprintln!(
+            "skipping symlink regression test because symlink creation failed: {}",
+            err
+        );
+        return;
+    }
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "outside_secret_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!content.contains("outside_secret_token"));
+    assert!(!content.contains("outside-link.txt"));
 }
 
 #[test]

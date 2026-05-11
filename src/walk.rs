@@ -225,6 +225,50 @@ fn scan_grep_file(
     }
 }
 
+fn canonical_grep_candidate_allowed(
+    canonical_root: &Path,
+    canonical_scope_root: &Path,
+    candidate_path: &Path,
+    options: WalkOptions,
+) -> bool {
+    let Ok(canonical_candidate) = candidate_path.canonicalize() else {
+        warn!(
+            "grep: skipping candidate that cannot canonicalize: {}",
+            candidate_path.display()
+        );
+        return false;
+    };
+
+    if !canonical_candidate.starts_with(canonical_root) {
+        warn!(
+            "grep: skipping candidate outside project root: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    if !canonical_candidate.starts_with(canonical_scope_root) {
+        warn!(
+            "grep: skipping candidate outside shared scope: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    let rel = canonical_candidate
+        .strip_prefix(canonical_root)
+        .unwrap_or(canonical_candidate.as_path());
+    if !path_allowed_by_options(rel, options) {
+        warn!(
+            "grep: skipping candidate blocked by path policy: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    true
+}
+
 /// Walk the project file tree, respecting .gitignore rules.
 ///
 /// If `subpath` is provided, only entries under that subdirectory are returned.
@@ -450,6 +494,17 @@ pub fn grep_project_paths(
             continue;
         }
 
+        let canonical_target_rel = canonical_target
+            .strip_prefix(&canonical_root)
+            .unwrap_or(canonical_target.as_path());
+        if !path_allowed_by_options(canonical_target_rel, options) {
+            warn!(
+                "grep_project_paths: skipping blocked canonical scope '{}'",
+                rel_path
+            );
+            continue;
+        }
+
         if canonical_target.is_file() {
             scan_grep_file(
                 &canonical_root,
@@ -491,6 +546,15 @@ pub fn grep_project_paths(
             };
 
             if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(true) {
+                continue;
+            }
+
+            if !canonical_grep_candidate_allowed(
+                &canonical_root,
+                &canonical_target,
+                entry.path(),
+                options,
+            ) {
                 continue;
             }
 

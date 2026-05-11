@@ -346,6 +346,34 @@ fn test_note_group_scope() {
 }
 
 #[test]
+fn test_note_group_scope_rejects_non_member_group() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        other_dir.path(),
+        &["init", "--name", "other", "--group", "team"],
+    );
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["note", "--group", "team", "outside group"],
+    );
+
+    assert!(
+        !success,
+        "group note in non-member group should fail\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains(
+        "Project is not a member of group 'team'. Run `ai-workspace init --group team` first."
+    ));
+}
+
+#[test]
 fn test_note_project_scope() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -1121,6 +1149,50 @@ fn test_edit_scope_project_to_group() {
 }
 
 #[test]
+fn test_edit_scope_project_to_non_member_group_fails() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        other_dir.path(),
+        &["init", "--name", "other", "--group", "team"],
+    );
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &[
+            "note",
+            "--scope",
+            "project",
+            "--label",
+            "my-note",
+            "scope test",
+        ],
+    );
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["edit", "my-note", "--scope", "group", "--group", "team"],
+    );
+
+    assert!(
+        !success,
+        "moving note to non-member group should fail\nstderr:\n{stderr}"
+    );
+    assert!(stderr.contains(
+        "Project is not a member of group 'team'. Run `ai-workspace init --group team` first."
+    ));
+
+    let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(stdout.contains("scope test"));
+    assert!(!stdout.contains("Group 'team' shared items:"));
+}
+
+#[test]
 fn test_edit_scope_group_to_project() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -1273,7 +1345,8 @@ fn test_delete_group() {
 
     // Verify group is gone from status
     let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
-    assert!(!stdout.contains("g1"));
+    assert!(stdout.contains("Groups: (none)"));
+    assert!(!stdout.contains("Group 'g1' shared items:"));
 }
 
 #[test]
