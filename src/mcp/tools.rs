@@ -24,6 +24,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             workspace_context(id, &db)
         }
         "workspace_read" => {
+            let options = walk_options_from_args(&arguments);
             let item_id = arguments.get("item_id").and_then(|v| v.as_i64());
             let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
             let path = arguments
@@ -47,9 +48,9 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             };
 
             if let Some(iid) = item_id {
-                workspace_read(id, iid, &db)
+                workspace_read(id, iid, &db, options)
             } else if let (Some(pid), Some(p)) = (project_id, path) {
-                workspace_read_by_path(id, pid, &p, &db)
+                workspace_read_by_path(id, pid, &p, &db, options)
             } else {
                 JsonRpcResponse::error(
                     id,
@@ -107,11 +108,12 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 .get("max_depth")
                 .and_then(|v| v.as_u64())
                 .map(|d| d as usize);
+            let options = walk_options_from_args(&arguments);
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            project_tree(id, project_id, path.as_deref(), max_depth, &db)
+            project_tree(id, project_id, path.as_deref(), max_depth, &db, options)
         }
         "project_grep" => {
             let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
@@ -136,11 +138,12 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 .get("glob")
                 .and_then(|v| v.as_str())
                 .map(|s| s.to_string());
+            let options = walk_options_from_args(&arguments);
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            project_grep(id, project_id, &pattern, glob.as_deref(), &db)
+            project_grep(id, project_id, &pattern, glob.as_deref(), &db, options)
         }
         "workspace_search_fulltext" => {
             let query = match arguments.get("query").and_then(|v| v.as_str()) {
@@ -204,6 +207,19 @@ fn tool_error(id: serde_json::Value, msg: &str) -> JsonRpcResponse {
 
 fn open_db() -> Result<Db, String> {
     Db::open_default().map_err(|e| format!("Failed to open database: {}", e))
+}
+
+fn walk_options_from_args(arguments: &serde_json::Value) -> walk::WalkOptions {
+    walk::WalkOptions {
+        include_hidden: arguments
+            .get("include_hidden")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+        include_sensitive: arguments
+            .get("include_sensitive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false),
+    }
 }
 
 fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
@@ -274,7 +290,70 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     tool_result(id, text)
 }
 
-fn workspace_read(id: serde_json::Value, item_id: i64, db: &Db) -> JsonRpcResponse {
+const PATH_POLICY_DENIED: &str = "Access denied: hidden or sensitive path requires explicit opt-in";
+
+fn path_allowed_under_root(root: &Path, path: &Path, options: walk::WalkOptions) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    walk::path_allowed_by_options(rel, options)
+}
+
+fn read_visible_path(
+    id: serde_json::Value,
+    canonical_root: &Path,
+    canonical: &Path,
+    options: walk::WalkOptions,
+) -> JsonRpcResponse {
+    if !path_allowed_under_root(canonical_root, canonical, options) {
+        return tool_error(id, PATH_POLICY_DENIED);
+    }
+
+    // Limit file reads to 10 MB to prevent OOM
+    const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
+
+    debug!("Reading file: {}", canonical.display());
+    if canonical.is_dir() {
+        match std::fs::read_dir(canonical) {
+            Ok(entries) => {
+                let mut listing: Vec<String> = entries
+                    .filter_map(|e| e.ok())
+                    .filter(|e| path_allowed_under_root(canonical_root, &e.path(), options))
+                    .map(|e| e.file_name().to_string_lossy().to_string())
+                    .collect();
+                listing.sort();
+                tool_result(id, listing.join("\n"))
+            }
+            Err(e) => {
+                error!("Failed to read dir {}: {}", canonical.display(), e);
+                tool_error(id, "Failed to read directory")
+            }
+        }
+    } else {
+        match std::fs::metadata(canonical) {
+            Ok(meta) if meta.len() > MAX_READ_SIZE => tool_error(
+                id,
+                &format!(
+                    "File too large ({} bytes, max {})",
+                    meta.len(),
+                    MAX_READ_SIZE
+                ),
+            ),
+            _ => match std::fs::read_to_string(canonical) {
+                Ok(content) => tool_result(id, content),
+                Err(e) => {
+                    error!("Failed to read file {}: {}", canonical.display(), e);
+                    tool_error(id, "Failed to read file")
+                }
+            },
+        }
+    }
+}
+
+fn workspace_read(
+    id: serde_json::Value,
+    item_id: i64,
+    db: &Db,
+    options: walk::WalkOptions,
+) -> JsonRpcResponse {
     info!("workspace_read: item_id={}", item_id);
 
     let item = match db.get_item_by_id(item_id) {
@@ -299,6 +378,9 @@ fn workspace_read(id: serde_json::Value, item_id: i64, db: &Db) -> JsonRpcRespon
         Some(p) => p,
         None => return tool_error(id, "Invalid shared item: missing path"),
     };
+    if !walk::path_allowed_by_options(Path::new(&rel_path), options) {
+        return tool_error(id, PATH_POLICY_DENIED);
+    }
 
     let project_root = Path::new(&project.path);
     let full_path = project_root.join(&rel_path);
@@ -326,43 +408,7 @@ fn workspace_read(id: serde_json::Value, item_id: i64, db: &Db) -> JsonRpcRespon
         return tool_error(id, "Access denied: path is outside project directory");
     }
 
-    // Limit file reads to 10 MB to prevent OOM
-    const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
-
-    debug!("Reading file: {}", canonical.display());
-    if canonical.is_dir() {
-        match std::fs::read_dir(&canonical) {
-            Ok(entries) => {
-                let listing: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                tool_result(id, listing.join("\n"))
-            }
-            Err(e) => {
-                error!("Failed to read dir {}: {}", canonical.display(), e);
-                tool_error(id, "Failed to read directory")
-            }
-        }
-    } else {
-        match std::fs::metadata(&canonical) {
-            Ok(meta) if meta.len() > MAX_READ_SIZE => tool_error(
-                id,
-                &format!(
-                    "File too large ({} bytes, max {})",
-                    meta.len(),
-                    MAX_READ_SIZE
-                ),
-            ),
-            _ => match std::fs::read_to_string(&canonical) {
-                Ok(content) => tool_result(id, content),
-                Err(e) => {
-                    error!("Failed to read file {}: {}", canonical.display(), e);
-                    tool_error(id, "Failed to read file")
-                }
-            },
-        }
-    }
+    read_visible_path(id, &canonical_root, &canonical, options)
 }
 
 fn workspace_read_by_path(
@@ -370,54 +416,23 @@ fn workspace_read_by_path(
     project_id: i64,
     path: &str,
     db: &Db,
+    options: walk::WalkOptions,
 ) -> JsonRpcResponse {
     info!(
         "workspace_read_by_path: project_id={}, path={}",
         project_id, path
     );
 
-    let (_canonical_root, canonical) = match resolve_project_path(project_id, Some(path), db) {
+    if !walk::path_allowed_by_options(Path::new(path), options) {
+        return tool_error(id, PATH_POLICY_DENIED);
+    }
+
+    let (canonical_root, canonical) = match resolve_project_path(project_id, Some(path), db) {
         Ok(v) => v,
         Err(e) => return tool_error(id, &e),
     };
 
-    // Same 10MB limit as workspace_read
-    const MAX_READ_SIZE: u64 = 10 * 1024 * 1024;
-
-    debug!("Reading file: {}", canonical.display());
-    if canonical.is_dir() {
-        match std::fs::read_dir(&canonical) {
-            Ok(entries) => {
-                let listing: Vec<String> = entries
-                    .filter_map(|e| e.ok())
-                    .map(|e| e.file_name().to_string_lossy().to_string())
-                    .collect();
-                tool_result(id, listing.join("\n"))
-            }
-            Err(e) => {
-                error!("Failed to read dir {}: {}", canonical.display(), e);
-                tool_error(id, "Failed to read directory")
-            }
-        }
-    } else {
-        match std::fs::metadata(&canonical) {
-            Ok(meta) if meta.len() > MAX_READ_SIZE => tool_error(
-                id,
-                &format!(
-                    "File too large ({} bytes, max {})",
-                    meta.len(),
-                    MAX_READ_SIZE
-                ),
-            ),
-            _ => match std::fs::read_to_string(&canonical) {
-                Ok(content) => tool_result(id, content),
-                Err(e) => {
-                    error!("Failed to read file {}: {}", canonical.display(), e);
-                    tool_error(id, "Failed to read file")
-                }
-            },
-        }
-    }
+    read_visible_path(id, &canonical_root, &canonical, options)
 }
 
 fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcResponse {
@@ -456,15 +471,31 @@ fn workspace_search_fulltext(
         query, limit
     );
 
-    // Bounded lazy refresh so on-disk edits are reflected.
+    // Bounded lazy refresh keeps common edits fresh; matching directory hits
+    // are revalidated below before snippets can be returned.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {
         log::warn!("refresh_stale failed: {}", e);
+        return tool_error(id, "Fulltext search refresh failed");
     }
 
     match db.search_files(query, limit) {
-        Ok(hits) => {
+        Ok(mut hits) => {
+            match crate::indexer::refresh_search_hits(db, &hits) {
+                Ok(refreshed) if refreshed > 0 => match db.search_files(query, limit) {
+                    Ok(updated_hits) => hits = updated_hits,
+                    Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+                },
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("refresh_search_hits failed: {}", e);
+                    return tool_error(id, "Fulltext search refresh failed");
+                }
+            }
+
+            let options = walk::WalkOptions::default();
             let results: Vec<_> = hits
                 .iter()
+                .filter(|h| walk::path_allowed_by_options(Path::new(&h.path), options))
                 .map(|h| {
                     serde_json::json!({
                         "shared_item_id": h.shared_item_id,
@@ -549,6 +580,7 @@ fn project_tree(
     path: Option<&str>,
     max_depth: Option<usize>,
     db: &Db,
+    options: walk::WalkOptions,
 ) -> JsonRpcResponse {
     info!(
         "project_tree: project_id={}, path={:?}, max_depth={:?}",
@@ -560,7 +592,7 @@ fn project_tree(
         Err(e) => return tool_error(id, &e),
     };
 
-    let entries = walk::walk_project_tree(&canonical_root, path, max_depth);
+    let entries = walk::walk_project_tree(&canonical_root, path, max_depth, options);
 
     // Format as indented tree
     let mut lines = Vec::new();
@@ -580,6 +612,7 @@ fn project_grep(
     pattern: &str,
     glob: Option<&str>,
     db: &Db,
+    options: walk::WalkOptions,
 ) -> JsonRpcResponse {
     info!(
         "project_grep: project_id={}, pattern={}, glob={:?}",
@@ -591,7 +624,7 @@ fn project_grep(
         Err(e) => return tool_error(id, &e),
     };
 
-    let matches = match walk::grep_project(&canonical_root, pattern, glob) {
+    let matches = match walk::grep_project(&canonical_root, pattern, glob, options) {
         Ok(m) => m,
         Err(e) => {
             return JsonRpcResponse::error(id, McpError::invalid_params(&e));
@@ -777,7 +810,7 @@ mod tests {
     #[test]
     fn workspace_read_item_not_found() {
         let db = test_db();
-        let resp = workspace_read(json!(1), 9999, &db);
+        let resp = workspace_read(json!(1), 9999, &db, walk::WalkOptions::default());
         let text = resp.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -791,7 +824,7 @@ mod tests {
         let pid = db.create_project("p", "/tmp/p").unwrap();
         let note_id = db.add_project_note(pid, "my note text", None).unwrap();
 
-        let resp = workspace_read(json!(1), note_id, &db);
+        let resp = workspace_read(json!(1), note_id, &db, walk::WalkOptions::default());
         let text = resp.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -809,7 +842,7 @@ mod tests {
         let pid = db.create_project("p", &project_path).unwrap();
         let file_id = db.share_file(pid, "hello.txt", None).unwrap();
 
-        let resp = workspace_read(json!(1), file_id, &db);
+        let resp = workspace_read(json!(1), file_id, &db, walk::WalkOptions::default());
         let text = resp.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -830,7 +863,7 @@ mod tests {
         let pid = db.create_project("p", &project_path).unwrap();
         let dir_id = db.share_dir(pid, "mydir", None).unwrap();
 
-        let resp = workspace_read(json!(1), dir_id, &db);
+        let resp = workspace_read(json!(1), dir_id, &db, walk::WalkOptions::default());
         let text = resp.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -848,7 +881,7 @@ mod tests {
         let pid = db.create_project("p", &project_path).unwrap();
         let file_id = db.share_file(pid, "gone.txt", None).unwrap();
 
-        let resp = workspace_read(json!(1), file_id, &db);
+        let resp = workspace_read(json!(1), file_id, &db, walk::WalkOptions::default());
         let result = resp.result.unwrap();
         let text = result["content"][0]["text"].as_str().unwrap();
         assert!(text.contains("Cannot resolve path"));

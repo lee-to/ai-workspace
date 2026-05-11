@@ -89,6 +89,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 ```
 
 That's it. The agent now has access to 8 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
+By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
 
 ## Example Prompts
 

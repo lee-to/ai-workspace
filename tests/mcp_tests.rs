@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use rusqlite::{Connection, params};
+
 fn binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/debug/ai-workspace");
@@ -39,6 +41,14 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+fn mtime_epoch(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Seed a project and group via CLI before MCP tests
@@ -90,6 +100,20 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
         "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n",
     )
     .unwrap();
+    std::fs::write(project_dir.path().join("visible.txt"), "visible_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".hidden.txt"), "hidden_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".env"), "secret_env_marker\n").unwrap();
+    std::fs::write(
+        project_dir.path().join("private.key"),
+        "secret_key_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join(".ssh")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".ssh").join("id_rsa"),
+        "ssh_secret_marker\n",
+    )
+    .unwrap();
 
     // Init project via CLI
     Command::new(binary_path())
@@ -98,6 +122,162 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
         .output()
         .expect("seed command failed");
+
+    project_dir
+}
+
+/// Seed a project with markdown content for workspace_search_fulltext policy tests.
+fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        project_dir.path().join("visible.md"),
+        "visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join(".env.md"),
+        "hidden_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "directory_visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("private.key.md"),
+        "directory_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "directory_hidden_fulltext_marker\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(project_dir.path())
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command should succeed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(&["init", "--name", "fulltext-policy-proj"]);
+    run(&["share", "visible.md"]);
+    run(&["share", ".env.md"]);
+    run(&["share", "docs"]);
+
+    project_dir
+}
+
+/// Seed a stale directory aggregate beyond workspace_search_fulltext's bounded refresh window.
+fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tempfile::TempDir {
+    const FILLER_COUNT: usize = 201;
+
+    let project_dir = tempfile::tempdir().unwrap();
+    for i in 0..FILLER_COUNT {
+        std::fs::write(
+            project_dir.path().join(format!("filler_{i:03}.md")),
+            format!("filler_{i:03}_marker\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "public_beyond_window_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "stale_hidden_beyond_window_marker\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args(["init", "--name", "stale-window-proj"])
+        .current_dir(project_dir.path())
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+    assert!(
+        output.status.success(),
+        "init should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut conn = Connection::open(db_path).unwrap();
+    let project_id: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = 'stale-window-proj'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+
+    for i in 0..FILLER_COUNT {
+        let rel = format!("filler_{i:03}.md");
+        let abs = project_dir.path().join(&rel);
+        let meta = std::fs::metadata(&abs).unwrap();
+        tx.execute(
+            "INSERT INTO shared_items (kind, path, project_id) VALUES ('file', ?1, ?2)",
+            params![rel, project_id],
+        )
+        .unwrap();
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![id, rel, format!("filler_{i:03}_marker")],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                abs.to_string_lossy(),
+                mtime_epoch(&meta),
+                meta.len() as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    tx.execute(
+        "INSERT INTO shared_items (kind, path, project_id) VALUES ('dir', 'docs', ?1)",
+        params![project_id],
+    )
+    .unwrap();
+    let docs_id = tx.last_insert_rowid();
+    let docs_abs = project_dir.path().join("docs");
+    let stale_aggregate = "### docs/public.md\npublic_beyond_window_marker\n\n### docs/.hidden.md\nstale_hidden_beyond_window_marker\n";
+    tx.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (?1, 'docs', ?2)",
+        params![docs_id, stale_aggregate],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, 1, ?3)",
+        params![
+            docs_id,
+            docs_abs.to_string_lossy(),
+            stale_aggregate.len() as i64
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
 
     project_dir
 }
@@ -145,6 +325,22 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"workspace_search"));
     assert!(tool_names.contains(&"list_groups"));
     assert!(tool_names.contains(&"list_projects"));
+
+    for name in ["workspace_read", "project_tree", "project_grep"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool should be present: {name}"));
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(
+            properties["include_hidden"].is_object(),
+            "{name} should expose include_hidden"
+        );
+        assert!(
+            properties["include_sensitive"].is_object(),
+            "{name} should expose include_sensitive"
+        );
+    }
 }
 
 #[test]
@@ -234,6 +430,103 @@ fn test_mcp_workspace_search() {
     );
     // Verify label in search results
     assert_eq!(results[0]["label"], "deploy-note");
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_hides_direct_hidden_sensitive_file() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "hidden_sensitive_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "hidden/sensitive direct .md share should be filtered: {content}"
+    );
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_children() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "directory_visible_fulltext_marker OR directory_sensitive_fulltext_marker OR directory_hidden_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "only public directory markdown should match: {content}"
+    );
+    assert_eq!(results[0]["path"], "docs");
+    assert!(!content.contains("directory_sensitive_fulltext_marker"));
+    assert!(!content.contains("directory_hidden_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_revalidates_stale_directory_beyond_refresh_window() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_stale_directory_fulltext_beyond_refresh_window(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "stale_hidden_beyond_window_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "stale directory aggregate beyond refresh window should be revalidated: {content}"
+    );
 }
 
 #[test]
@@ -372,6 +665,93 @@ fn test_mcp_project_tree_invalid_project() {
     assert!(text.contains("not found"));
 }
 
+#[test]
+fn test_mcp_project_tree_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_still_hides_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "include_hidden": true }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_and_sensitive_shows_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": {
+                    "project_id": 1,
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains(".ssh"));
+    assert!(content.contains("id_rsa"));
+    assert!(content.contains("private.key"));
+}
+
 // --- workspace_read by project_id+path tests ---
 
 #[test]
@@ -498,6 +878,92 @@ fn test_mcp_workspace_read_both_params_error() {
     assert_eq!(responses[0]["error"]["code"], -32602);
 }
 
+#[test]
+fn test_mcp_workspace_read_by_path_blocks_hidden_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": ".env" }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Access denied")
+    );
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_allows_hidden_sensitive_with_opt_in() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": ".env",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "secret_env_marker\n");
+}
+
+#[test]
+fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "." }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
 // --- project_grep tests ---
 
 #[test]
@@ -599,4 +1065,62 @@ fn test_mcp_project_grep_no_matches() {
         .as_str()
         .unwrap();
     assert_eq!(content, "");
+}
+
+#[test]
+fn test_mcp_project_grep_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "marker" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains("private.key"));
+    assert!(!content.contains("id_rsa"));
+}
+
+#[test]
+fn test_mcp_project_grep_include_hidden_and_sensitive_finds_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "secret_env_marker",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains("secret_env_marker"));
 }

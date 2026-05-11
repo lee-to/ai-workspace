@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::db::Db;
-use crate::models::{SharedItem, SharedItemKind};
-use crate::walk::walk_project_tree;
+use crate::models::{FileSearchHit, SharedItem, SharedItemKind};
+use crate::walk::{self, WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
 pub const MAX_INDEX_FILE_SIZE: u64 = 1_024 * 1_024;
@@ -110,6 +110,11 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 debug!("index: skip non-md file share {}", rel);
                 return Ok(stats);
             }
+            if !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default()) {
+                debug!("index: remove hidden/sensitive file share {}", rel);
+                db.delete_file_index(item.id)?;
+                return Ok(stats);
+            }
             index_single(db, item.id, project_root, rel, &mut stats)?;
         }
         SharedItemKind::Dir => {
@@ -119,7 +124,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
             let Some(rel) = item.path.as_deref() else {
                 return Ok(stats);
             };
-            let entries = walk_project_tree(project_root, Some(rel), None);
+            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
             let mut aggregate = String::new();
             let mut total_size: u64 = 0;
             let mut latest_mtime: i64 = 0;
@@ -201,7 +206,7 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
         }
         SharedItemKind::Dir => {
             // For directories we re-scan and compare aggregate mtime/size.
-            let entries = walk_project_tree(project_root, Some(rel), None);
+            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
             let mut total_size: u64 = 0;
             let mut latest_mtime: i64 = 0;
             for entry in entries {
@@ -272,26 +277,46 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
     let metas = db.list_file_index_meta()?;
     let mut refreshed = 0usize;
     for (id, abs_path, old_mtime, old_size) in metas.into_iter().take(max_checks) {
+        let Some(item) = db.get_item_by_id(id)? else {
+            db.delete_file_index(id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        if let Some(rel) = item.path.as_deref()
+            && !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default())
+        {
+            db.delete_file_index(id)?;
+            refreshed += 1;
+            continue;
+        }
+
         let Ok(meta) = std::fs::metadata(&abs_path) else {
             // file disappeared — drop from index
             db.delete_file_index(id)?;
             refreshed += 1;
             continue;
         };
-        if meta.is_dir() {
-            // Aggregate directories — cheaper to skip unless user ran reindex
+        let Some(pid) = item.project_id else {
+            db.delete_file_index(id)?;
+            refreshed += 1;
             continue;
-        }
-        if meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime {
-            if let Some(item) = db.get_item_by_id(id)? {
-                if let Some(pid) = item.project_id {
-                    if let Some(project) = db.get_project_by_id(pid)? {
-                        let root = PathBuf::from(&project.path);
-                        index_shared_item(db, &item, &root)?;
-                        refreshed += 1;
-                    }
-                }
+        };
+        let Some(project) = db.get_project_by_id(pid)? else {
+            db.delete_file_index(id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        if meta.is_dir() {
+            let root = PathBuf::from(&project.path);
+            if refresh_if_stale(db, &item, &root)? {
+                refreshed += 1;
             }
+        } else if meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime {
+            let root = PathBuf::from(&project.path);
+            index_shared_item(db, &item, &root)?;
+            refreshed += 1;
         }
     }
     debug!(
@@ -299,6 +324,49 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
         refreshed,
         start.elapsed()
     );
+    Ok(refreshed)
+}
+
+/// Revalidate FTS hits that could otherwise expose stale unsafe snippets.
+///
+/// `refresh_stale` is intentionally bounded for latency. Before returning
+/// search snippets, reindex matching directory aggregates because their visible
+/// row path can still contain old hidden/sensitive child content.
+pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
+    let mut refreshed = 0usize;
+
+    for hit in hits {
+        if !walk::path_allowed_by_options(Path::new(&hit.path), WalkOptions::default()) {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        }
+
+        let Some(item) = db.get_item_by_id(hit.shared_item_id)? else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        if item.kind != SharedItemKind::Dir {
+            continue;
+        }
+
+        let Some(project_id) = item.project_id else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+        let Some(project) = db.get_project_by_id(project_id)? else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        index_shared_item(db, &item, &PathBuf::from(&project.path))?;
+        refreshed += 1;
+    }
+
     Ok(refreshed)
 }
 
@@ -344,6 +412,23 @@ mod tests {
     }
 
     #[test]
+    fn skip_hidden_sensitive_md_file_share() {
+        let (db, proj, pid) = setup();
+        fs::write(proj.path().join(".env.md"), "hidden_secret_marker").unwrap();
+        let id = db.share_file(pid, ".env.md", None).unwrap();
+        let item = db.get_item_by_id(id).unwrap().unwrap();
+
+        let stats = index_shared_item(&db, &item, proj.path()).unwrap();
+
+        assert_eq!(stats.indexed, 0);
+        assert!(
+            db.search_files("hidden_secret_marker", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn index_dir_aggregates_md_files() {
         let (db, proj, pid) = setup();
         fs::create_dir_all(proj.path().join("docs")).unwrap();
@@ -386,6 +471,64 @@ mod tests {
         assert!(changed);
         assert_eq!(db.search_files("old_token", 10).unwrap().len(), 0);
         assert_eq!(db.search_files("new_token", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refresh_stale_removes_previously_indexed_sensitive_file() {
+        let (db, proj, pid) = setup();
+        fs::write(proj.path().join(".env.md"), "stale_secret_marker").unwrap();
+        let id = db.share_file(pid, ".env.md", None).unwrap();
+        let abs = proj.path().join(".env.md");
+        let meta = fs::metadata(&abs).unwrap();
+        db.index_file(
+            id,
+            ".env.md",
+            &abs.to_string_lossy(),
+            "stale_secret_marker",
+            mtime_epoch(&meta),
+            meta.len() as i64,
+        )
+        .unwrap();
+        assert_eq!(db.search_files("stale_secret_marker", 10).unwrap().len(), 1);
+
+        let refreshed = refresh_stale(&db, 200).unwrap();
+
+        assert_eq!(refreshed, 1);
+        assert!(
+            db.search_files("stale_secret_marker", 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn refresh_stale_reindexes_directory_to_drop_hidden_children() {
+        let (db, proj, pid) = setup();
+        fs::create_dir_all(proj.path().join("docs")).unwrap();
+        fs::write(proj.path().join("docs/public.md"), "public_marker").unwrap();
+        fs::write(proj.path().join("docs/.hidden.md"), "stale_hidden_marker").unwrap();
+        let id = db.share_dir(pid, "docs", None).unwrap();
+        let abs = proj.path().join("docs");
+        db.index_file(
+            id,
+            "docs",
+            &abs.to_string_lossy(),
+            "public_marker stale_hidden_marker",
+            1,
+            1024,
+        )
+        .unwrap();
+        assert_eq!(db.search_files("stale_hidden_marker", 10).unwrap().len(), 1);
+
+        let refreshed = refresh_stale(&db, 200).unwrap();
+
+        assert_eq!(refreshed, 1);
+        assert!(
+            db.search_files("stale_hidden_marker", 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(db.search_files("public_marker", 10).unwrap().len(), 1);
     }
 
     #[test]
