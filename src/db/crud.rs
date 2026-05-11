@@ -1026,13 +1026,17 @@ impl Db {
                     current_project_id
                 )
             })?;
-        let target_project = self.resolve_required_project_target(
-            service_target,
-            &format!(
-                "removing artifact dependency for item '{}' from project {}",
-                item_target, current_project_id
-            ),
-        )?;
+        let target_slug = match self.resolve_project_target(service_target)? {
+            Some(project) => project.slug,
+            None => {
+                let slug = normalize_project_slug(service_target);
+                warn!(
+                    "Artifact dependency removal target '{}' does not resolve to a project; falling back to slug snapshot '{}'",
+                    service_target, slug
+                );
+                slug
+            }
+        };
 
         let affected = match kind {
             Some(kind) => self.conn.execute(
@@ -1040,18 +1044,18 @@ impl Db {
                  WHERE shared_item_id = ?1
                    AND depends_on_project_slug_snapshot = ?2
                    AND kind = ?3",
-                params![item.id, target_project.slug, kind.as_str()],
+                params![item.id, target_slug, kind.as_str()],
             )?,
             None => self.conn.execute(
                 "DELETE FROM artifact_dependencies
                  WHERE shared_item_id = ?1
                    AND depends_on_project_slug_snapshot = ?2",
-                params![item.id, target_project.slug],
+                params![item.id, target_slug],
             )?,
         };
         info!(
             "Removed {} artifact dependencies for item_id={} path={:?} target_slug='{}' kind={:?}",
-            affected, item.id, item.path, target_project.slug, kind
+            affected, item.id, item.path, target_slug, kind
         );
         Ok(affected)
     }
@@ -3238,6 +3242,38 @@ mod tests {
             .unwrap();
         assert_eq!(deps.len(), 1);
         assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+    }
+
+    #[test]
+    fn remove_artifact_dependency_by_deleted_service_slug_snapshot() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+        db.destroy_project_with_service_deleted_event(auth).unwrap();
+
+        let removed = db
+            .remove_artifact_dependency(api, "api-spec", "auth", None)
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        let deps = db
+            .list_artifact_dependencies_for_item(api, "api-spec")
+            .unwrap();
+        assert!(deps.is_empty());
     }
 
     #[test]
