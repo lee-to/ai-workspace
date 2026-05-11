@@ -56,6 +56,19 @@ fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
     }
 }
 
+#[cfg(windows)]
+fn add_windows_verbatim_prefix(path: &str) -> Option<String> {
+    if path.starts_with(r"\\?\") {
+        None
+    } else if let Some(rest) = path.strip_prefix(r"\\") {
+        Some(format!(r"\\?\UNC\{}", rest))
+    } else if path.len() > 2 && path.as_bytes().get(1) == Some(&b':') {
+        Some(format!(r"\\?\{}", path))
+    } else {
+        None
+    }
+}
+
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("AI_WORKSPACE_DB") {
@@ -405,6 +418,31 @@ impl Db {
     /// Find project whose path is a prefix of the given cwd
     pub fn find_project_by_cwd(&self, cwd: &str) -> Result<Option<Project>> {
         debug!("Finding project by cwd: {}", cwd);
+        if let Some(project) = self.find_project_by_cwd_path(cwd)? {
+            return Ok(Some(project));
+        }
+
+        #[cfg(windows)]
+        {
+            if let Some(path) = strip_windows_verbatim_prefix(cwd)
+                && path != cwd
+                && let Some(project) = self.find_project_by_cwd_path(&path)?
+            {
+                return Ok(Some(project));
+            }
+
+            if let Some(path) = add_windows_verbatim_prefix(cwd)
+                && path != cwd
+                && let Some(project) = self.find_project_by_cwd_path(&path)?
+            {
+                return Ok(Some(project));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn find_project_by_cwd_path(&self, cwd: &str) -> Result<Option<Project>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, name, slug, path, created_at FROM projects WHERE ?1 = path OR ?1 LIKE path || '/%' ORDER BY length(path) DESC LIMIT 1",
         )?;
@@ -555,6 +593,37 @@ impl Db {
     }
 
     // --- Project ↔ Group ---
+
+    fn require_project_group_membership(
+        conn: &Connection,
+        project_id: i64,
+        group_id: i64,
+    ) -> Result<()> {
+        let group_name: String = conn.query_row(
+            "SELECT name FROM groups WHERE id = ?1",
+            params![group_id],
+            |row| row.get(0),
+        )?;
+        let is_member: i64 = conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1
+                FROM project_groups
+                WHERE project_id = ?1 AND group_id = ?2
+            )",
+            params![project_id, group_id],
+            |row| row.get(0),
+        )?;
+
+        if is_member == 0 {
+            anyhow::bail!(
+                "Project is not a member of group '{}'. Run `ai-workspace init --group {}` first.",
+                group_name,
+                group_name
+            );
+        }
+
+        Ok(())
+    }
 
     pub fn add_project_to_group(&self, project_id: i64, group_id: i64) -> Result<()> {
         debug!("Adding project {} to group {}", project_id, group_id);
@@ -1676,6 +1745,7 @@ impl Db {
             "Adding group note: group_id={}, created_by={}, label={:?}",
             group_id, created_by_project_id, label
         );
+        Self::require_project_group_membership(&self.conn, created_by_project_id, group_id)?;
         let tx = self.conn.unchecked_transaction()?;
         tx.execute(
             "INSERT INTO shared_items (kind, content, group_id, created_by_project_id, label) VALUES ('note', ?1, ?2, ?3, ?4)",
@@ -1994,6 +2064,10 @@ impl Db {
                 },
             )
             .map_err(|_| anyhow::anyhow!("Item not found or not owned by this project"))?;
+
+        if let Some(ScopeChange::ToGroup { group_id }) = &update.scope_change {
+            Self::require_project_group_membership(&tx, project_id, *group_id)?;
+        }
 
         // Compute final state
         let final_content = match &update.content {
@@ -3633,6 +3707,25 @@ mod tests {
     }
 
     #[test]
+    fn add_group_note_rejects_non_member_group() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let other_pid = db.create_project("other", "/tmp/other").unwrap();
+        let gid = db.get_or_create_group("team").unwrap();
+        db.add_project_to_group(other_pid, gid).unwrap();
+
+        let err = db
+            .add_group_note(gid, pid, "group context", Some("ctx"))
+            .unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Project is not a member of group 'team'. Run `ai-workspace init --group team` first."
+        );
+        assert!(db.search_items("group context").unwrap().is_empty());
+    }
+
+    #[test]
     fn search_items_fts5_special_chars() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -3941,6 +4034,32 @@ mod tests {
         assert!(item.project_id.is_none());
         assert_eq!(item.group_id, Some(gid));
         assert_eq!(item.created_by_project_id, Some(pid));
+    }
+
+    #[test]
+    fn edit_note_scope_project_to_non_member_group_fails() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let other_pid = db.create_project("other", "/tmp/other").unwrap();
+        let gid = db.get_or_create_group("team").unwrap();
+        db.add_project_to_group(other_pid, gid).unwrap();
+        let id = db.add_project_note(pid, "was project", None).unwrap();
+
+        let update = SharedItemUpdate {
+            content: None,
+            label: None,
+            scope_change: Some(ScopeChange::ToGroup { group_id: gid }),
+        };
+        let err = db.update_shared_item(id, pid, &update).unwrap_err();
+
+        assert_eq!(
+            err.to_string(),
+            "Project is not a member of group 'team'. Run `ai-workspace init --group team` first."
+        );
+        let item = db.get_item_by_id(id).unwrap().unwrap();
+        assert_eq!(item.project_id, Some(pid));
+        assert!(item.group_id.is_none());
+        assert!(item.created_by_project_id.is_none());
     }
 
     #[test]
