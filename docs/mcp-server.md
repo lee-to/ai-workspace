@@ -51,7 +51,7 @@ Get workspace metadata: all projects, their groups, and shared items (no file co
 
 **Parameters:** none
 
-**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label). Each group includes its member projects and group notes (with preview).
+**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its member projects and group notes (with preview).
 
 ### `workspace_read`
 
@@ -125,6 +125,51 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
+
+### `workspace_service_graph`
+
+Inspect directional service links for all projects, a specific group, or the group graphs around one project.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project` | string | no | Project id, slug, or registered path whose group graphs should be returned |
+| `project_id` | integer | no | Project ID whose group graphs should be returned |
+| `group_id` | integer | no | Group ID whose service graph should be returned |
+
+Pass at most one selector. With no selector, the tool returns all service links.
+
+**Returns:** JSON object with a `scope` object and a `links` array. For project-scoped requests, `scope.groups` lists every group included in the graph. Each link includes id, source/target project ids and slugs, kind, label, and timestamps.
+
+### `workspace_events`
+
+List workspace events or show a project's open event inbox.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project` | string | no | Project id, slug, or registered path for inbox mode |
+| `project_id` | integer | no | Project ID for inbox mode |
+| `source` | string | no | Source service slug filter for list mode |
+| `status` | string | no | Event status filter: `open` or `closed` |
+
+Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists events and applies the optional filters.
+
+**Returns:** JSON array of events with source snapshots, kind, title, body, severity, status, and timestamps.
+
+### `workspace_event_details`
+
+Get one event with affected services and affected artifacts.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `event_id` | integer | yes | Workspace event ID |
+
+**Returns:** JSON object with `event`, `affected_services`, and `affected_artifacts`. Artifact entries include path snapshots and recommended reactions.
 
 ### `project_tree`
 

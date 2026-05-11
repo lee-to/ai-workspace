@@ -7,6 +7,10 @@ use std::io::IsTerminal;
 use std::path::Path;
 
 use crate::db::{Db, ScopeChange, SharedItemUpdate};
+use crate::models::{
+    ArtifactDependencyKind, ArtifactReaction, EventSeverity, EventStatus, ServiceLinkKind,
+    WorkspaceEventKind,
+};
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum NoteScope {
@@ -21,6 +25,237 @@ pub enum ListTarget {
     Groups,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliServiceLinkKind {
+    #[value(name = "depends_on")]
+    DependsOn,
+    #[value(name = "related_to")]
+    RelatedTo,
+}
+
+impl From<CliServiceLinkKind> for ServiceLinkKind {
+    fn from(kind: CliServiceLinkKind) -> Self {
+        match kind {
+            CliServiceLinkKind::DependsOn => ServiceLinkKind::DependsOn,
+            CliServiceLinkKind::RelatedTo => ServiceLinkKind::RelatedTo,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliArtifactDependencyKind {
+    #[value(name = "references")]
+    References,
+    #[value(name = "consumes_api")]
+    ConsumesApi,
+    #[value(name = "documents")]
+    Documents,
+    #[value(name = "configures")]
+    Configures,
+}
+
+impl From<CliArtifactDependencyKind> for ArtifactDependencyKind {
+    fn from(kind: CliArtifactDependencyKind) -> Self {
+        match kind {
+            CliArtifactDependencyKind::References => ArtifactDependencyKind::References,
+            CliArtifactDependencyKind::ConsumesApi => ArtifactDependencyKind::ConsumesApi,
+            CliArtifactDependencyKind::Documents => ArtifactDependencyKind::Documents,
+            CliArtifactDependencyKind::Configures => ArtifactDependencyKind::Configures,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliArtifactReaction {
+    #[value(name = "inspect")]
+    Inspect,
+    #[value(name = "update")]
+    Update,
+    #[value(name = "delete")]
+    Delete,
+    #[value(name = "remove_reference")]
+    RemoveReference,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliWorkspaceEventKind {
+    #[value(name = "service_deleted")]
+    ServiceDeleted,
+    #[value(name = "service_changed")]
+    ServiceChanged,
+    #[value(name = "artifact_changed")]
+    ArtifactChanged,
+}
+
+impl From<CliWorkspaceEventKind> for WorkspaceEventKind {
+    fn from(kind: CliWorkspaceEventKind) -> Self {
+        match kind {
+            CliWorkspaceEventKind::ServiceDeleted => WorkspaceEventKind::ServiceDeleted,
+            CliWorkspaceEventKind::ServiceChanged => WorkspaceEventKind::ServiceChanged,
+            CliWorkspaceEventKind::ArtifactChanged => WorkspaceEventKind::ArtifactChanged,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliEventSeverity {
+    #[value(name = "info")]
+    Info,
+    #[value(name = "warning")]
+    Warning,
+    #[value(name = "error")]
+    Error,
+    #[value(name = "critical")]
+    Critical,
+}
+
+impl From<CliEventSeverity> for EventSeverity {
+    fn from(severity: CliEventSeverity) -> Self {
+        match severity {
+            CliEventSeverity::Info => EventSeverity::Info,
+            CliEventSeverity::Warning => EventSeverity::Warning,
+            CliEventSeverity::Error => EventSeverity::Error,
+            CliEventSeverity::Critical => EventSeverity::Critical,
+        }
+    }
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliEventStatus {
+    #[value(name = "open")]
+    Open,
+    #[value(name = "closed")]
+    Closed,
+}
+
+impl From<CliEventStatus> for EventStatus {
+    fn from(status: CliEventStatus) -> Self {
+        match status {
+            CliEventStatus::Open => EventStatus::Open,
+            CliEventStatus::Closed => EventStatus::Closed,
+        }
+    }
+}
+
+impl From<CliArtifactReaction> for ArtifactReaction {
+    fn from(reaction: CliArtifactReaction) -> Self {
+        match reaction {
+            CliArtifactReaction::Inspect => ArtifactReaction::Inspect,
+            CliArtifactReaction::Update => ArtifactReaction::Update,
+            CliArtifactReaction::Delete => ArtifactReaction::Delete,
+            CliArtifactReaction::RemoveReference => ArtifactReaction::RemoveReference,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LinkCommand {
+    /// Add a directional service link
+    Add {
+        /// Source project id, slug, or registered path
+        from: String,
+        /// Target project id, slug, or registered path
+        to: String,
+        /// Link kind
+        #[arg(long, value_enum)]
+        kind: CliServiceLinkKind,
+        /// Optional human-readable label
+        #[arg(long)]
+        label: Option<String>,
+    },
+    /// List service links
+    List {
+        /// Project id, slug, or registered path to show incoming/outgoing links for
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Remove a service link by id
+    Rm {
+        /// Service link id
+        id: i64,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    /// Mark a shared file or directory as depending on a service
+    Depends {
+        /// Shared item id, label, or path
+        item: String,
+        /// Service slug, project id, or registered path
+        service_slug: String,
+        /// Dependency kind
+        #[arg(long, value_enum)]
+        kind: CliArtifactDependencyKind,
+        /// Suggested reaction when the dependency source changes
+        #[arg(long, value_enum)]
+        reaction: CliArtifactReaction,
+    },
+    /// List artifact dependencies for the current project or one item
+    Deps {
+        /// Optional shared item id, label, or path
+        item: Option<String>,
+    },
+    /// Remove an artifact dependency
+    Undepend {
+        /// Shared item id, label, or path
+        item: String,
+        /// Service slug, project id, or registered path
+        service_slug: String,
+        /// Optional dependency kind filter
+        #[arg(long, value_enum)]
+        kind: Option<CliArtifactDependencyKind>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum EventCommand {
+    /// Create a workspace event and calculate its impact
+    Create {
+        /// Event kind
+        #[arg(long, value_enum)]
+        kind: CliWorkspaceEventKind,
+        /// Source service slug, project id, or registered path
+        #[arg(long)]
+        source: String,
+        /// Event severity
+        #[arg(long, value_enum, default_value = "info")]
+        severity: CliEventSeverity,
+        /// Optional title
+        #[arg(long)]
+        title: Option<String>,
+        /// Optional body text
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Show open events affecting the current project
+    Inbox,
+    /// List workspace events
+    List {
+        /// Source service slug filter
+        #[arg(long)]
+        source: Option<String>,
+        /// Event status filter
+        #[arg(long, value_enum)]
+        status: Option<CliEventStatus>,
+    },
+    /// Show event details
+    Show {
+        /// Event id
+        id: i64,
+    },
+    /// Close an event and resolve its targets/artifacts
+    Close {
+        /// Event id
+        id: i64,
+    },
+    /// Physically remove an event
+    Rm {
+        /// Event id
+        id: i64,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize current directory as a project
@@ -28,6 +263,9 @@ pub enum Command {
         /// Project name (defaults to directory name)
         #[arg(short, long)]
         name: Option<String>,
+        /// Stable service slug (defaults to a normalized project name)
+        #[arg(long)]
+        slug: Option<String>,
         /// Group to join or create
         #[arg(short, long)]
         group: Option<String>,
@@ -91,6 +329,21 @@ pub enum Command {
         /// What to list: projects, groups, or all (default)
         #[arg(value_enum, default_value = "all")]
         what: ListTarget,
+    },
+    /// Manage directional service links between projects
+    Link {
+        #[command(subcommand)]
+        command: LinkCommand,
+    },
+    /// Manage dependencies from shared artifacts to services
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
+    /// Manage workspace service events
+    Event {
+        #[command(subcommand)]
+        command: EventCommand,
     },
     /// Remove a project from ai-workspace (keeps files on disk)
     Destroy {
@@ -266,6 +519,160 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
     println!("{}", style_table_border(&border));
 }
 
+fn project_display_slug(db: &Db, project_id: i64) -> Result<String> {
+    Ok(db
+        .get_project_by_id(project_id)?
+        .map(|project| project.slug)
+        .unwrap_or_else(|| format!("project={project_id}")))
+}
+
+fn print_service_links(db: &Db, links: &[crate::models::ServiceLink]) -> Result<()> {
+    if links.is_empty() {
+        println!("Service links: (none)");
+        return Ok(());
+    }
+
+    let mut rows = Vec::with_capacity(links.len());
+    for link in links {
+        rows.push(vec![
+            link.id.to_string(),
+            project_display_slug(db, link.from_project_id)?,
+            project_display_slug(db, link.to_project_id)?,
+            link.kind.to_string(),
+            link.label.as_deref().unwrap_or("-").to_string(),
+        ]);
+    }
+    print_table(&["ID", "From", "To", "Kind", "Label"], &rows);
+    Ok(())
+}
+
+fn dependency_item_label(db: &Db, shared_item_id: i64) -> Result<String> {
+    Ok(db
+        .get_item_by_id(shared_item_id)?
+        .and_then(|item| item.path.or(item.label))
+        .unwrap_or_else(|| format!("item={shared_item_id}")))
+}
+
+fn dependency_summary(deps: &[crate::models::ArtifactDependency]) -> String {
+    if deps.is_empty() {
+        return "-".to_string();
+    }
+
+    let values = deps
+        .iter()
+        .map(|dep| {
+            format!(
+                "{}:{}:{}",
+                dep.depends_on_project_slug_snapshot, dep.kind, dep.reaction
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    truncate_for_cell(&values, 56)
+}
+
+fn print_artifact_dependencies(db: &Db, deps: &[crate::models::ArtifactDependency]) -> Result<()> {
+    if deps.is_empty() {
+        println!("Artifact dependencies: (none)");
+        return Ok(());
+    }
+
+    let mut rows = Vec::with_capacity(deps.len());
+    for dep in deps {
+        rows.push(vec![
+            dep.id.to_string(),
+            dependency_item_label(db, dep.shared_item_id)?,
+            dep.depends_on_project_slug_snapshot.clone(),
+            dep.kind.to_string(),
+            dep.reaction.to_string(),
+        ]);
+    }
+    print_table(&["ID", "Item", "Service", "Kind", "Reaction"], &rows);
+    Ok(())
+}
+
+fn print_workspace_events(events: &[crate::models::WorkspaceEvent]) {
+    if events.is_empty() {
+        println!("Events: (none)");
+        return;
+    }
+
+    let rows = events
+        .iter()
+        .map(|event| {
+            vec![
+                event.id.to_string(),
+                event.source_project_slug.clone(),
+                event.kind.to_string(),
+                event.severity.to_string(),
+                event.status.to_string(),
+                truncate_for_cell(&event.title, 48),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print_table(
+        &["ID", "Source", "Kind", "Severity", "Status", "Title"],
+        &rows,
+    );
+}
+
+fn print_event_details(db: &Db, event_id: i64) -> Result<()> {
+    let event = db
+        .get_workspace_event(event_id)?
+        .ok_or_else(|| anyhow::anyhow!("Event id={} not found", event_id))?;
+    println!("Event: {} (id={})", event.title, event.id);
+    println!("Source: {}", event.source_project_slug);
+    println!("Kind: {}", event.kind);
+    println!("Severity: {}", event.severity);
+    println!("Status: {}", event.status);
+    if let Some(body) = event.body {
+        println!("Body: {}", body);
+    }
+
+    let targets = db.list_event_targets(event.id)?;
+    print_section("Affected services:");
+    if targets.is_empty() {
+        println!("Affected services: (none)");
+    } else {
+        let mut rows = Vec::with_capacity(targets.len());
+        for target in targets {
+            let project = target
+                .affected_project_id
+                .map(|id| project_display_slug(db, id))
+                .transpose()?
+                .unwrap_or_else(|| "-".to_string());
+            rows.push(vec![
+                target.id.to_string(),
+                project,
+                target.relation_kind.to_string(),
+                target.status.to_string(),
+            ]);
+        }
+        print_table(&["ID", "Project", "Relation", "Status"], &rows);
+    }
+
+    let artifacts = db.list_event_artifacts(event.id)?;
+    print_section("Affected artifacts:");
+    if artifacts.is_empty() {
+        println!("Affected artifacts: (none)");
+    } else {
+        let rows = artifacts
+            .iter()
+            .map(|artifact| {
+                vec![
+                    artifact.id.to_string(),
+                    artifact.path_snapshot.clone(),
+                    artifact.reaction.to_string(),
+                    artifact.status.to_string(),
+                    truncate_for_cell(&artifact.reason, 48),
+                ]
+            })
+            .collect::<Vec<_>>();
+        print_table(&["ID", "Path", "Reaction", "Status", "Reason"], &rows);
+    }
+    Ok(())
+}
+
 /// Key files to auto-share on init (when no .ai-workspace.json exists).
 const AUTO_SHARE_FILES: &[&str] = &[
     "Cargo.toml",
@@ -337,7 +744,7 @@ pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Serve => crate::mcp::serve(),
 
-        Command::Init { name, group } => {
+        Command::Init { name, slug, group } => {
             let cwd = env::current_dir()?;
             let cwd_str = cwd.to_string_lossy().to_string();
 
@@ -361,12 +768,21 @@ pub fn run(cmd: Command) -> Result<()> {
                         .unwrap_or_else(|| "unnamed".to_string())
                 }
             });
+            let project_slug = slug.or_else(|| config.as_ref().and_then(|cfg| cfg.slug.clone()));
 
             info!("Initializing project '{}' at {}", project_name, cwd_str);
             let db = Db::open_default()?;
 
             // Check if already initialized
             let project_id = if let Some(existing) = db.get_project_by_path(&cwd_str)? {
+                if let Some(slug) = project_slug.as_deref()
+                    && existing.slug != crate::models::normalize_project_slug(slug)
+                {
+                    bail!(
+                        "Project already initialized with slug '{}'. Slug changes are not supported yet.",
+                        existing.slug
+                    );
+                }
                 // Only rename if --name was explicitly provided
                 if name_from_flag && existing.name != project_name {
                     db.rename_project(existing.id, &project_name)?;
@@ -376,16 +792,20 @@ pub fn run(cmd: Command) -> Result<()> {
                     ));
                 } else {
                     print_info(format!(
-                        "Project '{}' already initialized (id={})",
-                        existing.name, existing.id
+                        "Project '{}' already initialized (id={}, slug={})",
+                        existing.name, existing.id, existing.slug
                     ));
                 }
                 existing.id
             } else {
-                let id = db.create_project(&project_name, &cwd_str)?;
+                let id =
+                    db.create_project_with_slug(&project_name, &cwd_str, project_slug.as_deref())?;
+                let project = db
+                    .get_project_by_id(id)?
+                    .ok_or_else(|| anyhow::anyhow!("Project {} not found after create", id))?;
                 print_success(format!(
-                    "Initialized project '{}' (id={})",
-                    project_name, id
+                    "Initialized project '{}' (id={}, slug={})",
+                    project_name, id, project.slug
                 ));
                 print_info(format!("Path: {}", cwd_str));
                 id
@@ -427,16 +847,22 @@ pub fn run(cmd: Command) -> Result<()> {
                     + report.groups_removed
                     + report.shares_added
                     + report.shares_removed
+                    + report.dependencies_added
+                    + report.dependencies_removed
+                    + report.dependencies_updated
                     + report.notes_added
                     + report.notes_removed
                     + report.notes_updated;
                 if total > 0 {
                     print_success(format!(
-                        "Applied .ai-workspace.json: groups +{} -{}, shares +{} -{}, notes +{} -{} ~{}",
+                        "Applied .ai-workspace.json: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
                         report.groups_added,
                         report.groups_removed,
                         report.shares_added,
                         report.shares_removed,
+                        report.dependencies_added,
+                        report.dependencies_removed,
+                        report.dependencies_updated,
                         report.notes_added,
                         report.notes_removed,
                         report.notes_updated,
@@ -697,10 +1123,10 @@ pub fn run(cmd: Command) -> Result<()> {
                 None => require_project(&db)?,
             };
 
-            db.delete_project(project.id)?;
+            let event_id = db.destroy_project_with_service_deleted_event(project.id)?;
             print_success(format!(
-                "Removed project '{}' from ai-workspace (files on disk are untouched)",
-                project.name
+                "Removed project '{}' from ai-workspace (files on disk are untouched, event id={})",
+                project.name, event_id
             ));
             Ok(())
         }
@@ -732,11 +1158,12 @@ pub fn run(cmd: Command) -> Result<()> {
                         rows.push(vec![
                             p.id.to_string(),
                             p.name,
+                            p.slug,
                             truncate_for_cell(&p.path, 56),
                             truncate_for_cell(&group_names, 30),
                         ]);
                     }
-                    print_table(&["ID", "Project", "Path", "Groups"], &rows);
+                    print_table(&["ID", "Project", "Slug", "Path", "Groups"], &rows);
                 }
             }
 
@@ -758,7 +1185,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         } else {
                             members
                                 .iter()
-                                .map(|p| p.name.as_str())
+                                .map(|p| p.slug.as_str())
                                 .collect::<Vec<_>>()
                                 .join(", ")
                         };
@@ -768,17 +1195,301 @@ pub fn run(cmd: Command) -> Result<()> {
                             truncate_for_cell(&member_names, 48),
                         ]);
                     }
-                    print_table(&["ID", "Group", "Members"], &rows);
+                    print_table(&["ID", "Group", "Member slugs"], &rows);
                 }
             }
 
             Ok(())
         }
 
+        Command::Link { command } => {
+            let db = Db::open_default()?;
+            match command {
+                LinkCommand::Add {
+                    from,
+                    to,
+                    kind,
+                    label,
+                } => {
+                    let kind = ServiceLinkKind::from(kind);
+                    debug!(
+                        "Parsed link add command: from='{}', to='{}', kind={}, label={:?}",
+                        from, to, kind, label
+                    );
+                    let id = db.create_service_link(&from, &to, kind, label.as_deref())?;
+                    let link = db.get_service_link_by_id(id)?.ok_or_else(|| {
+                        anyhow::anyhow!("Service link id={} not found after create", id)
+                    })?;
+                    let from_slug = project_display_slug(&db, link.from_project_id)?;
+                    let to_slug = project_display_slug(&db, link.to_project_id)?;
+                    info!(
+                        "Created or reused service link id={} from={} to={} kind={}",
+                        id, from_slug, to_slug, link.kind
+                    );
+                    print_success(format!(
+                        "Linked {} -> {} (id={}, kind={})",
+                        from_slug, to_slug, id, link.kind
+                    ));
+                    Ok(())
+                }
+                LinkCommand::List { project } => {
+                    debug!("Parsed link list command: project={:?}", project);
+                    if let Some(project_target) = project {
+                        let project =
+                            db.resolve_project_target(&project_target)?.ok_or_else(|| {
+                                anyhow::anyhow!("Project '{}' not found", project_target)
+                            })?;
+                        info!("Listing service links for project slug='{}'", project.slug);
+                        print_section(format!("Outgoing links for {}:", project.slug));
+                        let outgoing = db.list_outgoing_service_links(project.id)?;
+                        print_service_links(&db, &outgoing)?;
+                        println!();
+                        print_section(format!("Incoming links for {}:", project.slug));
+                        let incoming = db.list_incoming_service_links(project.id)?;
+                        print_service_links(&db, &incoming)?;
+                        return Ok(());
+                    }
+
+                    let cwd_project = env::current_dir().ok().and_then(|cwd| {
+                        db.find_project_by_cwd(&cwd.to_string_lossy())
+                            .ok()
+                            .flatten()
+                    });
+
+                    if let Some(project) = cwd_project {
+                        let groups = db.get_groups_for_project(project.id)?;
+                        if groups.is_empty() {
+                            info!(
+                                "Listing incoming/outgoing service links for ungrouped project slug='{}'",
+                                project.slug
+                            );
+                            let mut links = db.list_outgoing_service_links(project.id)?;
+                            let mut seen = links.iter().map(|link| link.id).collect::<HashSet<_>>();
+                            for link in db.list_incoming_service_links(project.id)? {
+                                if seen.insert(link.id) {
+                                    links.push(link);
+                                }
+                            }
+                            print_section(format!("Service links for {}:", project.slug));
+                            print_service_links(&db, &links)?;
+                            return Ok(());
+                        }
+
+                        let mut links = Vec::new();
+                        let mut seen = HashSet::new();
+                        for group in groups {
+                            debug!(
+                                "Listing service graph for group id={} name='{}'",
+                                group.id, group.name
+                            );
+                            for link in db.list_group_service_links(group.id)? {
+                                if seen.insert(link.id) {
+                                    links.push(link);
+                                }
+                            }
+                        }
+                        info!(
+                            "Listed {} service links from current project group graph",
+                            links.len()
+                        );
+                        print_section(format!("Service graph for {}:", project.slug));
+                        print_service_links(&db, &links)?;
+                    } else {
+                        info!("Listing all service links outside a project context");
+                        let links = db.list_service_links()?;
+                        print_section("Service links:");
+                        print_service_links(&db, &links)?;
+                    }
+                    Ok(())
+                }
+                LinkCommand::Rm { id } => {
+                    debug!("Parsed link rm command: id={}", id);
+                    match db.delete_service_link_by_id(id)? {
+                        Some(link) => {
+                            let from_slug = project_display_slug(&db, link.from_project_id)?;
+                            let to_slug = project_display_slug(&db, link.to_project_id)?;
+                            print_success(format!(
+                                "Removed link {} -> {} ({}, id={})",
+                                from_slug, to_slug, link.kind, id
+                            ));
+                        }
+                        None => print_info(format!("Service link id={} not found", id)),
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        Command::Artifact { command } => {
+            let db = Db::open_default()?;
+            let project = require_project(&db)?;
+            match command {
+                ArtifactCommand::Depends {
+                    item,
+                    service_slug,
+                    kind,
+                    reaction,
+                } => {
+                    let kind = ArtifactDependencyKind::from(kind);
+                    let reaction = ArtifactReaction::from(reaction);
+                    debug!(
+                        "Parsed artifact depends command: item='{}', service='{}', kind={}, reaction={}",
+                        item, service_slug, kind, reaction
+                    );
+                    let id = db.add_artifact_dependency(
+                        project.id,
+                        &item,
+                        &service_slug,
+                        kind,
+                        reaction,
+                    )?;
+                    info!(
+                        "Added artifact dependency id={} project_slug='{}' item='{}' service='{}'",
+                        id, project.slug, item, service_slug
+                    );
+                    print_success(format!(
+                        "Marked '{}' as depending on '{}' (id={}, kind={}, reaction={})",
+                        item, service_slug, id, kind, reaction
+                    ));
+                    Ok(())
+                }
+                ArtifactCommand::Deps { item } => {
+                    debug!("Parsed artifact deps command: item={:?}", item);
+                    let deps = if let Some(item_target) = item {
+                        info!(
+                            "Listing artifact dependencies for project_slug='{}' item='{}'",
+                            project.slug, item_target
+                        );
+                        db.list_artifact_dependencies_for_item(project.id, &item_target)?
+                    } else {
+                        info!(
+                            "Listing artifact dependencies for project_slug='{}'",
+                            project.slug
+                        );
+                        db.list_artifact_dependencies_for_project(project.id)?
+                    };
+                    print_artifact_dependencies(&db, &deps)?;
+                    Ok(())
+                }
+                ArtifactCommand::Undepend {
+                    item,
+                    service_slug,
+                    kind,
+                } => {
+                    let kind = kind.map(ArtifactDependencyKind::from);
+                    debug!(
+                        "Parsed artifact undepend command: item='{}', service='{}', kind={:?}",
+                        item, service_slug, kind
+                    );
+                    let removed =
+                        db.remove_artifact_dependency(project.id, &item, &service_slug, kind)?;
+                    if removed == 0 {
+                        print_info(format!(
+                            "No artifact dependencies removed for '{}' -> '{}'",
+                            item, service_slug
+                        ));
+                    } else {
+                        print_success(format!(
+                            "Removed {} artifact dependenc{} for '{}' -> '{}'",
+                            removed,
+                            if removed == 1 { "y" } else { "ies" },
+                            item,
+                            service_slug
+                        ));
+                    }
+                    Ok(())
+                }
+            }
+        }
+
+        Command::Event { command } => {
+            let db = Db::open_default()?;
+            match command {
+                EventCommand::Create {
+                    kind,
+                    source,
+                    severity,
+                    title,
+                    body,
+                } => {
+                    let kind = WorkspaceEventKind::from(kind);
+                    let severity = EventSeverity::from(severity);
+                    let title = title.unwrap_or_else(|| format!("{} event from {}", kind, source));
+                    debug!(
+                        "Parsed event create command: kind={}, source='{}', severity={}",
+                        kind, source, severity
+                    );
+                    let id = db.create_workspace_event(
+                        &source,
+                        kind,
+                        severity,
+                        &title,
+                        body.as_deref(),
+                    )?;
+                    info!(
+                        "Created workspace event id={} source='{}' kind={}",
+                        id, source, kind
+                    );
+                    print_success(format!("Created event '{}' (id={})", title, id));
+                    print_event_details(&db, id)?;
+                    Ok(())
+                }
+                EventCommand::Inbox => {
+                    let project = require_project(&db)?;
+                    debug!(
+                        "Parsed event inbox command for project_slug='{}'",
+                        project.slug
+                    );
+                    let events = db.list_workspace_event_inbox(project.id)?;
+                    info!(
+                        "Listed {} inbox events for project_slug='{}'",
+                        events.len(),
+                        project.slug
+                    );
+                    print_workspace_events(&events);
+                    Ok(())
+                }
+                EventCommand::List { source, status } => {
+                    let status = status.map(EventStatus::from);
+                    debug!(
+                        "Parsed event list command: source={:?}, status={:?}",
+                        source, status
+                    );
+                    let events = db.list_workspace_events(source.as_deref(), status)?;
+                    info!("Listed {} workspace events", events.len());
+                    print_workspace_events(&events);
+                    Ok(())
+                }
+                EventCommand::Show { id } => {
+                    debug!("Parsed event show command: id={}", id);
+                    print_event_details(&db, id)
+                }
+                EventCommand::Close { id } => {
+                    debug!("Parsed event close command: id={}", id);
+                    if db.close_workspace_event(id)? {
+                        print_success(format!("Closed event id={}", id));
+                    } else {
+                        print_info(format!("Event id={} was not open or was not found", id));
+                    }
+                    Ok(())
+                }
+                EventCommand::Rm { id } => {
+                    debug!("Parsed event rm command: id={}", id);
+                    if db.remove_workspace_event(id)? {
+                        print_success(format!("Removed event id={}", id));
+                    } else {
+                        print_info(format!("Event id={} not found", id));
+                    }
+                    Ok(())
+                }
+            }
+        }
+
         Command::Status => {
             let db = Db::open_default()?;
             let project = require_project(&db)?;
             println!("Project: {} (id={})", project.name, project.id);
+            println!("Slug: {}", project.slug);
             println!("Path: {}", project.path);
 
             let groups = db.get_groups_for_project(project.id)?;
@@ -798,6 +1509,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 println!("Shared items: (none)");
             } else {
                 print_section("Shared items:");
+                let deps = db.list_artifact_dependencies_for_project(project.id)?;
                 let mut rows = Vec::with_capacity(items.len());
                 for item in &items {
                     let value = match item.kind {
@@ -811,9 +1523,16 @@ pub fn run(cmd: Command) -> Result<()> {
                         item.kind.to_string(),
                         item.label.as_deref().unwrap_or("-").to_string(),
                         truncate_for_cell(&value, 80),
+                        dependency_summary(
+                            &deps
+                                .iter()
+                                .filter(|dep| dep.shared_item_id == item.id)
+                                .cloned()
+                                .collect::<Vec<_>>(),
+                        ),
                     ]);
                 }
-                print_table(&["ID", "Kind", "Label", "Value"], &rows);
+                print_table(&["ID", "Kind", "Label", "Value", "Dependencies"], &rows);
             }
 
             // Collect own paths and note contents for dedup in group view
@@ -958,16 +1677,22 @@ pub fn run(cmd: Command) -> Result<()> {
                         + report.groups_removed
                         + report.shares_added
                         + report.shares_removed
+                        + report.dependencies_added
+                        + report.dependencies_removed
+                        + report.dependencies_updated
                         + report.notes_added
                         + report.notes_removed
                         + report.notes_updated;
                     if total > 0 {
                         print_success(format!(
-                            "Config sync: groups +{} -{}, shares +{} -{}, notes +{} -{} ~{}",
+                            "Config sync: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
                             report.groups_added,
                             report.groups_removed,
                             report.shares_added,
                             report.shares_removed,
+                            report.dependencies_added,
+                            report.dependencies_removed,
+                            report.dependencies_updated,
                             report.notes_added,
                             report.notes_removed,
                             report.notes_updated,

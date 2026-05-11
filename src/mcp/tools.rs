@@ -1,4 +1,4 @@
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use std::path::Path;
 
 use super::protocol::{JsonRpcResponse, McpError};
@@ -166,6 +166,72 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             };
             workspace_search_fulltext(id, &query, limit, &db)
         }
+        "workspace_service_graph" => {
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
+            let group_id = arguments.get("group_id").and_then(|v| v.as_i64());
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            workspace_service_graph(id, project.as_deref(), project_id, group_id, &db)
+        }
+        "workspace_events" => {
+            let project = arguments
+                .get("project")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let project_id = arguments.get("project_id").and_then(|v| v.as_i64());
+            let source = arguments
+                .get("source")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let status = match arguments.get("status").and_then(|v| v.as_str()) {
+                Some(value) => match value.parse::<crate::models::EventStatus>() {
+                    Ok(status) => Some(status),
+                    Err(_) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            McpError::invalid_params(
+                                "Invalid status. Expected one of: open, closed",
+                            ),
+                        );
+                    }
+                },
+                None => None,
+            };
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            workspace_events(
+                id,
+                project.as_deref(),
+                project_id,
+                source.as_deref(),
+                status,
+                &db,
+            )
+        }
+        "workspace_event_details" => {
+            let event_id = match arguments.get("event_id").and_then(|v| v.as_i64()) {
+                Some(event_id) => event_id,
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: event_id"),
+                    );
+                }
+            };
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            workspace_event_details(id, event_id, &db)
+        }
         _ => {
             error!("Unknown tool: {}", tool_name);
             JsonRpcResponse::error(
@@ -242,11 +308,43 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
 
     let projects_arr = context["projects"].as_array_mut().unwrap();
     for p in &projects {
-        let project_groups = db.get_groups_for_project(p.id).unwrap_or_default();
-        let items = db.get_shared_items_for_project(p.id).unwrap_or_default();
+        let project_groups = match db.get_groups_for_project(p.id) {
+            Ok(groups) => groups,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load groups for project '{}': {}", p.slug, e),
+                );
+            }
+        };
+        let items = match db.get_shared_items_for_project(p.id) {
+            Ok(items) => items,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!(
+                        "Failed to load shared items for project '{}': {}",
+                        p.slug, e
+                    ),
+                );
+            }
+        };
+        let deps = match db.list_artifact_dependencies_for_project(p.id) {
+            Ok(deps) => deps,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!(
+                        "Failed to load artifact dependencies for project '{}': {}",
+                        p.slug, e
+                    ),
+                );
+            }
+        };
         projects_arr.push(serde_json::json!({
             "id": p.id,
             "name": p.name,
+            "slug": p.slug,
             "path": p.path,
             "groups": project_groups.iter().map(|g| &g.name).collect::<Vec<_>>(),
             "shared_items": items.iter().map(|i| serde_json::json!({
@@ -254,14 +352,38 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
                 "kind": i.kind.as_str(),
                 "path": i.path,
                 "label": i.label,
+                "dependencies": deps.iter()
+                    .filter(|dep| dep.shared_item_id == i.id)
+                    .map(|dep| serde_json::json!({
+                        "service": dep.depends_on_project_slug_snapshot,
+                        "kind": dep.kind.as_str(),
+                        "reaction": dep.reaction.as_str()
+                    }))
+                    .collect::<Vec<_>>()
             })).collect::<Vec<_>>()
         }));
     }
 
     let groups_arr = context["groups"].as_array_mut().unwrap();
     for g in &groups {
-        let group_projects = db.get_projects_for_group(g.id).unwrap_or_default();
-        let notes = db.get_all_items_for_group(g.id).unwrap_or_default();
+        let group_projects = match db.get_projects_for_group(g.id) {
+            Ok(projects) => projects,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load projects for group '{}': {}", g.name, e),
+                );
+            }
+        };
+        let notes = match db.get_all_items_for_group(g.id) {
+            Ok(notes) => notes,
+            Err(e) => {
+                return tool_error(
+                    id,
+                    &format!("Failed to load shared items for group '{}': {}", g.name, e),
+                );
+            }
+        };
         let mut seen_contents = std::collections::HashSet::new();
         let note_items: Vec<_> = notes
             .iter()
@@ -281,13 +403,19 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         groups_arr.push(serde_json::json!({
             "id": g.id,
             "name": g.name,
-            "projects": group_projects.iter().map(|p| &p.name).collect::<Vec<_>>(),
+            "projects": group_projects.iter().map(|p| serde_json::json!({
+                "id": p.id,
+                "name": p.name,
+                "slug": p.slug,
+            })).collect::<Vec<_>>(),
             "notes": note_items
         }));
     }
 
-    let text = serde_json::to_string_pretty(&context).unwrap_or_default();
-    tool_result(id, text)
+    match serde_json::to_string_pretty(&context) {
+        Ok(text) => tool_result(id, text),
+        Err(e) => tool_error(id, &format!("Failed to serialize workspace context: {}", e)),
+    }
 }
 
 const PATH_POLICY_DENIED: &str = "Access denied: hidden or sensitive path requires explicit opt-in";
@@ -531,6 +659,7 @@ fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
                 "projects": projects.iter().map(|p| serde_json::json!({
                     "id": p.id,
                     "name": p.name,
+                    "slug": p.slug,
                     "path": p.path
                 })).collect::<Vec<_>>()
             })
@@ -664,6 +793,7 @@ fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
             serde_json::json!({
                 "id": p.id,
                 "name": p.name,
+                "slug": p.slug,
                 "path": p.path,
                 "groups": groups.iter().map(|g| serde_json::json!({
                     "id": g.id,
@@ -675,6 +805,299 @@ fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
 
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     tool_result(id, text)
+}
+
+fn project_slug(db: &Db, project_id: i64) -> String {
+    db.get_project_by_id(project_id)
+        .ok()
+        .flatten()
+        .map(|project| project.slug)
+        .unwrap_or_else(|| format!("project={project_id}"))
+}
+
+fn service_link_json(db: &Db, link: &crate::models::ServiceLink) -> serde_json::Value {
+    serde_json::json!({
+        "id": link.id,
+        "from_project_id": link.from_project_id,
+        "from": project_slug(db, link.from_project_id),
+        "to_project_id": link.to_project_id,
+        "to": project_slug(db, link.to_project_id),
+        "kind": link.kind.as_str(),
+        "label": link.label,
+        "created_at": link.created_at,
+        "updated_at": link.updated_at
+    })
+}
+
+fn workspace_service_graph(
+    id: serde_json::Value,
+    project: Option<&str>,
+    project_id: Option<i64>,
+    group_id: Option<i64>,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "workspace_service_graph: project={:?}, project_id={:?}, group_id={:?}",
+        project, project_id, group_id
+    );
+
+    if group_id.is_some() && (project.is_some() || project_id.is_some()) {
+        return JsonRpcResponse::error(
+            id,
+            McpError::invalid_params("Provide either group_id OR project/project_id, not both"),
+        );
+    }
+    if project.is_some() && project_id.is_some() {
+        return JsonRpcResponse::error(
+            id,
+            McpError::invalid_params("Provide either project OR project_id, not both"),
+        );
+    }
+
+    let (scope, links) = if let Some(group_id) = group_id {
+        debug!(
+            "workspace_service_graph: listing group graph group_id={}",
+            group_id
+        );
+        match db.list_group_service_links(group_id) {
+            Ok(links) => (serde_json::json!({"group_id": group_id}), links),
+            Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
+        }
+    } else if let Some(project_id) = project_id {
+        match db.get_project_by_id(project_id) {
+            Ok(Some(project)) => match service_graph_for_project(db, &project) {
+                Ok(graph) => graph,
+                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
+            },
+            Ok(None) => {
+                warn!(
+                    "workspace_service_graph: project_id={} not found",
+                    project_id
+                );
+                return tool_error(id, &format!("Project {} not found", project_id));
+            }
+            Err(e) => return tool_error(id, &format!("Failed to resolve project: {}", e)),
+        }
+    } else if let Some(project) = project {
+        match db.resolve_project_target(project) {
+            Ok(Some(project)) => match service_graph_for_project(db, &project) {
+                Ok(graph) => graph,
+                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
+            },
+            Ok(None) => {
+                warn!("workspace_service_graph: project='{}' not found", project);
+                return tool_error(id, &format!("Project '{}' not found", project));
+            }
+            Err(e) => return tool_error(id, &format!("Failed to resolve project: {}", e)),
+        }
+    } else {
+        debug!("workspace_service_graph: listing all service links");
+        match db.list_service_links() {
+            Ok(links) => (serde_json::json!({"all": true}), links),
+            Err(e) => return tool_error(id, &format!("Failed to list service links: {}", e)),
+        }
+    };
+
+    info!(
+        "workspace_service_graph: returning {} service links",
+        links.len()
+    );
+    let result = serde_json::json!({
+        "scope": scope,
+        "links": links.iter().map(|link| service_link_json(db, link)).collect::<Vec<_>>()
+    });
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn service_graph_for_project(
+    db: &Db,
+    project: &crate::models::Project,
+) -> anyhow::Result<(serde_json::Value, Vec<crate::models::ServiceLink>)> {
+    debug!(
+        "workspace_service_graph: listing graph for project id={} slug='{}'",
+        project.id, project.slug
+    );
+    let groups = db.get_groups_for_project(project.id)?;
+    if groups.is_empty() {
+        warn!(
+            "workspace_service_graph: project slug='{}' has no groups; returning direct links",
+            project.slug
+        );
+        let mut links = db.list_outgoing_service_links(project.id)?;
+        for link in db.list_incoming_service_links(project.id)? {
+            if !links.iter().any(|existing| existing.id == link.id) {
+                links.push(link);
+            }
+        }
+        return Ok((
+            serde_json::json!({
+                "project_id": project.id,
+                "project": project.slug
+            }),
+            links,
+        ));
+    }
+
+    let mut links: Vec<crate::models::ServiceLink> = Vec::new();
+    let mut scope_groups = Vec::new();
+    for group in groups {
+        scope_groups.push(serde_json::json!({
+            "id": group.id,
+            "name": group.name
+        }));
+        for link in db.list_group_service_links(group.id)? {
+            if !links.iter().any(|existing| existing.id == link.id) {
+                links.push(link);
+            }
+        }
+    }
+
+    Ok((
+        serde_json::json!({
+            "project_id": project.id,
+            "project": project.slug,
+            "groups": scope_groups
+        }),
+        links,
+    ))
+}
+
+fn workspace_events(
+    id: serde_json::Value,
+    project: Option<&str>,
+    project_id: Option<i64>,
+    source: Option<&str>,
+    status: Option<crate::models::EventStatus>,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "workspace_events: project={:?}, project_id={:?}, source={:?}, status={:?}",
+        project, project_id, source, status
+    );
+    if project.is_some() && project_id.is_some() {
+        return JsonRpcResponse::error(
+            id,
+            McpError::invalid_params("Provide either project OR project_id, not both"),
+        );
+    }
+    if (project.is_some() || project_id.is_some()) && (source.is_some() || status.is_some()) {
+        return JsonRpcResponse::error(
+            id,
+            McpError::invalid_params(
+                "Project inbox mode cannot be combined with source/status filters",
+            ),
+        );
+    }
+
+    let events = if let Some(project_id) = project_id {
+        match db.get_project_by_id(project_id) {
+            Ok(Some(_)) => match db.list_workspace_event_inbox(project_id) {
+                Ok(events) => events,
+                Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
+            },
+            Ok(None) => {
+                warn!("workspace_events: project_id={} not found", project_id);
+                return tool_error(id, &format!("Project {} not found", project_id));
+            }
+            Err(e) => return tool_error(id, &format!("Failed to resolve project: {}", e)),
+        }
+    } else if let Some(project) = project {
+        match db.resolve_project_target(project) {
+            Ok(Some(project)) => match db.list_workspace_event_inbox(project.id) {
+                Ok(events) => events,
+                Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
+            },
+            Ok(None) => {
+                warn!("workspace_events: project='{}' not found", project);
+                return tool_error(id, &format!("Project '{}' not found", project));
+            }
+            Err(e) => return tool_error(id, &format!("Failed to resolve project: {}", e)),
+        }
+    } else {
+        match db.list_workspace_events(source, status) {
+            Ok(events) => events,
+            Err(e) => return tool_error(id, &format!("Failed to list workspace events: {}", e)),
+        }
+    };
+
+    info!("workspace_events: returning {} events", events.len());
+    let result: Vec<_> = events.iter().map(event_json).collect();
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn workspace_event_details(id: serde_json::Value, event_id: i64, db: &Db) -> JsonRpcResponse {
+    info!("workspace_event_details: event_id={}", event_id);
+
+    let event = match db.get_workspace_event(event_id) {
+        Ok(Some(event)) => event,
+        Ok(None) => {
+            warn!("workspace_event_details: event_id={} not found", event_id);
+            return tool_error(id, &format!("Event {} not found", event_id));
+        }
+        Err(e) => return tool_error(id, &format!("Failed to get event: {}", e)),
+    };
+    let targets = match db.list_event_targets(event_id) {
+        Ok(targets) => targets,
+        Err(e) => return tool_error(id, &format!("Failed to list event targets: {}", e)),
+    };
+    let artifacts = match db.list_event_artifacts(event_id) {
+        Ok(artifacts) => artifacts,
+        Err(e) => return tool_error(id, &format!("Failed to list event artifacts: {}", e)),
+    };
+
+    info!(
+        "workspace_event_details: returning event_id={} targets={} artifacts={}",
+        event_id,
+        targets.len(),
+        artifacts.len()
+    );
+    let result = serde_json::json!({
+        "event": event_json(&event),
+        "affected_services": targets.iter().map(|target| serde_json::json!({
+            "id": target.id,
+            "event_id": target.event_id,
+            "affected_project_id": target.affected_project_id,
+            "project": target.affected_project_id.map(|pid| project_slug(db, pid)),
+            "relation_kind": target.relation_kind.as_str(),
+            "status": target.status.as_str(),
+            "created_at": target.created_at,
+            "updated_at": target.updated_at
+        })).collect::<Vec<_>>(),
+        "affected_artifacts": artifacts.iter().map(|artifact| serde_json::json!({
+            "id": artifact.id,
+            "event_id": artifact.event_id,
+            "affected_project_id": artifact.affected_project_id,
+            "project": artifact.affected_project_id.map(|pid| project_slug(db, pid)),
+            "shared_item_id": artifact.shared_item_id,
+            "path": artifact.path_snapshot,
+            "reaction": artifact.reaction.as_str(),
+            "reason": artifact.reason,
+            "status": artifact.status.as_str(),
+            "created_at": artifact.created_at,
+            "updated_at": artifact.updated_at
+        })).collect::<Vec<_>>()
+    });
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn event_json(event: &crate::models::WorkspaceEvent) -> serde_json::Value {
+    serde_json::json!({
+        "id": event.id,
+        "source_project_id": event.source_project_id,
+        "source_project_slug": event.source_project_slug,
+        "source_project_name": event.source_project_name,
+        "group_id": event.group_id,
+        "kind": event.kind.as_str(),
+        "title": event.title,
+        "body": event.body,
+        "severity": event.severity.as_str(),
+        "status": event.status.as_str(),
+        "created_at": event.created_at,
+        "updated_at": event.updated_at
+    })
 }
 
 #[cfg(test)]
@@ -698,6 +1121,45 @@ mod tests {
         db.add_group_note(gid, pid, "group note content", Some("gnote"))
             .unwrap();
         (pid, gid)
+    }
+
+    fn seed_event_graph(db: &Db) -> (i64, i64, i64) {
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth-mcp", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-mcp", Some("api"))
+            .unwrap();
+        let group = db.get_or_create_group("platform").unwrap();
+        db.add_project_to_group(auth, group).unwrap();
+        db.add_project_to_group(api, group).unwrap();
+        db.create_service_link(
+            "api",
+            "auth",
+            crate::models::ServiceLinkKind::DependsOn,
+            Some("JWT"),
+        )
+        .unwrap();
+        db.share_file(api, "docs/auth.md", Some("auth-doc"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "docs/auth.md",
+            "auth",
+            crate::models::ArtifactDependencyKind::References,
+            crate::models::ArtifactReaction::Update,
+        )
+        .unwrap();
+        let event = db
+            .create_workspace_event(
+                "auth",
+                crate::models::WorkspaceEventKind::ServiceChanged,
+                crate::models::EventSeverity::Warning,
+                "Auth changed",
+                Some("Token contract changed"),
+            )
+            .unwrap();
+        (api, group, event)
     }
 
     // --- handle_tool_call dispatch ---
@@ -803,6 +1265,141 @@ mod tests {
         let notes = groups[0]["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1);
         assert!(notes[0]["preview"].as_str().unwrap().contains("group note"));
+    }
+
+    #[test]
+    fn workspace_context_includes_artifact_dependencies() {
+        let db = test_db();
+        seed_event_graph(&db);
+        let resp = workspace_context(json!(1), &db);
+        assert!(resp.error.is_none());
+
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let projects = parsed["projects"].as_array().unwrap();
+        let api = projects
+            .iter()
+            .find(|project| project["slug"] == "api")
+            .unwrap();
+        let item = api["shared_items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["path"] == "docs/auth.md")
+            .unwrap();
+        assert_eq!(item["dependencies"][0]["service"], "auth");
+        assert_eq!(item["dependencies"][0]["kind"], "references");
+        assert_eq!(item["dependencies"][0]["reaction"], "update");
+    }
+
+    #[test]
+    fn workspace_service_graph_returns_project_group_links() {
+        let db = test_db();
+        seed_event_graph(&db);
+
+        let resp = workspace_service_graph(json!(1), Some("api"), None, None, &db);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["scope"]["project"], "api");
+        assert_eq!(parsed["scope"]["groups"][0]["name"], "platform");
+        assert_eq!(parsed["links"][0]["from"], "api");
+        assert_eq!(parsed["links"][0]["to"], "auth");
+        assert_eq!(parsed["links"][0]["kind"], "depends_on");
+    }
+
+    #[test]
+    fn workspace_service_graph_returns_all_project_group_links() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth-multi-mcp", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-multi-mcp", Some("api"))
+            .unwrap();
+        let web = db
+            .create_project_with_slug("Web", "/tmp/web-multi-mcp", Some("web"))
+            .unwrap();
+        let platform = db.get_or_create_group("platform").unwrap();
+        let frontend = db.get_or_create_group("frontend").unwrap();
+        db.add_project_to_group(auth, platform).unwrap();
+        db.add_project_to_group(api, platform).unwrap();
+        db.add_project_to_group(api, frontend).unwrap();
+        db.add_project_to_group(web, frontend).unwrap();
+        db.create_service_link(
+            "api",
+            "auth",
+            crate::models::ServiceLinkKind::DependsOn,
+            Some("JWT"),
+        )
+        .unwrap();
+        db.create_service_link(
+            "web",
+            "api",
+            crate::models::ServiceLinkKind::DependsOn,
+            Some("API"),
+        )
+        .unwrap();
+
+        let resp = workspace_service_graph(json!(1), Some("api"), None, None, &db);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["scope"]["project"], "api");
+        assert_eq!(parsed["scope"]["groups"].as_array().unwrap().len(), 2);
+
+        let links = parsed["links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| {
+            link["from"] == serde_json::json!("api") && link["to"] == serde_json::json!("auth")
+        }));
+        assert!(links.iter().any(|link| {
+            link["from"] == serde_json::json!("web") && link["to"] == serde_json::json!("api")
+        }));
+    }
+
+    #[test]
+    fn workspace_events_returns_project_inbox() {
+        let db = test_db();
+        seed_event_graph(&db);
+
+        let resp = workspace_events(json!(1), Some("api"), None, None, None, &db);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed[0]["source_project_slug"], "auth");
+        assert_eq!(parsed[0]["kind"], "service_changed");
+        assert_eq!(parsed[0]["status"], "open");
+    }
+
+    #[test]
+    fn workspace_event_details_returns_targets_and_artifacts() {
+        let db = test_db();
+        let (_api, _group, event) = seed_event_graph(&db);
+
+        let resp = workspace_event_details(json!(1), event, &db);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["event"]["id"], event);
+        assert_eq!(parsed["affected_services"][0]["project"], "api");
+        assert_eq!(parsed["affected_artifacts"][0]["path"], "docs/auth.md");
+        assert_eq!(parsed["affected_artifacts"][0]["reaction"], "update");
     }
 
     // --- workspace_read ---

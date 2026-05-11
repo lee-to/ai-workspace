@@ -1,14 +1,17 @@
 use anyhow::{Context as _, Result};
-use log::{debug, info, warn};
-use rusqlite::{Connection, params};
+use log::{debug, error, info, warn};
+use rusqlite::{Connection, Row, params, types::Type};
 use std::path::Path;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::models::{
-    FileSearchHit, Group, NoteEntry, Project, ShareEntry, SharedItem, SharedItemKind, SyncReport,
-    WorkspaceConfig,
+    ArtifactDependency, ArtifactDependencyKind, ArtifactReaction, DependencyEntry, EventArtifact,
+    EventArtifactStatus, EventSeverity, EventStatus, EventTarget, EventTargetRelationKind,
+    EventTargetStatus, FileSearchHit, Group, NoteEntry, Project, ServiceLink, ServiceLinkKind,
+    ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig, WorkspaceEvent,
+    WorkspaceEventKind, normalize_project_slug,
 };
 
 pub enum ScopeChange {
@@ -25,6 +28,24 @@ pub struct SharedItemUpdate {
 
 pub struct Db {
     conn: Connection,
+}
+
+fn parse_row_enum<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    let value: String = row.get(column)?;
+    value.parse::<T>().map_err(|err| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                err.to_string(),
+            )),
+        )
+    })
 }
 
 fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
@@ -70,15 +91,76 @@ impl Db {
 
     // --- Projects ---
 
+    #[allow(dead_code)]
     pub fn create_project(&self, name: &str, path: &str) -> Result<i64> {
-        debug!("Creating project: name={}, path={}", name, path);
-        self.conn.execute(
-            "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-            params![name, path],
-        )?;
+        self.create_project_with_slug(name, path, None)
+    }
+
+    pub fn create_project_with_slug(
+        &self,
+        name: &str,
+        path: &str,
+        requested_slug: Option<&str>,
+    ) -> Result<i64> {
+        debug!(
+            "Creating project: name={}, path={}, requested_slug={:?}",
+            name, path, requested_slug
+        );
+        let slug = match requested_slug {
+            Some(slug) => {
+                let normalized = normalize_project_slug(slug);
+                if normalized != slug {
+                    warn!(
+                        "Normalized requested project slug '{}' to '{}'",
+                        slug, normalized
+                    );
+                }
+                if self.get_project_by_slug(&normalized)?.is_some() {
+                    anyhow::bail!("Project slug '{}' already exists", normalized);
+                }
+                normalized
+            }
+            None => self.generate_unique_project_slug(name, path)?,
+        };
+        debug!("Using project slug '{}' for name='{}'", slug, name);
+        self.conn
+            .execute(
+                "INSERT INTO projects (name, slug, path) VALUES (?1, ?2, ?3)",
+                params![name, slug, path],
+            )
+            .with_context(|| {
+                format!("Failed to create project name='{name}' slug='{slug}' path='{path}'")
+            })?;
         let id = self.conn.last_insert_rowid();
-        info!("Created project id={}", id);
+        info!("Created project id={} name='{}' slug='{}'", id, name, slug);
         Ok(id)
+    }
+
+    fn generate_unique_project_slug(&self, name: &str, path: &str) -> Result<String> {
+        let source = if name.trim().is_empty() {
+            Path::new(path)
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| "project".to_string())
+        } else {
+            name.to_string()
+        };
+        let base = normalize_project_slug(&source);
+        debug!(
+            "Generated base project slug '{}' from source '{}'",
+            base, source
+        );
+        let mut candidate = base.clone();
+        let mut suffix = 2;
+        while self.get_project_by_slug(&candidate)?.is_some() {
+            warn!(
+                "Project slug '{}' already exists; trying fallback suffix {}",
+                candidate, suffix
+            );
+            candidate = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        Ok(candidate)
     }
 
     pub fn rename_project(&self, id: i64, new_name: &str) -> Result<()> {
@@ -91,6 +173,7 @@ impl Db {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn delete_project(&self, project_id: i64) -> Result<()> {
         info!("Deleting project {}", project_id);
         let tx = self.conn.unchecked_transaction()?;
@@ -116,17 +199,201 @@ impl Db {
         Ok(())
     }
 
+    pub fn destroy_project_with_service_deleted_event(&self, project_id: i64) -> Result<i64> {
+        debug!(
+            "Destroying project id={} with service_deleted event snapshot",
+            project_id
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        let source = tx
+            .query_row(
+                "SELECT id, name, slug, path, created_at FROM projects WHERE id = ?1",
+                params![project_id],
+                |row| {
+                    Ok(Project {
+                        id: row.get(0)?,
+                        name: row.get(1)?,
+                        slug: row.get(2)?,
+                        path: row.get(3)?,
+                        created_at: row.get(4)?,
+                    })
+                },
+            )
+            .with_context(|| format!("Failed to load project id={project_id} for destroy"))?;
+        let group_id: Option<i64> = {
+            let mut stmt = tx.prepare(
+                "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
+            )?;
+            let mut rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
+            match rows.next() {
+                Some(row) => Some(row?),
+                None => None,
+            }
+        };
+        if group_id.is_none() {
+            warn!(
+                "Destroy event source slug='{}' has no group; impact may be limited",
+                source.slug
+            );
+        }
+
+        tx.execute(
+            "INSERT INTO workspace_events (
+                 source_project_id,
+                 source_project_slug,
+                 source_project_name,
+                 group_id,
+                 kind,
+                 title,
+                 severity
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                source.id,
+                source.slug,
+                source.name,
+                group_id,
+                WorkspaceEventKind::ServiceDeleted.as_str(),
+                format!("Service deleted: {}", source.name),
+                EventSeverity::Warning.as_str()
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "Failed to create destroy event kind={} source_slug='{}'",
+                WorkspaceEventKind::ServiceDeleted,
+                source.slug
+            )
+        })?;
+        let event_id = tx.last_insert_rowid();
+
+        let linked_count = {
+            let mut stmt = tx.prepare(
+                "SELECT DISTINCT from_project_id AS affected_project_id
+                 FROM service_links
+                 WHERE to_project_id = ?1",
+            )?;
+            let rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
+            let mut count = 0;
+            for affected_project_id in rows {
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_targets (
+                         event_id,
+                         affected_project_id,
+                         relation_kind
+                     )
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        event_id,
+                        affected_project_id?,
+                        EventTargetRelationKind::LinkedService.as_str()
+                    ],
+                )?;
+                count += 1;
+            }
+            count
+        };
+
+        let artifact_count = {
+            let mut stmt = tx.prepare(
+                "SELECT ad.shared_item_id, ad.reaction, si.project_id, si.path, ad.kind
+                 FROM artifact_dependencies ad
+                 JOIN shared_items si ON si.id = ad.shared_item_id
+                 WHERE ad.depends_on_project_slug_snapshot = ?1
+                   AND si.project_id IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(params![source.slug], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                ))
+            })?;
+            let mut count = 0;
+            for row in rows {
+                let (shared_item_id, reaction, affected_project_id, path, dep_kind) = row?;
+                tx.execute(
+                    "INSERT OR IGNORE INTO event_targets (
+                         event_id,
+                         affected_project_id,
+                         relation_kind
+                     )
+                     VALUES (?1, ?2, ?3)",
+                    params![
+                        event_id,
+                        affected_project_id,
+                        EventTargetRelationKind::ArtifactDependency.as_str()
+                    ],
+                )?;
+                tx.execute(
+                    "INSERT INTO event_artifacts (
+                         event_id,
+                         affected_project_id,
+                         shared_item_id,
+                         path_snapshot,
+                         reaction,
+                         reason
+                     )
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        event_id,
+                        affected_project_id,
+                        shared_item_id,
+                        path,
+                        reaction,
+                        format!("{} depends on {}", dep_kind, source.slug)
+                    ],
+                )?;
+                count += 1;
+            }
+            count
+        };
+        if linked_count == 0 && artifact_count == 0 {
+            warn!(
+                "Destroy event id={} source_slug='{}' has no affected services or artifacts",
+                event_id, source.slug
+            );
+        }
+
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )
+        .context("Failed to clean project note FTS rows during destroy")?;
+        tx.execute(
+            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
+            params![project_id],
+        )
+        .context("Failed to clean group note FTS rows during destroy")?;
+        tx.execute(
+            "DELETE FROM shared_items WHERE created_by_project_id = ?1",
+            params![project_id],
+        )
+        .context("Failed to delete project-created shared items during destroy")?;
+        tx.execute("DELETE FROM projects WHERE id = ?1", params![project_id])
+            .context("Failed to delete project row during destroy")?;
+        tx.commit()?;
+        info!(
+            "Destroyed project id={} slug='{}' with event id={} affected_services={} affected_artifacts={}",
+            project_id, source.slug, event_id, linked_count, artifact_count
+        );
+        Ok(event_id)
+    }
+
     pub fn get_project_by_path(&self, path: &str) -> Result<Option<Project>> {
         debug!("Looking up project by path: {}", path);
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, created_at FROM projects WHERE path = ?1")?;
+            .prepare("SELECT id, name, slug, path, created_at FROM projects WHERE path = ?1")?;
         let mut rows = stmt.query_map(params![path], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         match rows.next() {
@@ -139,14 +406,15 @@ impl Db {
     pub fn find_project_by_cwd(&self, cwd: &str) -> Result<Option<Project>> {
         debug!("Finding project by cwd: {}", cwd);
         let mut stmt = self.conn.prepare(
-            "SELECT id, name, path, created_at FROM projects WHERE ?1 = path OR ?1 LIKE path || '/%' ORDER BY length(path) DESC LIMIT 1",
+            "SELECT id, name, slug, path, created_at FROM projects WHERE ?1 = path OR ?1 LIKE path || '/%' ORDER BY length(path) DESC LIMIT 1",
         )?;
         let mut rows = stmt.query_map(params![cwd], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         match rows.next() {
@@ -159,13 +427,14 @@ impl Db {
         debug!("Looking up project by id: {}", id);
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, created_at FROM projects WHERE id = ?1")?;
+            .prepare("SELECT id, name, slug, path, created_at FROM projects WHERE id = ?1")?;
         let mut rows = stmt.query_map(params![id], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         match rows.next() {
@@ -174,8 +443,29 @@ impl Db {
         }
     }
 
-    /// Resolve a project by numeric ID or exact registered path.
+    pub fn get_project_by_slug(&self, slug: &str) -> Result<Option<Project>> {
+        debug!("Looking up project by slug: {}", slug);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, slug, path, created_at FROM projects WHERE slug = ?1")?;
+        let mut rows = stmt.query_map(params![slug], |row| {
+            Ok(Project {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Resolve a project by numeric ID, slug, or exact registered path.
     pub fn resolve_project_target(&self, target: &str) -> Result<Option<Project>> {
+        debug!("Resolving project target '{}'", target);
         if let Ok(id) = target.parse::<i64>()
             && let Some(project) = self.get_project_by_id(id)?
         {
@@ -188,8 +478,14 @@ impl Db {
 
         if let Some(path) = strip_windows_verbatim_prefix(target)
             && path != target
+            && let Some(project) = self.get_project_by_path(&path)?
         {
-            return self.get_project_by_path(&path);
+            return Ok(Some(project));
+        }
+
+        let slug = normalize_project_slug(target);
+        if let Some(project) = self.get_project_by_slug(&slug)? {
+            return Ok(Some(project));
         }
 
         Ok(None)
@@ -199,13 +495,14 @@ impl Db {
         debug!("Listing all projects");
         let mut stmt = self
             .conn
-            .prepare("SELECT id, name, path, created_at FROM projects ORDER BY name")?;
+            .prepare("SELECT id, name, slug, path, created_at FROM projects ORDER BY name")?;
         let rows = stmt.query_map([], |row| {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -288,7 +585,7 @@ impl Db {
     pub fn get_projects_for_group(&self, group_id: i64) -> Result<Vec<Project>> {
         debug!("Getting projects for group {}", group_id);
         let mut stmt = self.conn.prepare(
-            "SELECT p.id, p.name, p.path, p.created_at FROM projects p
+            "SELECT p.id, p.name, p.slug, p.path, p.created_at FROM projects p
              JOIN project_groups pg ON pg.project_id = p.id
              WHERE pg.group_id = ?1 ORDER BY p.name",
         )?;
@@ -296,8 +593,9 @@ impl Db {
             Ok(Project {
                 id: row.get(0)?,
                 name: row.get(1)?,
-                path: row.get(2)?,
-                created_at: row.get(3)?,
+                slug: row.get(2)?,
+                path: row.get(3)?,
+                created_at: row.get(4)?,
             })
         })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
@@ -337,6 +635,979 @@ impl Db {
         self.conn
             .execute("DELETE FROM groups WHERE id = ?1", params![group_id])?;
         Ok(())
+    }
+
+    // --- Service Links ---
+
+    #[allow(dead_code)]
+    pub fn create_service_link(
+        &self,
+        from_target: &str,
+        to_target: &str,
+        kind: ServiceLinkKind,
+        label: Option<&str>,
+    ) -> Result<i64> {
+        debug!(
+            "Creating service link: from_target='{}', to_target='{}', kind={}, label={:?}",
+            from_target, to_target, kind, label
+        );
+        let from_project = self.resolve_required_project_target(
+            from_target,
+            &format!(
+                "creating service link {} -> {} ({})",
+                from_target, to_target, kind
+            ),
+        )?;
+        let to_project = self.resolve_required_project_target(
+            to_target,
+            &format!(
+                "creating service link {} -> {} ({})",
+                from_target, to_target, kind
+            ),
+        )?;
+
+        if from_project.id == to_project.id {
+            warn!(
+                "Rejected self-link for project slug='{}' kind={}",
+                from_project.slug, kind
+            );
+            anyhow::bail!(
+                "Cannot create service link from '{}' to itself",
+                from_project.slug
+            );
+        }
+
+        if let Some(existing) =
+            self.get_service_link_by_endpoints(from_project.id, to_project.id, kind)?
+        {
+            warn!(
+                "Service link already exists: from_slug='{}', to_slug='{}', kind={}",
+                from_project.slug, to_project.slug, kind
+            );
+            return Ok(existing.id);
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO service_links (from_project_id, to_project_id, kind, label)
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![from_project.id, to_project.id, kind.as_str(), label],
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to create service link from '{}' to '{}' kind={}",
+                    from_project.slug, to_project.slug, kind
+                )
+            })?;
+        let id = self.conn.last_insert_rowid();
+        info!(
+            "Created service link id={} from_slug='{}' to_slug='{}' kind={}",
+            id, from_project.slug, to_project.slug, kind
+        );
+        Ok(id)
+    }
+
+    #[allow(dead_code)]
+    pub fn delete_service_link(
+        &self,
+        from_target: &str,
+        to_target: &str,
+        kind: ServiceLinkKind,
+    ) -> Result<bool> {
+        debug!(
+            "Deleting service link: from_target='{}', to_target='{}', kind={}",
+            from_target, to_target, kind
+        );
+        let from_project = self.resolve_required_project_target(
+            from_target,
+            &format!(
+                "deleting service link {} -> {} ({})",
+                from_target, to_target, kind
+            ),
+        )?;
+        let to_project = self.resolve_required_project_target(
+            to_target,
+            &format!(
+                "deleting service link {} -> {} ({})",
+                from_target, to_target, kind
+            ),
+        )?;
+
+        let affected = self.conn.execute(
+            "DELETE FROM service_links
+             WHERE from_project_id = ?1 AND to_project_id = ?2 AND kind = ?3",
+            params![from_project.id, to_project.id, kind.as_str()],
+        )?;
+        if affected > 0 {
+            info!(
+                "Deleted service link from_slug='{}' to_slug='{}' kind={}",
+                from_project.slug, to_project.slug, kind
+            );
+        }
+        Ok(affected > 0)
+    }
+
+    pub fn delete_service_link_by_id(&self, id: i64) -> Result<Option<ServiceLink>> {
+        debug!("Deleting service link by id={}", id);
+        let existing = self.get_service_link_by_id(id)?;
+        if existing.is_none() {
+            warn!("Service link id={} not found for deletion", id);
+            return Ok(None);
+        }
+
+        self.conn
+            .execute("DELETE FROM service_links WHERE id = ?1", params![id])
+            .with_context(|| format!("Failed to delete service link id={id}"))?;
+        if let Some(link) = existing.as_ref() {
+            info!(
+                "Deleted service link id={} from_project_id={} to_project_id={} kind={}",
+                link.id, link.from_project_id, link.to_project_id, link.kind
+            );
+        }
+        Ok(existing)
+    }
+
+    pub fn get_service_link_by_id(&self, id: i64) -> Result<Option<ServiceLink>> {
+        debug!("Looking up service link by id={}", id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![id], Self::map_service_link)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn list_service_links(&self) -> Result<Vec<ServiceLink>> {
+        debug!("Listing all service links");
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map([], Self::map_service_link)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_outgoing_service_links(&self, project_id: i64) -> Result<Vec<ServiceLink>> {
+        debug!(
+            "Listing outgoing service links with SQL filter from_project_id={}",
+            project_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             WHERE from_project_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![project_id], Self::map_service_link)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_incoming_service_links(&self, project_id: i64) -> Result<Vec<ServiceLink>> {
+        debug!(
+            "Listing incoming service links with SQL filter to_project_id={}",
+            project_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             WHERE to_project_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![project_id], Self::map_service_link)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_group_service_links(&self, group_id: i64) -> Result<Vec<ServiceLink>> {
+        debug!(
+            "Listing group service graph with SQL filter group_id={}",
+            group_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT sl.id, sl.from_project_id, sl.to_project_id, sl.kind, sl.label,
+                    sl.created_at, sl.updated_at
+             FROM service_links sl
+             WHERE sl.from_project_id IN (
+                 SELECT project_id FROM project_groups WHERE group_id = ?1
+             )
+             AND sl.to_project_id IN (
+                 SELECT project_id FROM project_groups WHERE group_id = ?1
+             )
+             ORDER BY sl.created_at, sl.id",
+        )?;
+        let rows = stmt.query_map(params![group_id], Self::map_service_link)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_service_link_by_endpoints(
+        &self,
+        from_project_id: i64,
+        to_project_id: i64,
+        kind: ServiceLinkKind,
+    ) -> Result<Option<ServiceLink>> {
+        debug!(
+            "Resolving service link with SQL filters from_project_id={}, to_project_id={}, kind={}",
+            from_project_id, to_project_id, kind
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, from_project_id, to_project_id, kind, label, created_at, updated_at
+             FROM service_links
+             WHERE from_project_id = ?1 AND to_project_id = ?2 AND kind = ?3",
+        )?;
+        let mut rows = stmt.query_map(
+            params![from_project_id, to_project_id, kind.as_str()],
+            Self::map_service_link,
+        )?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn resolve_required_project_target(&self, target: &str, context: &str) -> Result<Project> {
+        debug!("Resolving project endpoint '{}' while {}", target, context);
+        match self.resolve_project_target(target)? {
+            Some(project) => Ok(project),
+            None => {
+                error!("Project endpoint '{}' not found while {}", target, context);
+                anyhow::bail!("Project endpoint '{}' not found while {}", target, context)
+            }
+        }
+    }
+
+    #[allow(dead_code)]
+    fn map_service_link(row: &Row<'_>) -> rusqlite::Result<ServiceLink> {
+        let kind_text: String = row.get(3)?;
+        let kind = kind_text.parse::<ServiceLinkKind>().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )),
+            )
+        })?;
+        Ok(ServiceLink {
+            id: row.get(0)?,
+            from_project_id: row.get(1)?,
+            to_project_id: row.get(2)?,
+            kind,
+            label: row.get(4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+
+    // --- Artifact Dependencies ---
+
+    #[allow(dead_code)]
+    pub fn add_artifact_dependency(
+        &self,
+        current_project_id: i64,
+        item_target: &str,
+        service_target: &str,
+        kind: ArtifactDependencyKind,
+        reaction: ArtifactReaction,
+    ) -> Result<i64> {
+        debug!(
+            "Adding artifact dependency: current_project_id={}, item_target='{}', service_target='{}', kind={}, reaction={}",
+            current_project_id, item_target, service_target, kind, reaction
+        );
+        let item = self
+            .resolve_item_for_project(item_target, current_project_id)?
+            .ok_or_else(|| {
+                error!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target, current_project_id
+                );
+                anyhow::anyhow!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target,
+                    current_project_id
+                )
+            })?;
+        if item.kind == SharedItemKind::Note {
+            error!(
+                "Artifact dependency target '{}' resolved to note item id={}",
+                item_target, item.id
+            );
+            anyhow::bail!(
+                "Artifact dependency target '{}' must be a shared file or directory",
+                item_target
+            );
+        }
+
+        let target_project = self.resolve_required_project_target(
+            service_target,
+            &format!(
+                "adding artifact dependency for item '{}' from project {}",
+                item_target, current_project_id
+            ),
+        )?;
+        if !self.projects_share_group(current_project_id, target_project.id)? {
+            warn!(
+                "Dependency target slug='{}' is not in a shared group with project_id={}",
+                target_project.slug, current_project_id
+            );
+        }
+
+        if let Some(existing) =
+            self.get_artifact_dependency_by_item_slug_kind(item.id, &target_project.slug, kind)?
+        {
+            self.conn.execute(
+                "UPDATE artifact_dependencies
+                 SET depends_on_project_id = ?1, reaction = ?2, updated_at = datetime('now')
+                 WHERE id = ?3",
+                params![target_project.id, reaction.as_str(), existing.id],
+            )?;
+            info!(
+                "Updated artifact dependency id={} item_id={} target_slug='{}' kind={} reaction={}",
+                existing.id, item.id, target_project.slug, kind, reaction
+            );
+            return Ok(existing.id);
+        }
+
+        self.conn.execute(
+            "INSERT INTO artifact_dependencies (
+                 shared_item_id,
+                 depends_on_project_id,
+                 depends_on_project_slug_snapshot,
+                 kind,
+                 reaction
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                item.id,
+                target_project.id,
+                target_project.slug,
+                kind.as_str(),
+                reaction.as_str()
+            ],
+        )?;
+        let id = self.conn.last_insert_rowid();
+        info!(
+            "Added artifact dependency id={} item_id={} path={:?} target_slug='{}' kind={} reaction={}",
+            id, item.id, item.path, target_project.slug, kind, reaction
+        );
+        Ok(id)
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_artifact_dependency(
+        &self,
+        current_project_id: i64,
+        item_target: &str,
+        service_target: &str,
+        kind: Option<ArtifactDependencyKind>,
+    ) -> Result<usize> {
+        debug!(
+            "Removing artifact dependency: current_project_id={}, item_target='{}', service_target='{}', kind={:?}",
+            current_project_id, item_target, service_target, kind
+        );
+        let item = self
+            .resolve_item_for_project(item_target, current_project_id)?
+            .ok_or_else(|| {
+                error!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target, current_project_id
+                );
+                anyhow::anyhow!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target,
+                    current_project_id
+                )
+            })?;
+        let target_slug = match self.resolve_project_target(service_target)? {
+            Some(project) => project.slug,
+            None => {
+                let slug = normalize_project_slug(service_target);
+                warn!(
+                    "Artifact dependency removal target '{}' does not resolve to a project; falling back to slug snapshot '{}'",
+                    service_target, slug
+                );
+                slug
+            }
+        };
+
+        let affected = match kind {
+            Some(kind) => self.conn.execute(
+                "DELETE FROM artifact_dependencies
+                 WHERE shared_item_id = ?1
+                   AND depends_on_project_slug_snapshot = ?2
+                   AND kind = ?3",
+                params![item.id, target_slug, kind.as_str()],
+            )?,
+            None => self.conn.execute(
+                "DELETE FROM artifact_dependencies
+                 WHERE shared_item_id = ?1
+                   AND depends_on_project_slug_snapshot = ?2",
+                params![item.id, target_slug],
+            )?,
+        };
+        info!(
+            "Removed {} artifact dependencies for item_id={} path={:?} target_slug='{}' kind={:?}",
+            affected, item.id, item.path, target_slug, kind
+        );
+        Ok(affected)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_artifact_dependencies_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<ArtifactDependency>> {
+        debug!(
+            "Listing artifact dependencies with SQL filter shared item project_id={}",
+            project_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT ad.id, ad.shared_item_id, ad.depends_on_project_id,
+                    ad.depends_on_project_slug_snapshot, ad.kind, ad.reaction,
+                    ad.created_at, ad.updated_at
+             FROM artifact_dependencies ad
+             JOIN shared_items si ON si.id = ad.shared_item_id
+             WHERE si.project_id = ?1
+             ORDER BY ad.created_at, ad.id",
+        )?;
+        let rows = stmt.query_map(params![project_id], Self::map_artifact_dependency)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_artifact_dependencies_for_item(
+        &self,
+        current_project_id: i64,
+        item_target: &str,
+    ) -> Result<Vec<ArtifactDependency>> {
+        debug!(
+            "Listing artifact dependencies for item_target='{}' project_id={}",
+            item_target, current_project_id
+        );
+        let item = self
+            .resolve_item_for_project(item_target, current_project_id)?
+            .ok_or_else(|| {
+                error!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target, current_project_id
+                );
+                anyhow::anyhow!(
+                    "Shared item target '{}' not found for project {}",
+                    item_target,
+                    current_project_id
+                )
+            })?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shared_item_id, depends_on_project_id,
+                    depends_on_project_slug_snapshot, kind, reaction,
+                    created_at, updated_at
+             FROM artifact_dependencies
+             WHERE shared_item_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![item.id], Self::map_artifact_dependency)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_artifact_dependencies_on_service_slug(
+        &self,
+        service_slug: &str,
+    ) -> Result<Vec<ArtifactDependency>> {
+        debug!(
+            "Listing artifact dependencies with SQL filter depends_on_project_slug_snapshot='{}'",
+            service_slug
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shared_item_id, depends_on_project_id,
+                    depends_on_project_slug_snapshot, kind, reaction,
+                    created_at, updated_at
+             FROM artifact_dependencies
+             WHERE depends_on_project_slug_snapshot = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![service_slug], Self::map_artifact_dependency)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    fn get_artifact_dependency_by_item_slug_kind(
+        &self,
+        shared_item_id: i64,
+        target_slug: &str,
+        kind: ArtifactDependencyKind,
+    ) -> Result<Option<ArtifactDependency>> {
+        debug!(
+            "Resolving artifact dependency with SQL filters shared_item_id={}, target_slug='{}', kind={}",
+            shared_item_id, target_slug, kind
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shared_item_id, depends_on_project_id,
+                    depends_on_project_slug_snapshot, kind, reaction,
+                    created_at, updated_at
+             FROM artifact_dependencies
+             WHERE shared_item_id = ?1
+               AND depends_on_project_slug_snapshot = ?2
+               AND kind = ?3",
+        )?;
+        let mut rows = stmt.query_map(
+            params![shared_item_id, target_slug, kind.as_str()],
+            Self::map_artifact_dependency,
+        )?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn projects_share_group(&self, left_project_id: i64, right_project_id: i64) -> Result<bool> {
+        if left_project_id == right_project_id {
+            return Ok(true);
+        }
+        let shares_group: i64 = self.conn.query_row(
+            "SELECT EXISTS (
+                 SELECT 1
+                 FROM project_groups left_pg
+                 JOIN project_groups right_pg ON right_pg.group_id = left_pg.group_id
+                 WHERE left_pg.project_id = ?1
+                   AND right_pg.project_id = ?2
+             )",
+            params![left_project_id, right_project_id],
+            |row| row.get(0),
+        )?;
+        Ok(shares_group != 0)
+    }
+
+    #[allow(dead_code)]
+    fn map_artifact_dependency(row: &Row<'_>) -> rusqlite::Result<ArtifactDependency> {
+        let kind_text: String = row.get(4)?;
+        let kind = kind_text.parse::<ArtifactDependencyKind>().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )),
+            )
+        })?;
+        let reaction_text: String = row.get(5)?;
+        let reaction = reaction_text.parse::<ArtifactReaction>().map_err(|err| {
+            rusqlite::Error::FromSqlConversionFailure(
+                5,
+                Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    err.to_string(),
+                )),
+            )
+        })?;
+        Ok(ArtifactDependency {
+            id: row.get(0)?,
+            shared_item_id: row.get(1)?,
+            depends_on_project_id: row.get(2)?,
+            depends_on_project_slug_snapshot: row.get(3)?,
+            kind,
+            reaction,
+            created_at: row.get(6)?,
+            updated_at: row.get(7)?,
+        })
+    }
+
+    // --- Workspace Events ---
+
+    #[allow(dead_code)]
+    pub fn create_workspace_event(
+        &self,
+        source_target: &str,
+        kind: WorkspaceEventKind,
+        severity: EventSeverity,
+        title: &str,
+        body: Option<&str>,
+    ) -> Result<i64> {
+        debug!(
+            "Creating workspace event: source_target='{}', kind={}, severity={}",
+            source_target, kind, severity
+        );
+        let source = self.resolve_required_project_target(
+            source_target,
+            &format!("creating workspace event kind={}", kind),
+        )?;
+        let group_id = self.first_group_id_for_project(source.id)?;
+        if group_id.is_none() {
+            warn!(
+                "Event source slug='{}' has no group; impact may be limited",
+                source.slug
+            );
+        }
+
+        self.conn
+            .execute(
+                "INSERT INTO workspace_events (
+                 source_project_id,
+                 source_project_slug,
+                 source_project_name,
+                 group_id,
+                 kind,
+                 title,
+                 body,
+                 severity
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    source.id,
+                    source.slug,
+                    source.name,
+                    group_id,
+                    kind.as_str(),
+                    title,
+                    body,
+                    severity.as_str()
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "Failed to create workspace event kind={} source_slug='{}'",
+                    kind, source.slug
+                )
+            })?;
+        let event_id = self.conn.last_insert_rowid();
+        let linked_count = self.insert_linked_service_event_targets(event_id, source.id)?;
+        let artifact_count = self.insert_artifact_event_impacts(event_id, &source.slug)?;
+        if linked_count == 0 && artifact_count == 0 {
+            warn!(
+                "Event id={} source_slug='{}' has no affected services or artifacts",
+                event_id, source.slug
+            );
+        }
+        info!(
+            "Created workspace event id={} source_slug='{}' kind={} affected_services={} affected_artifacts={}",
+            event_id, source.slug, kind, linked_count, artifact_count
+        );
+        Ok(event_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn close_workspace_event(&self, event_id: i64) -> Result<bool> {
+        debug!("Closing workspace event id={}", event_id);
+        let affected = self.conn.execute(
+            "UPDATE workspace_events
+             SET status = ?1, updated_at = datetime('now')
+             WHERE id = ?2 AND status != ?1",
+            params![EventStatus::Closed.as_str(), event_id],
+        )?;
+        if affected > 0 {
+            self.conn.execute(
+                "UPDATE event_targets
+                 SET status = ?1, updated_at = datetime('now')
+                 WHERE event_id = ?2",
+                params![EventTargetStatus::Resolved.as_str(), event_id],
+            )?;
+            self.conn.execute(
+                "UPDATE event_artifacts
+                 SET status = ?1, updated_at = datetime('now')
+                 WHERE event_id = ?2",
+                params![EventArtifactStatus::Resolved.as_str(), event_id],
+            )?;
+            info!("Closed workspace event id={}", event_id);
+        }
+        Ok(affected > 0)
+    }
+
+    #[allow(dead_code)]
+    pub fn remove_workspace_event(&self, event_id: i64) -> Result<bool> {
+        debug!("Removing workspace event id={}", event_id);
+        let affected = self.conn.execute(
+            "DELETE FROM workspace_events WHERE id = ?1",
+            params![event_id],
+        )?;
+        if affected > 0 {
+            info!("Removed workspace event id={}", event_id);
+        }
+        Ok(affected > 0)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_workspace_event(&self, event_id: i64) -> Result<Option<WorkspaceEvent>> {
+        debug!("Getting workspace event id={}", event_id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source_project_id, source_project_slug, source_project_name,
+                    group_id, kind, title, body, severity, status, created_at, updated_at
+             FROM workspace_events
+             WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map(params![event_id], Self::map_workspace_event)?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn list_workspace_events(
+        &self,
+        source_slug: Option<&str>,
+        status: Option<EventStatus>,
+    ) -> Result<Vec<WorkspaceEvent>> {
+        debug!(
+            "Listing workspace events with source_slug={:?}, status={:?}",
+            source_slug, status
+        );
+        let mut stmt = match (source_slug, status) {
+            (Some(_), Some(_)) => self.conn.prepare(
+                "SELECT id, source_project_id, source_project_slug, source_project_name,
+                        group_id, kind, title, body, severity, status, created_at, updated_at
+                 FROM workspace_events
+                 WHERE source_project_slug = ?1 AND status = ?2
+                 ORDER BY created_at DESC, id DESC",
+            )?,
+            (Some(_), None) => self.conn.prepare(
+                "SELECT id, source_project_id, source_project_slug, source_project_name,
+                        group_id, kind, title, body, severity, status, created_at, updated_at
+                 FROM workspace_events
+                 WHERE source_project_slug = ?1
+                 ORDER BY created_at DESC, id DESC",
+            )?,
+            (None, Some(_)) => self.conn.prepare(
+                "SELECT id, source_project_id, source_project_slug, source_project_name,
+                        group_id, kind, title, body, severity, status, created_at, updated_at
+                 FROM workspace_events
+                 WHERE status = ?1
+                 ORDER BY created_at DESC, id DESC",
+            )?,
+            (None, None) => self.conn.prepare(
+                "SELECT id, source_project_id, source_project_slug, source_project_name,
+                        group_id, kind, title, body, severity, status, created_at, updated_at
+                 FROM workspace_events
+                 ORDER BY created_at DESC, id DESC",
+            )?,
+        };
+        let rows = match (source_slug, status) {
+            (Some(source_slug), Some(status)) => stmt.query_map(
+                params![source_slug, status.as_str()],
+                Self::map_workspace_event,
+            )?,
+            (Some(source_slug), None) => {
+                stmt.query_map(params![source_slug], Self::map_workspace_event)?
+            }
+            (None, Some(status)) => {
+                stmt.query_map(params![status.as_str()], Self::map_workspace_event)?
+            }
+            (None, None) => stmt.query_map([], Self::map_workspace_event)?,
+        };
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_workspace_event_inbox(&self, project_id: i64) -> Result<Vec<WorkspaceEvent>> {
+        debug!(
+            "Listing workspace event inbox with SQL filter project_id={}",
+            project_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT we.id, we.source_project_id, we.source_project_slug,
+                    we.source_project_name, we.group_id, we.kind, we.title, we.body,
+                    we.severity, we.status, we.created_at, we.updated_at
+             FROM workspace_events we
+             LEFT JOIN event_targets et ON et.event_id = we.id
+             LEFT JOIN event_artifacts ea ON ea.event_id = we.id
+             WHERE we.status = 'open'
+               AND (et.affected_project_id = ?1 OR ea.affected_project_id = ?1)
+             ORDER BY we.created_at DESC, we.id DESC",
+        )?;
+        let rows = stmt.query_map(params![project_id], Self::map_workspace_event)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_event_targets(&self, event_id: i64) -> Result<Vec<EventTarget>> {
+        debug!("Listing event targets with event_id={}", event_id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_id, affected_project_id, relation_kind, status, created_at, updated_at
+             FROM event_targets
+             WHERE event_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::map_event_target)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn list_event_artifacts(&self, event_id: i64) -> Result<Vec<EventArtifact>> {
+        debug!("Listing event artifacts with event_id={}", event_id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_id, affected_project_id, shared_item_id, path_snapshot,
+                    reaction, reason, status, created_at, updated_at
+             FROM event_artifacts
+             WHERE event_id = ?1
+             ORDER BY created_at, id",
+        )?;
+        let rows = stmt.query_map(params![event_id], Self::map_event_artifact)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    fn first_group_id_for_project(&self, project_id: i64) -> Result<Option<i64>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map(params![project_id], |row| row.get(0))?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    #[allow(dead_code)]
+    fn insert_linked_service_event_targets(&self, event_id: i64, source_id: i64) -> Result<usize> {
+        debug!(
+            "Calculating linked service impact for event_id={} source_project_id={}",
+            event_id, source_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT from_project_id AS affected_project_id
+             FROM service_links
+             WHERE to_project_id = ?1",
+        )?;
+        let rows = stmt.query_map(params![source_id], |row| row.get::<_, i64>(0))?;
+        let mut count = 0;
+        for affected_project_id in rows {
+            let affected_project_id = affected_project_id?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO event_targets (
+                     event_id,
+                     affected_project_id,
+                     relation_kind
+                 )
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    event_id,
+                    affected_project_id,
+                    EventTargetRelationKind::LinkedService.as_str()
+                ],
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[allow(dead_code)]
+    fn insert_artifact_event_impacts(&self, event_id: i64, source_slug: &str) -> Result<usize> {
+        debug!(
+            "Calculating artifact dependency impact for event_id={} source_slug='{}'",
+            event_id, source_slug
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT ad.shared_item_id, ad.reaction, si.project_id, si.path, ad.kind
+             FROM artifact_dependencies ad
+             JOIN shared_items si ON si.id = ad.shared_item_id
+             WHERE ad.depends_on_project_slug_snapshot = ?1
+               AND si.project_id IS NOT NULL",
+        )?;
+        let rows = stmt.query_map(params![source_slug], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+            ))
+        })?;
+        let mut count = 0;
+        for row in rows {
+            let (shared_item_id, reaction, affected_project_id, path, dep_kind) = row?;
+            self.conn.execute(
+                "INSERT OR IGNORE INTO event_targets (
+                     event_id,
+                     affected_project_id,
+                     relation_kind
+                 )
+                 VALUES (?1, ?2, ?3)",
+                params![
+                    event_id,
+                    affected_project_id,
+                    EventTargetRelationKind::ArtifactDependency.as_str()
+                ],
+            )?;
+            self.conn.execute(
+                "INSERT INTO event_artifacts (
+                     event_id,
+                     affected_project_id,
+                     shared_item_id,
+                     path_snapshot,
+                     reaction,
+                     reason
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    event_id,
+                    affected_project_id,
+                    shared_item_id,
+                    path,
+                    reaction,
+                    format!("{} depends on {}", dep_kind, source_slug)
+                ],
+            )?;
+            count += 1;
+        }
+        Ok(count)
+    }
+
+    #[allow(dead_code)]
+    fn map_workspace_event(row: &Row<'_>) -> rusqlite::Result<WorkspaceEvent> {
+        Ok(WorkspaceEvent {
+            id: row.get(0)?,
+            source_project_id: row.get(1)?,
+            source_project_slug: row.get(2)?,
+            source_project_name: row.get(3)?,
+            group_id: row.get(4)?,
+            kind: parse_row_enum(row, 5)?,
+            title: row.get(6)?,
+            body: row.get(7)?,
+            severity: parse_row_enum(row, 8)?,
+            status: parse_row_enum(row, 9)?,
+            created_at: row.get(10)?,
+            updated_at: row.get(11)?,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn map_event_target(row: &Row<'_>) -> rusqlite::Result<EventTarget> {
+        Ok(EventTarget {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            affected_project_id: row.get(2)?,
+            relation_kind: parse_row_enum(row, 3)?,
+            status: parse_row_enum(row, 4)?,
+            created_at: row.get(5)?,
+            updated_at: row.get(6)?,
+        })
+    }
+
+    #[allow(dead_code)]
+    fn map_event_artifact(row: &Row<'_>) -> rusqlite::Result<EventArtifact> {
+        Ok(EventArtifact {
+            id: row.get(0)?,
+            event_id: row.get(1)?,
+            affected_project_id: row.get(2)?,
+            shared_item_id: row.get(3)?,
+            path_snapshot: row.get(4)?,
+            reaction: parse_row_enum(row, 5)?,
+            reason: row.get(6)?,
+            status: parse_row_enum(row, 7)?,
+            created_at: row.get(8)?,
+            updated_at: row.get(9)?,
+        })
     }
 
     // --- Shared Items ---
@@ -792,12 +2063,24 @@ impl Db {
             match item.kind {
                 SharedItemKind::File | SharedItemKind::Dir => {
                     if let Some(ref path) = item.path {
-                        let entry = match &item.label {
-                            Some(label) => ShareEntry::WithLabel {
-                                path: path.clone(),
-                                label: label.clone(),
+                        let dependencies = self
+                            .list_artifact_dependencies_for_item(project_id, path)?
+                            .into_iter()
+                            .map(|dep| DependencyEntry {
+                                service: dep.depends_on_project_slug_snapshot,
+                                kind: dep.kind,
+                                reaction: dep.reaction,
+                            })
+                            .collect::<Vec<_>>();
+                        let entry = ShareEntry::WithMetadata {
+                            path: path.clone(),
+                            label: item.label.clone(),
+                            kind: Some(item.kind),
+                            dependencies: if dependencies.is_empty() {
+                                None
+                            } else {
+                                Some(dependencies)
                             },
-                            None => ShareEntry::PathOnly(path.clone()),
                         };
                         shares.push(entry);
                     }
@@ -823,6 +2106,7 @@ impl Db {
 
         Ok(WorkspaceConfig {
             name: project.name,
+            slug: Some(project.slug),
             groups: group_names,
             share: shares,
             notes,
@@ -841,6 +2125,9 @@ impl Db {
             "Syncing project {} from config '{}'",
             project_id, config.name
         );
+        let project = self
+            .get_project_by_id(project_id)?
+            .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
         let mut report = SyncReport::default();
 
         let tx = self.conn.unchecked_transaction()?;
@@ -909,45 +2196,214 @@ impl Db {
         }
 
         // --- Shares (files/dirs) ---
-        let current_shares: Vec<(i64, String, Option<String>)> = {
+        let current_shares: Vec<(i64, String, SharedItemKind, Option<String>)> = {
             let mut stmt = tx.prepare(
-                "SELECT id, path, label FROM shared_items
+                "SELECT id, path, kind, label FROM shared_items
                  WHERE project_id = ?1 AND kind IN ('file', 'dir')",
             )?;
             let rows = stmt.query_map(params![project_id], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                let kind_text: String = row.get(2)?;
+                let kind = kind_text.parse::<SharedItemKind>().map_err(|err| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            err.to_string(),
+                        )),
+                    )
+                })?;
+                Ok((row.get(0)?, row.get(1)?, kind, row.get(3)?))
             })?;
             rows.collect::<std::result::Result<Vec<_>, _>>()?
         };
-        let current_share_paths: std::collections::HashSet<String> =
-            current_shares.iter().map(|(_, p, _)| p.clone()).collect();
+        let current_share_paths: std::collections::HashSet<String> = current_shares
+            .iter()
+            .map(|(_, p, _, _)| p.clone())
+            .collect();
         let desired_share_paths: std::collections::HashSet<String> =
             config.share.iter().map(|s| s.path().to_string()).collect();
 
         // Add missing shares (INSERT OR IGNORE to handle UNIQUE constraint)
         for entry in &config.share {
+            let desired_kind = entry.kind().unwrap_or_else(|| {
+                let full_path = Path::new(&project.path).join(entry.path());
+                if full_path.is_dir() {
+                    SharedItemKind::Dir
+                } else {
+                    SharedItemKind::File
+                }
+            });
             if !current_share_paths.contains(entry.path()) {
-                debug!("sync: adding share '{}'", entry.path());
-                // Determine kind by checking if path looks like a dir (ends with /)
-                // or fall back to 'file'. The actual kind is determined at share time,
-                // but in config we store what was shared, so we re-insert as file.
-                // The share command handles file vs dir detection.
+                debug!(
+                    "sync: adding share '{}' kind={}",
+                    entry.path(),
+                    desired_kind
+                );
                 tx.execute(
-                    "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES ('file', ?1, ?2, ?3)",
-                    params![entry.path(), project_id, entry.label()],
+                    "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES (?1, ?2, ?3, ?4)",
+                    params![desired_kind.as_str(), entry.path(), project_id, entry.label()],
                 )?;
                 if tx.changes() > 0 {
                     report.shares_added += 1;
                 }
+            } else if let Some((id, _path, current_kind, current_label)) = current_shares
+                .iter()
+                .find(|(_, path, _, _)| path == entry.path())
+                && (*current_kind != desired_kind || current_label.as_deref() != entry.label())
+            {
+                debug!(
+                    "sync: updating share '{}' kind {} -> {}, label {:?} -> {:?}",
+                    entry.path(),
+                    current_kind,
+                    desired_kind,
+                    current_label,
+                    entry.label()
+                );
+                tx.execute(
+                    "UPDATE shared_items
+                     SET kind = ?1, label = ?2, updated_at = datetime('now')
+                     WHERE id = ?3",
+                    params![desired_kind.as_str(), entry.label(), id],
+                )?;
             }
         }
 
         // Remove shares not in config
-        for (id, path, _label) in &current_shares {
+        for (id, path, _kind, _label) in &current_shares {
             if !desired_share_paths.contains(path) {
                 debug!("sync: removing share '{}'", path);
                 tx.execute("DELETE FROM shared_items WHERE id = ?1", params![id])?;
                 report.shares_removed += 1;
+            }
+        }
+
+        // --- Artifact dependencies for project-owned shares ---
+        for entry in &config.share {
+            let Some(desired_dependencies) = entry.dependencies() else {
+                continue;
+            };
+            debug!(
+                "sync: reconciling {} dependencies for share '{}'",
+                desired_dependencies.len(),
+                entry.path()
+            );
+            let item_id: Option<i64> = tx
+                .query_row(
+                    "SELECT id FROM shared_items
+                     WHERE project_id = ?1 AND path = ?2 AND kind IN ('file', 'dir')",
+                    params![project_id, entry.path()],
+                    |row| row.get(0),
+                )
+                .ok();
+            let Some(item_id) = item_id else {
+                warn!(
+                    "Config dependency sync skipped for missing share '{}'",
+                    entry.path()
+                );
+                continue;
+            };
+
+            let current_dependencies: Vec<ArtifactDependency> = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, shared_item_id, depends_on_project_id,
+                            depends_on_project_slug_snapshot, kind, reaction,
+                            created_at, updated_at
+                     FROM artifact_dependencies
+                     WHERE shared_item_id = ?1",
+                )?;
+                let rows = stmt.query_map(params![item_id], Self::map_artifact_dependency)?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+
+            let desired_keys = desired_dependencies
+                .iter()
+                .map(|dep| (normalize_project_slug(&dep.service), dep.kind))
+                .collect::<std::collections::HashSet<_>>();
+
+            for dep in desired_dependencies {
+                let service_slug = normalize_project_slug(&dep.service);
+                let target_project_id: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM projects WHERE slug = ?1",
+                        params![service_slug],
+                        |row| row.get(0),
+                    )
+                    .ok();
+                if target_project_id.is_none() {
+                    warn!(
+                        "Config dependency target slug '{}' is unknown for share '{}'",
+                        service_slug,
+                        entry.path()
+                    );
+                }
+                let existing = current_dependencies.iter().find(|current| {
+                    current.depends_on_project_slug_snapshot == service_slug
+                        && current.kind == dep.kind
+                });
+                if let Some(existing) = existing {
+                    if existing.reaction != dep.reaction
+                        || existing.depends_on_project_id != target_project_id
+                    {
+                        debug!(
+                            "sync: updating dependency id={} service='{}' kind={} reaction {} -> {}",
+                            existing.id, service_slug, dep.kind, existing.reaction, dep.reaction
+                        );
+                        tx.execute(
+                            "UPDATE artifact_dependencies
+                             SET depends_on_project_id = ?1,
+                                 reaction = ?2,
+                                 updated_at = datetime('now')
+                             WHERE id = ?3",
+                            params![target_project_id, dep.reaction.as_str(), existing.id],
+                        )?;
+                        report.dependencies_updated += 1;
+                    }
+                } else {
+                    debug!(
+                        "sync: adding dependency share='{}' service='{}' kind={} reaction={}",
+                        entry.path(),
+                        service_slug,
+                        dep.kind,
+                        dep.reaction
+                    );
+                    tx.execute(
+                        "INSERT INTO artifact_dependencies (
+                             shared_item_id,
+                             depends_on_project_id,
+                             depends_on_project_slug_snapshot,
+                             kind,
+                             reaction
+                         )
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            item_id,
+                            target_project_id,
+                            service_slug,
+                            dep.kind.as_str(),
+                            dep.reaction.as_str()
+                        ],
+                    )?;
+                    report.dependencies_added += 1;
+                }
+            }
+
+            for current in &current_dependencies {
+                let current_key = (
+                    current.depends_on_project_slug_snapshot.clone(),
+                    current.kind,
+                );
+                if !desired_keys.contains(&current_key) {
+                    debug!(
+                        "sync: removing dependency id={} service='{}' kind={}",
+                        current.id, current.depends_on_project_slug_snapshot, current.kind
+                    );
+                    tx.execute(
+                        "DELETE FROM artifact_dependencies WHERE id = ?1",
+                        params![current.id],
+                    )?;
+                    report.dependencies_removed += 1;
+                }
             }
         }
 
@@ -1039,11 +2495,14 @@ impl Db {
 
         tx.commit()?;
         info!(
-            "Sync complete: groups +{} -{}, shares +{} -{}, notes +{} -{} ~{}",
+            "Sync complete: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
             report.groups_added,
             report.groups_removed,
             report.shares_added,
             report.shares_removed,
+            report.dependencies_added,
+            report.dependencies_removed,
+            report.dependencies_updated,
             report.notes_added,
             report.notes_removed,
             report.notes_updated,
@@ -1232,6 +2691,7 @@ mod tests {
 
         let p = db.get_project_by_path("/tmp/proj").unwrap().unwrap();
         assert_eq!(p.name, "proj");
+        assert_eq!(p.slug, "proj");
         assert_eq!(p.path, "/tmp/proj");
         assert_eq!(p.id, id);
     }
@@ -1248,12 +2708,74 @@ mod tests {
         let id = db.create_project("proj", "/tmp/proj").unwrap();
         let p = db.get_project_by_id(id).unwrap().unwrap();
         assert_eq!(p.name, "proj");
+        assert_eq!(p.slug, "proj");
         assert!(db.get_project_by_id(9999).unwrap().is_none());
+    }
+
+    #[test]
+    fn create_project_with_explicit_slug() {
+        let db = test_db();
+        let id = db
+            .create_project_with_slug("Auth Service", "/tmp/auth", Some("auth-api"))
+            .unwrap();
+        let p = db.get_project_by_id(id).unwrap().unwrap();
+        assert_eq!(p.slug, "auth-api");
+    }
+
+    #[test]
+    fn create_project_generates_unique_slug() {
+        let db = test_db();
+        db.create_project("Service", "/tmp/service-a").unwrap();
+        let id = db.create_project("Service", "/tmp/service-b").unwrap();
+        let p = db.get_project_by_id(id).unwrap().unwrap();
+        assert_eq!(p.slug, "service-2");
+    }
+
+    #[test]
+    fn get_project_by_slug() {
+        let db = test_db();
+        let id = db
+            .create_project_with_slug("Auth Service", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let p = db.get_project_by_slug("auth").unwrap().unwrap();
+        assert_eq!(p.id, id);
+        assert!(db.get_project_by_slug("missing").unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_project_target_by_slug() {
+        let db = test_db();
+        let id = db
+            .create_project_with_slug("Auth Service", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let p = db.resolve_project_target("auth").unwrap().unwrap();
+        assert_eq!(p.id, id);
     }
 
     #[test]
     fn resolve_project_target_accepts_windows_verbatim_path() {
         let db = test_db();
+        let id = db
+            .create_project("proj", r"C:\tmp\ai-workspace-project")
+            .unwrap();
+
+        let p = db
+            .resolve_project_target(r"\\?\C:\tmp\ai-workspace-project")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(p.id, id);
+    }
+
+    #[test]
+    fn resolve_project_target_prefers_stripped_windows_path_over_normalized_slug() {
+        let db = test_db();
+        db.create_project_with_slug(
+            "slug collision",
+            "/tmp/collision",
+            Some("c-tmp-ai-workspace-project"),
+        )
+        .unwrap();
         let id = db
             .create_project("proj", r"C:\tmp\ai-workspace-project")
             .unwrap();
@@ -1451,6 +2973,576 @@ mod tests {
         assert!(db.get_group_by_name("grp").unwrap().is_none());
         assert_eq!(db.get_groups_for_project(pid).unwrap().len(), 0);
         assert_eq!(db.get_all_items_for_group(gid).unwrap().len(), 0);
+    }
+
+    // --- Service Links ---
+
+    #[test]
+    fn create_service_link_resolves_slug_and_lists_outgoing() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+
+        let id = db
+            .create_service_link("api", "auth", ServiceLinkKind::DependsOn, Some("JWT"))
+            .unwrap();
+
+        let links = db.list_outgoing_service_links(api).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].id, id);
+        assert_eq!(links[0].from_project_id, api);
+        assert_eq!(links[0].to_project_id, auth);
+        assert_eq!(links[0].kind, ServiceLinkKind::DependsOn);
+        assert_eq!(links[0].label.as_deref(), Some("JWT"));
+    }
+
+    #[test]
+    fn create_service_link_resolves_numeric_ids() {
+        let db = test_db();
+        let auth = db.create_project("auth", "/tmp/auth").unwrap();
+        let api = db.create_project("api", "/tmp/api").unwrap();
+
+        let id = db
+            .create_service_link(
+                &api.to_string(),
+                &auth.to_string(),
+                ServiceLinkKind::DependsOn,
+                None,
+            )
+            .unwrap();
+
+        let link = db
+            .get_service_link_by_endpoints(api, auth, ServiceLinkKind::DependsOn)
+            .unwrap()
+            .unwrap();
+        assert_eq!(link.id, id);
+    }
+
+    #[test]
+    fn create_service_link_duplicate_is_idempotent() {
+        let db = test_db();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+
+        let first = db
+            .create_service_link("api", "auth", ServiceLinkKind::DependsOn, Some("first"))
+            .unwrap();
+        let second = db
+            .create_service_link("api", "auth", ServiceLinkKind::DependsOn, Some("second"))
+            .unwrap();
+
+        assert_eq!(first, second);
+        let links = db.list_outgoing_service_links(api).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].label.as_deref(), Some("first"));
+    }
+
+    #[test]
+    fn create_service_link_rejects_self_link() {
+        let db = test_db();
+        db.create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+
+        let err = db
+            .create_service_link("api", "api", ServiceLinkKind::DependsOn, None)
+            .unwrap_err();
+
+        assert!(err.to_string().contains("itself"));
+    }
+
+    #[test]
+    fn list_incoming_service_links() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Web", "/tmp/web", Some("web"))
+            .unwrap();
+
+        db.create_service_link("api", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+        db.create_service_link("web", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+
+        let links = db.list_incoming_service_links(auth).unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().all(|link| link.to_project_id == auth));
+    }
+
+    #[test]
+    fn list_group_service_links_only_returns_internal_graph_edges() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let web = db
+            .create_project_with_slug("Web", "/tmp/web", Some("web"))
+            .unwrap();
+        let group = db.get_or_create_group("core").unwrap();
+        db.add_project_to_group(auth, group).unwrap();
+        db.add_project_to_group(api, group).unwrap();
+
+        db.create_service_link("api", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+        db.create_service_link("web", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+
+        let links = db.list_group_service_links(group).unwrap();
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].from_project_id, api);
+        assert_eq!(links[0].to_project_id, auth);
+        assert_ne!(links[0].from_project_id, web);
+    }
+
+    #[test]
+    fn delete_service_link_removes_matching_edge() {
+        let db = test_db();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_service_link("api", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+
+        assert!(
+            db.delete_service_link("api", "auth", ServiceLinkKind::DependsOn)
+                .unwrap()
+        );
+        assert!(
+            !db.delete_service_link("api", "auth", ServiceLinkKind::DependsOn)
+                .unwrap()
+        );
+        assert!(db.list_outgoing_service_links(api).unwrap().is_empty());
+    }
+
+    // --- Artifact Dependencies ---
+
+    #[test]
+    fn add_artifact_dependency_resolves_item_label_and_service_slug() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let group = db.get_or_create_group("core").unwrap();
+        db.add_project_to_group(api, group).unwrap();
+        db.add_project_to_group(auth, group).unwrap();
+        let item = db
+            .share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+
+        let id = db
+            .add_artifact_dependency(
+                api,
+                "api-spec",
+                "auth",
+                ArtifactDependencyKind::ConsumesApi,
+                ArtifactReaction::Update,
+            )
+            .unwrap();
+
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].id, id);
+        assert_eq!(deps[0].shared_item_id, item);
+        assert_eq!(deps[0].depends_on_project_id, Some(auth));
+        assert_eq!(deps[0].depends_on_project_slug_snapshot, "auth");
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::ConsumesApi);
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+    }
+
+    #[test]
+    fn add_artifact_dependency_updates_existing_kind_reaction() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.share_file(api, "README.md", Some("readme")).unwrap();
+
+        let first = db
+            .add_artifact_dependency(
+                api,
+                "readme",
+                "auth",
+                ArtifactDependencyKind::Documents,
+                ArtifactReaction::Inspect,
+            )
+            .unwrap();
+        let second = db
+            .add_artifact_dependency(
+                api,
+                "readme",
+                "auth",
+                ArtifactDependencyKind::Documents,
+                ArtifactReaction::RemoveReference,
+            )
+            .unwrap();
+
+        assert_eq!(first, second);
+        let deps = db
+            .list_artifact_dependencies_for_item(api, "readme")
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].reaction, ArtifactReaction::RemoveReference);
+    }
+
+    #[test]
+    fn add_artifact_dependency_rejects_notes() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.add_project_note(api, "note body", Some("note")).unwrap();
+
+        let err = db
+            .add_artifact_dependency(
+                api,
+                "note",
+                "auth",
+                ArtifactDependencyKind::References,
+                ArtifactReaction::Inspect,
+            )
+            .unwrap_err();
+
+        assert!(err.to_string().contains("file or directory"));
+    }
+
+    #[test]
+    fn remove_artifact_dependency_by_kind() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Inspect,
+        )
+        .unwrap();
+
+        let removed = db
+            .remove_artifact_dependency(
+                api,
+                "api-spec",
+                "auth",
+                Some(ArtifactDependencyKind::ConsumesApi),
+            )
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        let deps = db
+            .list_artifact_dependencies_for_item(api, "api-spec")
+            .unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+    }
+
+    #[test]
+    fn remove_artifact_dependency_by_deleted_service_slug_snapshot() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+        db.destroy_project_with_service_deleted_event(auth).unwrap();
+
+        let removed = db
+            .remove_artifact_dependency(api, "api-spec", "auth", None)
+            .unwrap();
+
+        assert_eq!(removed, 1);
+        let deps = db
+            .list_artifact_dependencies_for_item(api, "api-spec")
+            .unwrap();
+        assert!(deps.is_empty());
+    }
+
+    #[test]
+    fn list_artifact_dependencies_on_service_slug() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let web = db
+            .create_project_with_slug("Web", "/tmp/web", Some("web"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.share_file(web, "client.ts", Some("client")).unwrap();
+
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+        db.add_artifact_dependency(
+            web,
+            "client",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Inspect,
+        )
+        .unwrap();
+
+        let deps = db
+            .list_artifact_dependencies_on_service_slug("auth")
+            .unwrap();
+        assert_eq!(deps.len(), 2);
+        assert!(
+            deps.iter()
+                .all(|dep| dep.depends_on_project_slug_snapshot == "auth")
+        );
+    }
+
+    #[test]
+    fn deleting_shared_item_cascades_artifact_dependencies() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let item = db
+            .share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        assert!(db.remove_shared_item_for_project(item, api).unwrap());
+
+        assert!(
+            db.list_artifact_dependencies_for_project(api)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            db.list_artifact_dependencies_on_service_slug("auth")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // --- Workspace Events ---
+
+    #[test]
+    fn create_workspace_event_snapshots_source_and_link_impacts() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        let group = db.get_or_create_group("core").unwrap();
+        db.add_project_to_group(auth, group).unwrap();
+        db.add_project_to_group(api, group).unwrap();
+        db.create_service_link("api", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+
+        let event_id = db
+            .create_workspace_event(
+                "auth",
+                WorkspaceEventKind::ServiceChanged,
+                EventSeverity::Warning,
+                "Auth changed",
+                Some("Token format changed"),
+            )
+            .unwrap();
+
+        let event = db.get_workspace_event(event_id).unwrap().unwrap();
+        assert_eq!(event.source_project_id, Some(auth));
+        assert_eq!(event.source_project_slug, "auth");
+        assert_eq!(event.source_project_name, "Auth");
+        assert_eq!(event.group_id, Some(group));
+        assert_eq!(event.kind, WorkspaceEventKind::ServiceChanged);
+        assert_eq!(event.severity, EventSeverity::Warning);
+        assert_eq!(event.status, EventStatus::Open);
+
+        let targets = db.list_event_targets(event_id).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].affected_project_id, Some(api));
+        assert_eq!(
+            targets[0].relation_kind,
+            EventTargetRelationKind::LinkedService
+        );
+    }
+
+    #[test]
+    fn create_workspace_event_calculates_artifact_impacts() {
+        let db = test_db();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let event_id = db
+            .create_workspace_event(
+                "auth",
+                WorkspaceEventKind::ServiceChanged,
+                EventSeverity::Info,
+                "Auth changed",
+                None,
+            )
+            .unwrap();
+
+        let targets = db.list_event_targets(event_id).unwrap();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].affected_project_id, Some(api));
+        assert_eq!(
+            targets[0].relation_kind,
+            EventTargetRelationKind::ArtifactDependency
+        );
+
+        let artifacts = db.list_event_artifacts(event_id).unwrap();
+        assert_eq!(artifacts.len(), 1);
+        assert_eq!(artifacts[0].affected_project_id, Some(api));
+        assert_eq!(artifacts[0].path_snapshot, "openapi.yaml");
+        assert_eq!(artifacts[0].reaction, ArtifactReaction::Update);
+        assert_eq!(artifacts[0].status, EventArtifactStatus::Open);
+    }
+
+    #[test]
+    fn close_workspace_event_resolves_targets_and_artifacts() {
+        let db = test_db();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.share_file(api, "openapi.yaml", Some("api-spec"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "api-spec",
+            "auth",
+            ArtifactDependencyKind::ConsumesApi,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+        let event_id = db
+            .create_workspace_event(
+                "auth",
+                WorkspaceEventKind::ServiceChanged,
+                EventSeverity::Info,
+                "Auth changed",
+                None,
+            )
+            .unwrap();
+
+        assert!(db.close_workspace_event(event_id).unwrap());
+        assert!(!db.close_workspace_event(event_id).unwrap());
+
+        let event = db.get_workspace_event(event_id).unwrap().unwrap();
+        assert_eq!(event.status, EventStatus::Closed);
+        assert_eq!(
+            db.list_event_targets(event_id).unwrap()[0].status,
+            EventTargetStatus::Resolved
+        );
+        assert_eq!(
+            db.list_event_artifacts(event_id).unwrap()[0].status,
+            EventArtifactStatus::Resolved
+        );
+    }
+
+    #[test]
+    fn workspace_event_inbox_and_remove() {
+        let db = test_db();
+        db.create_project_with_slug("Auth", "/tmp/auth", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api", Some("api"))
+            .unwrap();
+        db.create_service_link("api", "auth", ServiceLinkKind::DependsOn, None)
+            .unwrap();
+        let event_id = db
+            .create_workspace_event(
+                "auth",
+                WorkspaceEventKind::ServiceDeleted,
+                EventSeverity::Critical,
+                "Auth deleted",
+                None,
+            )
+            .unwrap();
+
+        let inbox = db.list_workspace_event_inbox(api).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, event_id);
+
+        let open_auth_events = db
+            .list_workspace_events(Some("auth"), Some(EventStatus::Open))
+            .unwrap();
+        assert_eq!(open_auth_events.len(), 1);
+
+        assert!(db.remove_workspace_event(event_id).unwrap());
+        assert!(db.get_workspace_event(event_id).unwrap().is_none());
+        assert!(db.list_event_targets(event_id).unwrap().is_empty());
     }
 
     // --- Shared Items: Files & Dirs ---
@@ -1960,12 +4052,15 @@ mod tests {
 
         let config = db.export_project_config(pid).unwrap();
         assert_eq!(config.name, "proj");
+        assert_eq!(config.slug.as_deref(), Some("proj"));
         assert_eq!(config.groups, vec!["team"]);
         assert_eq!(config.share.len(), 2);
         assert_eq!(config.share[0].path(), "src/main.rs");
         assert_eq!(config.share[0].label(), Some("main"));
+        assert_eq!(config.share[0].kind(), Some(SharedItemKind::File));
         assert_eq!(config.share[1].path(), "docs");
         assert!(config.share[1].label().is_none());
+        assert_eq!(config.share[1].kind(), Some(SharedItemKind::Dir));
         assert_eq!(config.notes.len(), 1);
         assert_eq!(config.notes[0].content, "important");
         assert_eq!(config.notes[0].label.as_deref(), Some("info"));
@@ -1986,6 +4081,33 @@ mod tests {
         assert_eq!(config.notes[0].content, "proj note");
     }
 
+    #[test]
+    fn export_project_config_includes_artifact_dependencies() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-config", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-config", Some("auth"))
+            .unwrap();
+        db.share_file(api, "docs/auth.md", Some("auth docs"))
+            .unwrap();
+        db.add_artifact_dependency(
+            api,
+            "docs/auth.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = db.export_project_config(api).unwrap();
+        let deps = config.share[0].dependencies().unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].service, "auth");
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+    }
+
     // --- Sync from Config ---
 
     #[test]
@@ -1995,12 +4117,15 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec!["team-a".to_string(), "team-b".to_string()],
             share: vec![
                 ShareEntry::PathOnly("README.md".to_string()),
-                ShareEntry::WithLabel {
+                ShareEntry::WithMetadata {
                     path: "api.json".to_string(),
-                    label: "API spec".to_string(),
+                    label: Some("API spec".to_string()),
+                    kind: Some(SharedItemKind::File),
+                    dependencies: None,
                 },
             ],
             notes: vec![],
@@ -2018,6 +4143,90 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_configured_share_kind() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs".to_string(),
+                label: None,
+                kind: Some(SharedItemKind::Dir),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+        assert_eq!(items[0].path.as_deref(), Some("docs"));
+    }
+
+    #[test]
+    fn sync_reconciles_artifact_dependencies_from_config() {
+        let db = test_db();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-sync", Some("api"))
+            .unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-sync", Some("auth"))
+            .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: Some("api".to_string()),
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs/auth.md".to_string(),
+                label: Some("auth docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: Some(vec![DependencyEntry {
+                    service: "auth".to_string(),
+                    kind: ArtifactDependencyKind::References,
+                    reaction: ArtifactReaction::Update,
+                }]),
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        assert_eq!(report.dependencies_added, 1);
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_project_slug_snapshot, "auth");
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+
+        let mut updated_config = config.clone();
+        if let ShareEntry::WithMetadata {
+            dependencies: Some(deps),
+            ..
+        } = &mut updated_config.share[0]
+        {
+            deps[0].reaction = ArtifactReaction::Inspect;
+        }
+        let report = db.sync_from_config(api, &updated_config).unwrap();
+        assert_eq!(report.dependencies_updated, 1);
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps[0].reaction, ArtifactReaction::Inspect);
+
+        if let ShareEntry::WithMetadata { dependencies, .. } = &mut updated_config.share[0] {
+            *dependencies = Some(vec![]);
+        }
+        let report = db.sync_from_config(api, &updated_config).unwrap();
+        assert_eq!(report.dependencies_removed, 1);
+        assert!(
+            db.list_artifact_dependencies_for_project(api)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sync_removes_extra_groups_and_shares() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -2027,6 +4236,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![],
@@ -2049,6 +4259,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![
@@ -2084,6 +4295,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![NoteEntry {
@@ -2108,6 +4320,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![ShareEntry::PathOnly("existing.txt".to_string())],
             notes: vec![],
@@ -2128,6 +4341,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
+            slug: None,
             groups: vec!["team".to_string()],
             share: vec![ShareEntry::PathOnly("file.txt".to_string())],
             notes: vec![NoteEntry {
