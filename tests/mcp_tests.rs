@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use rusqlite::{Connection, params};
+
 fn binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/debug/ai-workspace");
@@ -39,6 +41,14 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+fn mtime_epoch(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Seed a project and group via CLI before MCP tests
@@ -167,6 +177,107 @@ fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
     run(&["share", "visible.md"]);
     run(&["share", ".env.md"]);
     run(&["share", "docs"]);
+
+    project_dir
+}
+
+/// Seed a stale directory aggregate beyond workspace_search_fulltext's bounded refresh window.
+fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tempfile::TempDir {
+    const FILLER_COUNT: usize = 201;
+
+    let project_dir = tempfile::tempdir().unwrap();
+    for i in 0..FILLER_COUNT {
+        std::fs::write(
+            project_dir.path().join(format!("filler_{i:03}.md")),
+            format!("filler_{i:03}_marker\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "public_beyond_window_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "stale_hidden_beyond_window_marker\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args(["init", "--name", "stale-window-proj"])
+        .current_dir(project_dir.path())
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+    assert!(
+        output.status.success(),
+        "init should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut conn = Connection::open(db_path).unwrap();
+    let project_id: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = 'stale-window-proj'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+
+    for i in 0..FILLER_COUNT {
+        let rel = format!("filler_{i:03}.md");
+        let abs = project_dir.path().join(&rel);
+        let meta = std::fs::metadata(&abs).unwrap();
+        tx.execute(
+            "INSERT INTO shared_items (kind, path, project_id) VALUES ('file', ?1, ?2)",
+            params![rel, project_id],
+        )
+        .unwrap();
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![id, rel, format!("filler_{i:03}_marker")],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                abs.to_string_lossy(),
+                mtime_epoch(&meta),
+                meta.len() as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    tx.execute(
+        "INSERT INTO shared_items (kind, path, project_id) VALUES ('dir', 'docs', ?1)",
+        params![project_id],
+    )
+    .unwrap();
+    let docs_id = tx.last_insert_rowid();
+    let docs_abs = project_dir.path().join("docs");
+    let stale_aggregate = "### docs/public.md\npublic_beyond_window_marker\n\n### docs/.hidden.md\nstale_hidden_beyond_window_marker\n";
+    tx.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (?1, 'docs', ?2)",
+        params![docs_id, stale_aggregate],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, 1, ?3)",
+        params![
+            docs_id,
+            docs_abs.to_string_lossy(),
+            stale_aggregate.len() as i64
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
 
     project_dir
 }
@@ -385,6 +496,37 @@ fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_childre
     assert_eq!(results[0]["path"], "docs");
     assert!(!content.contains("directory_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_hidden_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_revalidates_stale_directory_beyond_refresh_window() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_stale_directory_fulltext_beyond_refresh_window(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "stale_hidden_beyond_window_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "stale directory aggregate beyond refresh window should be revalidated: {content}"
+    );
 }
 
 #[test]

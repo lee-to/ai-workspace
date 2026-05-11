@@ -471,14 +471,27 @@ fn workspace_search_fulltext(
         query, limit
     );
 
-    // Bounded lazy refresh also removes stale hidden/sensitive FTS rows.
+    // Bounded lazy refresh keeps common edits fresh; matching directory hits
+    // are revalidated below before snippets can be returned.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {
         log::warn!("refresh_stale failed: {}", e);
         return tool_error(id, "Fulltext search refresh failed");
     }
 
     match db.search_files(query, limit) {
-        Ok(hits) => {
+        Ok(mut hits) => {
+            match crate::indexer::refresh_search_hits(db, &hits) {
+                Ok(refreshed) if refreshed > 0 => match db.search_files(query, limit) {
+                    Ok(updated_hits) => hits = updated_hits,
+                    Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+                },
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("refresh_search_hits failed: {}", e);
+                    return tool_error(id, "Fulltext search refresh failed");
+                }
+            }
+
             let options = walk::WalkOptions::default();
             let results: Vec<_> = hits
                 .iter()

@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::db::Db;
-use crate::models::{SharedItem, SharedItemKind};
+use crate::models::{FileSearchHit, SharedItem, SharedItemKind};
 use crate::walk::{self, WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
@@ -324,6 +324,49 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
         refreshed,
         start.elapsed()
     );
+    Ok(refreshed)
+}
+
+/// Revalidate FTS hits that could otherwise expose stale unsafe snippets.
+///
+/// `refresh_stale` is intentionally bounded for latency. Before returning
+/// search snippets, reindex matching directory aggregates because their visible
+/// row path can still contain old hidden/sensitive child content.
+pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
+    let mut refreshed = 0usize;
+
+    for hit in hits {
+        if !walk::path_allowed_by_options(Path::new(&hit.path), WalkOptions::default()) {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        }
+
+        let Some(item) = db.get_item_by_id(hit.shared_item_id)? else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        if item.kind != SharedItemKind::Dir {
+            continue;
+        }
+
+        let Some(project_id) = item.project_id else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+        let Some(project) = db.get_project_by_id(project_id)? else {
+            db.delete_file_index(hit.shared_item_id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        index_shared_item(db, &item, &PathBuf::from(&project.path))?;
+        refreshed += 1;
+    }
+
     Ok(refreshed)
 }
 

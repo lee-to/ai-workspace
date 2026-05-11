@@ -121,7 +121,7 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
 - Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
-- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call); stale hidden/sensitive index rows are removed during refresh.
+- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call); matching directory hits are revalidated before snippets are returned so stale aggregates cannot expose hidden/sensitive child content.
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
