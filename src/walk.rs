@@ -29,6 +29,58 @@ const MAX_GREP_MATCHES: usize = 100;
 /// Size of the buffer used for binary detection (8 KB).
 const BINARY_DETECT_SIZE: usize = 8 * 1024;
 
+/// File traversal policy. Defaults are safe for MCP exposure.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WalkOptions {
+    pub include_hidden: bool,
+    pub include_sensitive: bool,
+}
+
+fn is_hidden_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => {
+            name.to_str().is_some_and(|name| name.starts_with('.'))
+        }
+        _ => false,
+    })
+}
+
+fn is_sensitive_name(name: &str) -> bool {
+    let lower = name.to_ascii_lowercase();
+    const SENSITIVE_NAMES: &[&str] = &[
+        ".env",
+        ".npmrc",
+        ".pypirc",
+        ".netrc",
+        ".aws",
+        ".ssh",
+        "id_rsa",
+        "id_dsa",
+        "id_ecdsa",
+        "id_ed25519",
+    ];
+    const SENSITIVE_EXTENSIONS: &[&str] = &[".pem", ".key", ".p12", ".pfx"];
+
+    SENSITIVE_NAMES
+        .iter()
+        .any(|sensitive| lower == *sensitive || lower.starts_with(&format!("{sensitive}.")))
+        || SENSITIVE_EXTENSIONS
+            .iter()
+            .any(|extension| lower.ends_with(extension) || lower.contains(&format!("{extension}.")))
+}
+
+fn is_sensitive_path(path: &Path) -> bool {
+    path.components().any(|component| match component {
+        std::path::Component::Normal(name) => name.to_str().is_some_and(is_sensitive_name),
+        _ => false,
+    })
+}
+
+pub fn path_allowed_by_options(path: &Path, options: WalkOptions) -> bool {
+    (options.include_hidden || !is_hidden_path(path))
+        && (options.include_sensitive || !is_sensitive_path(path))
+}
+
 /// Check if a file is likely binary by looking for null bytes in the first 8KB.
 fn is_binary(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
@@ -42,9 +94,7 @@ fn is_binary(path: &Path) -> bool {
 }
 
 fn normalize_rel_path(input: &str) -> Option<PathBuf> {
-    if input.trim().is_empty()
-        || input.split(['/', '\\']).any(|part| part.is_empty())
-    {
+    if input.trim().is_empty() || input.split(['/', '\\']).any(|part| part.is_empty()) {
         return None;
     }
 
@@ -184,7 +234,15 @@ pub fn walk_project_tree(
     root: &Path,
     subpath: Option<&str>,
     max_depth: Option<usize>,
+    options: WalkOptions,
 ) -> Vec<FileEntry> {
+    if let Some(sub) = subpath
+        && !path_allowed_by_options(Path::new(sub), options)
+    {
+        warn!("Walk subpath blocked by policy: {}", sub);
+        return Vec::new();
+    }
+
     let walk_root = match subpath {
         Some(sub) => root.join(sub),
         None => root.to_path_buf(),
@@ -203,11 +261,18 @@ pub fn walk_project_tree(
 
     let mut builder = ignore::WalkBuilder::new(&walk_root);
     builder
-        .hidden(false)
+        .hidden(!options.include_hidden)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .sort_by_file_name(|a, b| a.cmp(b));
+
+    let policy_root = root.to_path_buf();
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        let rel = path.strip_prefix(&policy_root).unwrap_or(path);
+        path_allowed_by_options(rel, options)
+    });
 
     if let Some(depth) = max_depth {
         builder.max_depth(Some(depth));
@@ -262,6 +327,7 @@ pub fn grep_project(
     root: &Path,
     pattern: &str,
     glob_pattern: Option<&str>,
+    options: WalkOptions,
 ) -> Result<Vec<GrepMatch>, String> {
     info!(
         "grep_project: root={}, pattern={}, glob={:?}",
@@ -275,10 +341,17 @@ pub fn grep_project(
 
     let mut builder = ignore::WalkBuilder::new(root);
     builder
-        .hidden(false)
+        .hidden(!options.include_hidden)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true);
+
+    let policy_root = root.to_path_buf();
+    builder.filter_entry(move |entry| {
+        let path = entry.path();
+        let rel = path.strip_prefix(&policy_root).unwrap_or(path);
+        path_allowed_by_options(rel, options)
+    });
 
     let walker = builder.build();
     let mut matches = Vec::new();
@@ -325,6 +398,7 @@ pub fn grep_project_paths(
     rel_paths: &[String],
     pattern: &str,
     glob_pattern: Option<&str>,
+    options: WalkOptions,
 ) -> Result<Vec<GrepMatch>, String> {
     info!(
         "grep_project_paths: root={}, scopes={}, pattern={}, glob={:?}",
@@ -345,7 +419,10 @@ pub fn grep_project_paths(
 
     for rel_path in rel_paths {
         if matches.len() >= MAX_GREP_MATCHES {
-            debug!("grep_project_paths: hit max matches limit ({})", MAX_GREP_MATCHES);
+            debug!(
+                "grep_project_paths: hit max matches limit ({})",
+                MAX_GREP_MATCHES
+            );
             break;
         }
 
@@ -354,12 +431,14 @@ pub fn grep_project_paths(
             continue;
         };
 
+        if !path_allowed_by_options(&normalized, options) {
+            warn!("grep_project_paths: skipping blocked scope '{}'", rel_path);
+            continue;
+        }
+
         let target = canonical_root.join(normalized);
         let Ok(canonical_target) = target.canonicalize() else {
-            warn!(
-                "grep_project_paths: skipping missing scope '{}'",
-                rel_path
-            );
+            warn!("grep_project_paths: skipping missing scope '{}'", rel_path);
             continue;
         };
 
@@ -390,10 +469,17 @@ pub fn grep_project_paths(
 
         let mut builder = ignore::WalkBuilder::new(&canonical_target);
         builder
-            .hidden(false)
+            .hidden(!options.include_hidden)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true);
+
+        let policy_root = canonical_root.clone();
+        builder.filter_entry(move |entry| {
+            let path = entry.path();
+            let rel = path.strip_prefix(&policy_root).unwrap_or(path);
+            path_allowed_by_options(rel, options)
+        });
 
         for result in builder.build() {
             if matches.len() >= MAX_GREP_MATCHES {
@@ -433,5 +519,57 @@ mod tests {
         let path = PathBuf::from("src").join("lib.rs");
 
         assert_eq!(path_to_slash_string(&path), "src/lib.rs");
+    }
+
+    #[test]
+    fn path_policy_blocks_hidden_and_sensitive_by_default() {
+        let options = WalkOptions::default();
+
+        assert!(path_allowed_by_options(Path::new("src/main.rs"), options));
+        assert!(!path_allowed_by_options(Path::new(".hidden.txt"), options));
+        assert!(!path_allowed_by_options(Path::new(".env"), options));
+        assert!(!path_allowed_by_options(Path::new(".env.md"), options));
+        assert!(!path_allowed_by_options(Path::new("private.key"), options));
+        assert!(!path_allowed_by_options(
+            Path::new("private.key.md"),
+            options
+        ));
+        assert!(!path_allowed_by_options(Path::new("id_rsa.md"), options));
+        assert!(!path_allowed_by_options(Path::new(".ssh/id_rsa"), options));
+    }
+
+    #[test]
+    fn path_policy_separates_hidden_and_sensitive_opt_ins() {
+        let include_hidden = WalkOptions {
+            include_hidden: true,
+            include_sensitive: false,
+        };
+        let include_sensitive = WalkOptions {
+            include_hidden: false,
+            include_sensitive: true,
+        };
+        let include_both = WalkOptions {
+            include_hidden: true,
+            include_sensitive: true,
+        };
+
+        assert!(path_allowed_by_options(
+            Path::new(".hidden.txt"),
+            include_hidden
+        ));
+        assert!(!path_allowed_by_options(Path::new(".env"), include_hidden));
+        assert!(path_allowed_by_options(
+            Path::new("private.key"),
+            include_sensitive
+        ));
+        assert!(!path_allowed_by_options(
+            Path::new(".ssh/id_rsa"),
+            include_sensitive
+        ));
+        assert!(path_allowed_by_options(Path::new(".env"), include_both));
+        assert!(path_allowed_by_options(
+            Path::new(".ssh/id_rsa"),
+            include_both
+        ));
     }
 }

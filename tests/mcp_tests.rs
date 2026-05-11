@@ -2,6 +2,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
+use rusqlite::{Connection, params};
+
 fn binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/debug/ai-workspace");
@@ -26,9 +28,7 @@ fn mcp_request_with_env(
         command.env(key, value);
     }
 
-    let mut child = command
-        .spawn()
-        .expect("Failed to start MCP server");
+    let mut child = command.spawn().expect("Failed to start MCP server");
 
     let mut stdin = child.stdin.take().unwrap();
     for req in requests {
@@ -55,6 +55,130 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute_batch(
+        "
+        PRAGMA foreign_keys = ON;
+
+        CREATE TABLE projects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            path TEXT NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL UNIQUE,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE project_groups (
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+            PRIMARY KEY (project_id, group_id)
+        );
+
+        CREATE TABLE shared_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'note')),
+            path TEXT,
+            content TEXT,
+            label TEXT,
+            project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+            group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+            created_by_project_id INTEGER REFERENCES projects(id),
+            created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            CHECK (
+                (kind IN ('file', 'dir') AND path IS NOT NULL AND project_id IS NOT NULL AND content IS NULL AND group_id IS NULL)
+                OR
+                (kind = 'note' AND content IS NOT NULL AND project_id IS NOT NULL AND group_id IS NULL AND path IS NULL)
+                OR
+                (kind = 'note' AND content IS NOT NULL AND group_id IS NOT NULL AND project_id IS NULL AND path IS NULL AND created_by_project_id IS NOT NULL)
+            )
+        );
+
+        CREATE VIRTUAL TABLE notes_fts USING fts5(label, content);
+        CREATE VIRTUAL TABLE files_fts USING fts5(
+            path,
+            content,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+        CREATE TABLE files_fts_meta (
+            shared_item_id INTEGER PRIMARY KEY REFERENCES shared_items(id) ON DELETE CASCADE,
+            abs_path TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        );
+        CREATE UNIQUE INDEX idx_shared_items_project_path
+        ON shared_items (project_id, path) WHERE path IS NOT NULL;
+        CREATE TRIGGER trg_shared_items_delete_fts
+        AFTER DELETE ON shared_items
+        BEGIN
+            DELETE FROM files_fts WHERE rowid = OLD.id;
+        END;
+        ",
+    )
+    .unwrap();
+
+    let project_path = project_path
+        .canonicalize()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    conn.execute(
+        "INSERT INTO projects (id, name, path) VALUES (1, 'legacy-proj', ?1)",
+        params![project_path],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO groups (id, name) VALUES (1, 'legacy-group')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO project_groups (project_id, group_id) VALUES (1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (id, kind, path, label, project_id) VALUES (1, 'file', 'readme.md', 'legacy-readme', 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (id, kind, content, label, group_id, created_by_project_id) VALUES (2, 'note', 'legacy note content', 'legacy-note', 1, 1)",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO notes_fts (rowid, label, content) VALUES (2, 'legacy-note', 'legacy note content')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (1, 'readme.md', 'legacy file token')",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (1, '/tmp/legacy/readme.md', 1, 17)",
+        [],
+    )
+    .unwrap();
+}
+
+fn mtime_epoch(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 /// Seed a project and group via CLI before MCP tests
@@ -85,6 +209,58 @@ fn seed_data(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+#[test]
+fn test_mcp_migrates_legacy_database_and_read_paths_work() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::write(project_dir.path().join("readme.md"), "legacy file token").unwrap();
+    create_legacy_db(&db_path, project_dir.path());
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_context",
+                "arguments": {}
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(context["projects"][0]["name"], "legacy-proj");
+    assert_eq!(context["groups"][0]["name"], "legacy-group");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search",
+                "arguments": { "query": "legacy" }
+            }
+        })],
+    );
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("legacy note content"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(version, 3);
+}
+
 /// Seed a project with a file tree suitable for project_tree/project_grep tests
 fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().unwrap();
@@ -104,6 +280,20 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
     std::fs::write(
         project_dir.path().join("src/utils.rs"),
         "pub fn greet(name: &str) {\n    println!(\"hello {}\", name);\n}\n",
+    )
+    .unwrap();
+    std::fs::write(project_dir.path().join("visible.txt"), "visible_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".hidden.txt"), "hidden_marker\n").unwrap();
+    std::fs::write(project_dir.path().join(".env"), "secret_env_marker\n").unwrap();
+    std::fs::write(
+        project_dir.path().join("private.key"),
+        "secret_key_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join(".ssh")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".ssh").join("id_rsa"),
+        "ssh_secret_marker\n",
     )
     .unwrap();
 
@@ -174,6 +364,249 @@ fn seed_scoped_project(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+fn seed_service_event_data(db_path: &PathBuf) -> (tempfile::TempDir, tempfile::TempDir) {
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(api_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        api_dir.path().join("docs/auth.md"),
+        "Auth integration notes",
+    )
+    .unwrap();
+
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(dir)
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command failed: {:?}\nstdout={}\nstderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "platform",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "init", "--name", "API", "--slug", "api", "--group", "platform",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &["share", "docs/auth.md", "--label", "auth-doc"],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "link",
+            "add",
+            "api",
+            "auth",
+            "--kind",
+            "depends_on",
+            "--label",
+            "JWT",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "docs/auth.md",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "event",
+            "create",
+            "--kind",
+            "service_changed",
+            "--source",
+            "auth",
+            "--severity",
+            "warning",
+            "--title",
+            "Auth changed",
+        ],
+    );
+
+    (auth_dir, api_dir)
+}
+
+/// Seed a project with markdown content for workspace_search_fulltext policy tests.
+fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        project_dir.path().join("visible.md"),
+        "visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join(".env.md"),
+        "hidden_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "directory_visible_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("private.key.md"),
+        "directory_sensitive_fulltext_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "directory_hidden_fulltext_marker\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(project_dir.path())
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command should succeed: {:?}\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(&["init", "--name", "fulltext-policy-proj"]);
+    run(&["share", "visible.md"]);
+    run(&["share", ".env.md"]);
+    run(&["share", "docs"]);
+
+    project_dir
+}
+
+/// Seed a stale directory aggregate beyond workspace_search_fulltext's bounded refresh window.
+fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tempfile::TempDir {
+    const FILLER_COUNT: usize = 201;
+
+    let project_dir = tempfile::tempdir().unwrap();
+    for i in 0..FILLER_COUNT {
+        std::fs::write(
+            project_dir.path().join(format!("filler_{i:03}.md")),
+            format!("filler_{i:03}_marker\n"),
+        )
+        .unwrap();
+    }
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join("public.md"),
+        "public_beyond_window_marker\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs").join(".hidden.md"),
+        "stale_hidden_beyond_window_marker\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args(["init", "--name", "stale-window-proj"])
+        .current_dir(project_dir.path())
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+    assert!(
+        output.status.success(),
+        "init should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut conn = Connection::open(db_path).unwrap();
+    let project_id: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE name = 'stale-window-proj'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+
+    for i in 0..FILLER_COUNT {
+        let rel = format!("filler_{i:03}.md");
+        let abs = project_dir.path().join(&rel);
+        let meta = std::fs::metadata(&abs).unwrap();
+        tx.execute(
+            "INSERT INTO shared_items (kind, path, project_id) VALUES ('file', ?1, ?2)",
+            params![rel, project_id],
+        )
+        .unwrap();
+        let id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![id, rel, format!("filler_{i:03}_marker")],
+        )
+        .unwrap();
+        tx.execute(
+            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, ?3, ?4)",
+            params![
+                id,
+                abs.to_string_lossy(),
+                mtime_epoch(&meta),
+                meta.len() as i64
+            ],
+        )
+        .unwrap();
+    }
+
+    tx.execute(
+        "INSERT INTO shared_items (kind, path, project_id) VALUES ('dir', 'docs', ?1)",
+        params![project_id],
+    )
+    .unwrap();
+    let docs_id = tx.last_insert_rowid();
+    let docs_abs = project_dir.path().join("docs");
+    let stale_aggregate = "### docs/public.md\npublic_beyond_window_marker\n\n### docs/.hidden.md\nstale_hidden_beyond_window_marker\n";
+    tx.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (?1, 'docs', ?2)",
+        params![docs_id, stale_aggregate],
+    )
+    .unwrap();
+    tx.execute(
+        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, 1, ?3)",
+        params![
+            docs_id,
+            docs_abs.to_string_lossy(),
+            stale_aggregate.len() as i64
+        ],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+
+    project_dir
+}
+
 #[test]
 fn test_mcp_initialize() {
     let (_db_dir, db_path) = temp_db();
@@ -217,6 +650,25 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"workspace_search"));
     assert!(tool_names.contains(&"list_groups"));
     assert!(tool_names.contains(&"list_projects"));
+    assert!(tool_names.contains(&"workspace_service_graph"));
+    assert!(tool_names.contains(&"workspace_events"));
+    assert!(tool_names.contains(&"workspace_event_details"));
+
+    for name in ["workspace_read", "project_tree", "project_grep"] {
+        let tool = tools
+            .iter()
+            .find(|tool| tool["name"] == name)
+            .unwrap_or_else(|| panic!("tool should be present: {name}"));
+        let properties = &tool["inputSchema"]["properties"];
+        assert!(
+            properties["include_hidden"].is_object(),
+            "{name} should expose include_hidden"
+        );
+        assert!(
+            properties["include_sensitive"].is_object(),
+            "{name} should expose include_sensitive"
+        );
+    }
 }
 
 #[test]
@@ -244,6 +696,7 @@ fn test_mcp_workspace_context() {
     let context: serde_json::Value = serde_json::from_str(content).unwrap();
     assert!(context["projects"].as_array().unwrap().len() > 0);
     assert_eq!(context["projects"][0]["name"], "seed-proj");
+    assert_eq!(context["projects"][0]["slug"], "seed-proj");
     // Verify labels appear in shared_items
     let shared_items = context["projects"][0]["shared_items"].as_array().unwrap();
     assert!(shared_items.iter().any(|i| i["label"] == "readme"));
@@ -298,6 +751,106 @@ fn test_mcp_workspace_context_includes_project_path_when_project_wide_enabled() 
         .unwrap();
     let context: serde_json::Value = serde_json::from_str(content).unwrap();
     assert!(context["projects"][0]["path"].as_str().is_some());
+}
+
+#[test]
+fn test_mcp_service_graph_events_and_event_details() {
+    let (_db_dir, db_path) = temp_db();
+    let (_auth_dir, _api_dir) = seed_service_event_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_context",
+                    "arguments": {}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_service_graph",
+                    "arguments": { "project": "api" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_events",
+                    "arguments": { "project": "api" }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 3);
+
+    let context_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(context_text).unwrap();
+    let api = context["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|project| project["slug"] == "api")
+        .unwrap();
+    let auth_doc = api["shared_items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["path"] == "docs/auth.md")
+        .unwrap();
+    assert_eq!(auth_doc["dependencies"][0]["service"], "auth");
+    assert_eq!(auth_doc["dependencies"][0]["reaction"], "update");
+
+    let graph_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let graph: serde_json::Value = serde_json::from_str(graph_text).unwrap();
+    assert_eq!(graph["scope"]["project"], "api");
+    assert_eq!(graph["links"][0]["from"], "api");
+    assert_eq!(graph["links"][0]["to"], "auth");
+    assert_eq!(graph["links"][0]["kind"], "depends_on");
+
+    let events_text = responses[2]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let events: serde_json::Value = serde_json::from_str(events_text).unwrap();
+    assert_eq!(events[0]["source_project_slug"], "auth");
+    assert_eq!(events[0]["kind"], "service_changed");
+    let event_id = events[0]["id"].as_i64().unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_event_details",
+                "arguments": { "event_id": event_id }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let details_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let details: serde_json::Value = serde_json::from_str(details_text).unwrap();
+    assert_eq!(details["event"]["id"], event_id);
+    assert_eq!(details["affected_services"][0]["project"], "api");
+    assert_eq!(details["affected_artifacts"][0]["path"], "docs/auth.md");
+    assert_eq!(details["affected_artifacts"][0]["reaction"], "update");
 }
 
 #[test]
@@ -360,6 +913,103 @@ fn test_mcp_workspace_search() {
 }
 
 #[test]
+fn test_mcp_workspace_search_fulltext_hides_direct_hidden_sensitive_file() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "hidden_sensitive_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "hidden/sensitive direct .md share should be filtered: {content}"
+    );
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_children() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "directory_visible_fulltext_marker OR directory_sensitive_fulltext_marker OR directory_hidden_fulltext_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "only public directory markdown should match: {content}"
+    );
+    assert_eq!(results[0]["path"], "docs");
+    assert!(!content.contains("directory_sensitive_fulltext_marker"));
+    assert!(!content.contains("directory_hidden_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_revalidates_stale_directory_beyond_refresh_window() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_stale_directory_fulltext_beyond_refresh_window(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "stale_hidden_beyond_window_marker"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(
+        results.is_empty(),
+        "stale directory aggregate beyond refresh window should be revalidated: {content}"
+    );
+}
+
+#[test]
 fn test_mcp_list_groups() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_data(&db_path);
@@ -384,6 +1034,7 @@ fn test_mcp_list_groups() {
     let groups: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert_eq!(groups[0]["name"], "seed-group");
     assert!(groups[0]["projects"].as_array().unwrap().len() > 0);
+    assert_eq!(groups[0]["projects"][0]["slug"], "seed-proj");
 }
 
 #[test]
@@ -461,6 +1112,7 @@ fn test_mcp_list_projects() {
         .unwrap();
     let projects: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert_eq!(projects[0]["name"], "seed-proj");
+    assert_eq!(projects[0]["slug"], "seed-proj");
     assert!(projects[0]["groups"].as_array().unwrap().len() > 0);
 }
 
@@ -680,6 +1332,96 @@ fn test_mcp_project_tree_invalid_project() {
     assert_eq!(result["isError"], true);
     let text = result["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("not found"));
+}
+
+#[test]
+fn test_mcp_project_tree_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_still_hides_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "include_hidden": true }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_and_sensitive_shows_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": {
+                    "project_id": 1,
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains(".ssh"));
+    assert!(content.contains("id_rsa"));
+    assert!(content.contains("private.key"));
 }
 
 // --- workspace_read by project_id+path tests ---
@@ -931,6 +1673,94 @@ fn test_mcp_workspace_read_both_params_error() {
     assert_eq!(responses[0]["error"]["code"], -32602);
 }
 
+#[test]
+fn test_mcp_workspace_read_by_path_blocks_hidden_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": ".env" }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Access denied")
+    );
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_allows_hidden_sensitive_with_opt_in() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": ".env",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "secret_env_marker\n");
+}
+
+#[test]
+fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "." }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains(".ssh"));
+    assert!(!content.contains("private.key"));
+}
+
 // --- project_grep tests ---
 
 #[test]
@@ -1069,4 +1899,64 @@ fn test_mcp_project_grep_no_matches() {
         .as_str()
         .unwrap();
     assert_eq!(content, "");
+}
+
+#[test]
+fn test_mcp_project_grep_hides_hidden_and_sensitive_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "marker" }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("visible.txt"));
+    assert!(!content.contains(".hidden.txt"));
+    assert!(!content.contains(".env"));
+    assert!(!content.contains("private.key"));
+    assert!(!content.contains("id_rsa"));
+}
+
+#[test]
+fn test_mcp_project_grep_include_hidden_and_sensitive_finds_sensitive() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "secret_env_marker",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".env"));
+    assert!(content.contains("secret_env_marker"));
 }

@@ -70,6 +70,31 @@ Project B ──┘
 | Project note | Project | Yes | **No** |
 | Group note | Group | No | Yes (all members) |
 
+## Service Graphs and Events
+
+Use groups for projects that should see each other's shared context. Use service links when one project depends on another service at runtime or operationally:
+
+```bash
+ai-workspace link add billing-api auth-service --kind depends_on
+```
+
+The link direction is intentional: `billing-api --depends_on--> auth-service` means auth events affect billing.
+
+Use artifact dependencies when a shared file or directory needs a specific reaction if a service changes:
+
+```bash
+ai-workspace artifact depends specs/auth.md auth-service --kind references --reaction update
+```
+
+When a service changes, create an event and check affected inboxes:
+
+```bash
+RUST_LOG=debug ai-workspace event create --kind service_changed --source auth-service --title "Auth contract changed"
+ai-workspace event inbox
+```
+
+`RUST_LOG=debug` is useful when troubleshooting event impact calculation because it logs link matches and artifact dependency matches. Destroying a project creates a `service_deleted` event before the project row is removed, so related projects can still inspect the source snapshot and affected artifacts.
+
 ## Quick Start
 
 ### 1. Initialize projects
@@ -85,6 +110,8 @@ ai-workspace init --group backend
 Both projects now belong to the `backend` group.
 
 Key project files (`README*`, `Cargo.toml`, `package.json`, `go.mod`, etc.) are automatically shared on first `init` — no manual `share` needed for common files. This auto-share is skipped when `.ai-workspace.json` is present.
+
+If `.ai-workspace.json` exists, `init` also reads the optional project `slug`, shared entry `kind`, and shared entry `dependencies` metadata. This lets a committed config restore directory shares and artifact dependencies without exporting event history.
 
 ### 2. Share files
 
@@ -131,7 +158,7 @@ ai-workspace serve
 
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
 
-The server exposes 7 tools: `workspace_context`, `workspace_read`, `workspace_search`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first.
+The server exposes 11 tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first. By default, MCP project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`.
 
 ## Data Storage
 

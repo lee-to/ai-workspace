@@ -7,8 +7,34 @@ use std::path::Path;
 pub struct Project {
     pub id: i64,
     pub name: String,
+    pub slug: String,
     pub path: String,
     pub created_at: String,
+}
+
+pub fn normalize_project_slug(input: &str) -> String {
+    let mut slug = String::new();
+    let mut previous_dash = false;
+
+    for ch in input.chars().flat_map(|ch| ch.to_lowercase()) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            previous_dash = false;
+        } else if !previous_dash && !slug.is_empty() {
+            slug.push('-');
+            previous_dash = true;
+        }
+    }
+
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -55,6 +81,192 @@ impl std::str::FromStr for SharedItemKind {
     }
 }
 
+macro_rules! string_enum {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($variant:ident => $value:literal),+ $(,)?
+        }
+    ) => {
+        $(#[$meta])*
+        #[allow(dead_code)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum $name {
+            $($variant),+
+        }
+
+        #[allow(dead_code)]
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $value),+
+                }
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(self.as_str())
+            }
+        }
+
+        impl std::str::FromStr for $name {
+            type Err = anyhow::Error;
+
+            fn from_str(s: &str) -> Result<Self, Self::Err> {
+                match s {
+                    $($value => Ok(Self::$variant),)+
+                    _ => Err(anyhow::anyhow!(
+                        "unknown {} value: {}",
+                        stringify!($name),
+                        s
+                    )),
+                }
+            }
+        }
+    };
+}
+
+string_enum! {
+    pub enum ServiceLinkKind {
+        DependsOn => "depends_on",
+        RelatedTo => "related_to",
+    }
+}
+
+string_enum! {
+    pub enum ArtifactDependencyKind {
+        References => "references",
+        ConsumesApi => "consumes_api",
+        Documents => "documents",
+        Configures => "configures",
+    }
+}
+
+string_enum! {
+    pub enum ArtifactReaction {
+        Inspect => "inspect",
+        Update => "update",
+        Delete => "delete",
+        RemoveReference => "remove_reference",
+    }
+}
+
+string_enum! {
+    pub enum WorkspaceEventKind {
+        ServiceDeleted => "service_deleted",
+        ServiceChanged => "service_changed",
+        ArtifactChanged => "artifact_changed",
+    }
+}
+
+string_enum! {
+    pub enum EventSeverity {
+        Info => "info",
+        Warning => "warning",
+        Error => "error",
+        Critical => "critical",
+    }
+}
+
+string_enum! {
+    pub enum EventStatus {
+        Open => "open",
+        Closed => "closed",
+    }
+}
+
+string_enum! {
+    pub enum EventTargetRelationKind {
+        LinkedService => "linked_service",
+        ArtifactDependency => "artifact_dependency",
+    }
+}
+
+string_enum! {
+    pub enum EventTargetStatus {
+        Open => "open",
+        Resolved => "resolved",
+    }
+}
+
+string_enum! {
+    pub enum EventArtifactStatus {
+        Open => "open",
+        Resolved => "resolved",
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ServiceLink {
+    pub id: i64,
+    pub from_project_id: i64,
+    pub to_project_id: i64,
+    pub kind: ServiceLinkKind,
+    pub label: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct ArtifactDependency {
+    pub id: i64,
+    pub shared_item_id: i64,
+    pub depends_on_project_id: Option<i64>,
+    pub depends_on_project_slug_snapshot: String,
+    pub kind: ArtifactDependencyKind,
+    pub reaction: ArtifactReaction,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct WorkspaceEvent {
+    pub id: i64,
+    pub source_project_id: Option<i64>,
+    pub source_project_slug: String,
+    pub source_project_name: String,
+    pub group_id: Option<i64>,
+    pub kind: WorkspaceEventKind,
+    pub title: String,
+    pub body: Option<String>,
+    pub severity: EventSeverity,
+    pub status: EventStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EventTarget {
+    pub id: i64,
+    pub event_id: i64,
+    pub affected_project_id: Option<i64>,
+    pub relation_kind: EventTargetRelationKind,
+    pub status: EventTargetStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct EventArtifact {
+    pub id: i64,
+    pub event_id: i64,
+    pub affected_project_id: Option<i64>,
+    pub shared_item_id: Option<i64>,
+    pub path_snapshot: String,
+    pub reaction: ArtifactReaction,
+    pub reason: String,
+    pub status: EventArtifactStatus,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SharedItem {
     pub id: i64,
@@ -88,29 +300,63 @@ pub struct FileSearchHit {
 
 // --- Workspace Config (for .ai-workspace.json) ---
 
+/// An artifact dependency entry in the config file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DependencyEntry {
+    pub service: String,
+    pub kind: ArtifactDependencyKind,
+    pub reaction: ArtifactReaction,
+}
+
+fn option_vec_is_none<T>(value: &Option<Vec<T>>) -> bool {
+    value.is_none()
+}
+
 /// A shared item entry in the config file.
-/// String form = path only (no label). Object form = path + label.
+/// String form = legacy path only. Object form can include label, kind, and dependencies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum ShareEntry {
     /// Just a path string, no label
     PathOnly(String),
-    /// Object with path and optional label
-    WithLabel { path: String, label: String },
+    /// Object with path and optional metadata
+    WithMetadata {
+        path: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<SharedItemKind>,
+        #[serde(default, skip_serializing_if = "option_vec_is_none")]
+        dependencies: Option<Vec<DependencyEntry>>,
+    },
 }
 
 impl ShareEntry {
     pub fn path(&self) -> &str {
         match self {
             ShareEntry::PathOnly(p) => p,
-            ShareEntry::WithLabel { path, .. } => path,
+            ShareEntry::WithMetadata { path, .. } => path,
         }
     }
 
     pub fn label(&self) -> Option<&str> {
         match self {
             ShareEntry::PathOnly(_) => None,
-            ShareEntry::WithLabel { label, .. } => Some(label),
+            ShareEntry::WithMetadata { label, .. } => label.as_deref(),
+        }
+    }
+
+    pub fn kind(&self) -> Option<SharedItemKind> {
+        match self {
+            ShareEntry::PathOnly(_) => None,
+            ShareEntry::WithMetadata { kind, .. } => *kind,
+        }
+    }
+
+    pub fn dependencies(&self) -> Option<&[DependencyEntry]> {
+        match self {
+            ShareEntry::PathOnly(_) => None,
+            ShareEntry::WithMetadata { dependencies, .. } => dependencies.as_deref(),
         }
     }
 }
@@ -127,6 +373,8 @@ pub struct NoteEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkspaceConfig {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slug: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -142,6 +390,9 @@ pub struct SyncReport {
     pub groups_removed: usize,
     pub shares_added: usize,
     pub shares_removed: usize,
+    pub dependencies_added: usize,
+    pub dependencies_removed: usize,
+    pub dependencies_updated: usize,
     pub notes_added: usize,
     pub notes_removed: usize,
     pub notes_updated: usize,
@@ -237,6 +488,7 @@ mod tests {
         let project = Project {
             id: 1,
             name: "test".to_string(),
+            slug: "test".to_string(),
             path: "/tmp/test".to_string(),
             created_at: "2024-01-01".to_string(),
         };
@@ -244,6 +496,58 @@ mod tests {
         let parsed: Project = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.id, 1);
         assert_eq!(parsed.name, "test");
+        assert_eq!(parsed.slug, "test");
+    }
+
+    #[test]
+    fn normalize_project_slug_handles_names() {
+        assert_eq!(normalize_project_slug("Auth Service"), "auth-service");
+        assert_eq!(normalize_project_slug("  Billing_API!! "), "billing-api");
+        assert_eq!(normalize_project_slug("!!!"), "project");
+    }
+
+    #[test]
+    fn service_event_enums_roundtrip() {
+        assert_eq!(ServiceLinkKind::DependsOn.as_str(), "depends_on");
+        assert_eq!(
+            ServiceLinkKind::from_str("depends_on").unwrap(),
+            ServiceLinkKind::DependsOn
+        );
+        assert_eq!(ArtifactDependencyKind::ConsumesApi.as_str(), "consumes_api");
+        assert_eq!(
+            ArtifactReaction::RemoveReference.as_str(),
+            "remove_reference"
+        );
+        assert_eq!(
+            WorkspaceEventKind::ServiceDeleted.as_str(),
+            "service_deleted"
+        );
+        assert_eq!(EventSeverity::Warning.as_str(), "warning");
+        assert_eq!(EventStatus::Closed.as_str(), "closed");
+        assert_eq!(
+            EventTargetRelationKind::ArtifactDependency.as_str(),
+            "artifact_dependency"
+        );
+        assert_eq!(EventTargetStatus::Resolved.as_str(), "resolved");
+        assert_eq!(EventArtifactStatus::Open.as_str(), "open");
+        assert!(WorkspaceEventKind::from_str("unknown").is_err());
+    }
+
+    #[test]
+    fn service_link_serde_uses_snake_case_kind() {
+        let link = ServiceLink {
+            id: 1,
+            from_project_id: 10,
+            to_project_id: 20,
+            kind: ServiceLinkKind::DependsOn,
+            label: Some("runtime dependency".to_string()),
+            created_at: "2026-01-01".to_string(),
+            updated_at: "2026-01-01".to_string(),
+        };
+        let json = serde_json::to_string(&link).unwrap();
+        assert!(json.contains("\"kind\":\"depends_on\""));
+        let parsed: ServiceLink = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind, ServiceLinkKind::DependsOn);
     }
 
     #[test]
@@ -281,9 +585,11 @@ mod tests {
 
     #[test]
     fn share_entry_with_label_serde() {
-        let entry = ShareEntry::WithLabel {
+        let entry = ShareEntry::WithMetadata {
             path: "config.yml".to_string(),
-            label: "deploy config".to_string(),
+            label: Some("deploy config".to_string()),
+            kind: None,
+            dependencies: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let parsed: ShareEntry = serde_json::from_str(&json).unwrap();
@@ -292,15 +598,39 @@ mod tests {
     }
 
     #[test]
+    fn share_entry_with_kind_and_dependencies_serde() {
+        let entry = ShareEntry::WithMetadata {
+            path: "docs/auth.md".to_string(),
+            label: Some("auth docs".to_string()),
+            kind: Some(SharedItemKind::File),
+            dependencies: Some(vec![DependencyEntry {
+                service: "auth".to_string(),
+                kind: ArtifactDependencyKind::References,
+                reaction: ArtifactReaction::Update,
+            }]),
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains("\"kind\":\"file\""));
+        assert!(json.contains("\"service\":\"auth\""));
+        let parsed: ShareEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.path(), "docs/auth.md");
+        assert_eq!(parsed.kind(), Some(SharedItemKind::File));
+        assert_eq!(parsed.dependencies().unwrap()[0].service, "auth");
+    }
+
+    #[test]
     fn workspace_config_serde_roundtrip() {
         let config = WorkspaceConfig {
             name: "my-project".to_string(),
+            slug: Some("my-project".to_string()),
             groups: vec!["team-a".to_string()],
             share: vec![
                 ShareEntry::PathOnly("README.md".to_string()),
-                ShareEntry::WithLabel {
+                ShareEntry::WithMetadata {
                     path: "api.json".to_string(),
-                    label: "API spec".to_string(),
+                    label: Some("API spec".to_string()),
+                    kind: Some(SharedItemKind::File),
+                    dependencies: None,
                 },
             ],
             notes: vec![NoteEntry {
@@ -317,6 +647,7 @@ mod tests {
     fn workspace_config_empty_fields_omitted() {
         let config = WorkspaceConfig {
             name: "minimal".to_string(),
+            slug: None,
             groups: vec![],
             share: vec![],
             notes: vec![],
@@ -334,6 +665,7 @@ mod tests {
 
         let config = WorkspaceConfig {
             name: "test-proj".to_string(),
+            slug: None,
             groups: vec!["grp".to_string()],
             share: vec![ShareEntry::PathOnly("file.txt".to_string())],
             notes: vec![NoteEntry {

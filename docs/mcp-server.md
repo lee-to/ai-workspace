@@ -71,7 +71,7 @@ Get workspace metadata: all projects, their groups, and shared items (no file co
 
 **Parameters:** none
 
-**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label). Each group includes its member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
+**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ### `workspace_read`
 
@@ -84,6 +84,8 @@ Read the content of a shared file, directory, or note. Supports two modes: by sh
 | `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`rel_path`) |
 | `project_id` | integer | — | Project ID to read from (use with `rel_path`) |
 | `rel_path` | string | — | Relative path within the project (use with `project_id`) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
 Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing both returns an `invalid_params` error.
 
@@ -95,6 +97,7 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - `project_id`+`rel_path` is limited to an explicitly shared file or a path inside an explicitly shared directory by default
 - Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads
 - Path traversal protection: rejects absolute paths, parent-directory traversal, and paths outside the project directory
+- Hidden/dotfile and credential-like paths are blocked by default. Hidden sensitive paths such as `.ssh/id_rsa` require both `include_hidden: true` and `include_sensitive: true`.
 
 ### `workspace_search`
 
@@ -140,10 +143,56 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
-- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call).
+- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
+- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call); matching directory hits are revalidated before snippets are returned so stale aggregates cannot expose hidden/sensitive child content.
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
+
+### `workspace_service_graph`
+
+Inspect directional service links for all projects, a specific group, or the group graphs around one project.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project` | string | no | Project id, slug, or registered path whose group graphs should be returned |
+| `project_id` | integer | no | Project ID whose group graphs should be returned |
+| `group_id` | integer | no | Group ID whose service graph should be returned |
+
+Pass at most one selector. With no selector, the tool returns all service links.
+
+**Returns:** JSON object with a `scope` object and a `links` array. For project-scoped requests, `scope.groups` lists every group included in the graph. Each link includes id, source/target project ids and slugs, kind, label, and timestamps.
+
+### `workspace_events`
+
+List workspace events or show a project's open event inbox.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project` | string | no | Project id, slug, or registered path for inbox mode |
+| `project_id` | integer | no | Project ID for inbox mode |
+| `source` | string | no | Source service slug filter for list mode |
+| `status` | string | no | Event status filter: `open` or `closed` |
+
+Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists events and applies the optional filters.
+
+**Returns:** JSON array of events with source snapshots, kind, title, body, severity, status, and timestamps.
+
+### `workspace_event_details`
+
+Get one event with affected services and affected artifacts.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `event_id` | integer | yes | Workspace event ID |
+
+**Returns:** JSON object with `event`, `affected_services`, and `affected_artifacts`. Artifact entries include path snapshots and recommended reactions.
 
 ### `project_tree`
 
@@ -156,8 +205,10 @@ List the shared file tree of a project, respecting `.gitignore` rules. By defaul
 | `project_id` | integer | yes | The project ID |
 | `subdir` | string | no | Subdirectory to list. By default it must intersect a shared scope |
 | `max_depth` | integer | no | Maximum traversal depth (1 = immediate children only, default: unlimited) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.
+**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown. Hidden/dotfile and credential-like paths are hidden by default; hidden sensitive paths require both opt-in flags.
 
 **Example output:**
 ```
@@ -178,8 +229,10 @@ Search shared project files for a regex pattern, respecting `.gitignore` rules. 
 | `project_id` | integer | yes | The project ID |
 | `pattern` | string | yes | Regex pattern to search for |
 | `glob` | string | no | Glob to filter files (e.g. `*.rs`) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files and files larger than 1 MB. Unshared files are not opened in the default mode.
+**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files, files larger than 1 MB, and hidden/dotfile or credential-like paths unless explicitly included. Unshared files are not opened in the default mode.
 
 **Example output:**
 ```

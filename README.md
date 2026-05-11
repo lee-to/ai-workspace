@@ -88,7 +88,8 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 8 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
+That's it. The agent now has access to 11 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
+By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
 
@@ -122,19 +123,25 @@ Once connected, you can talk to your AI agent naturally. Here are some examples:
 - *"Before I refactor this model, check if other projects share files that depend on it"*
 - *"Read the shared style guide and apply it to this component"*
 
-The agent will automatically call the right MCP tools (`workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`) to answer these.
+The agent will automatically call the right MCP tools (`workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`) to answer these.
 
 ## CLI at a glance
 
 | Command | What it does |
 |---------|-------------|
-| `init --group <name>` | Register project, join/create a group, auto-share key files |
+| `init --slug <slug> --group <name>` | Register project, set a stable slug, join/create a group, auto-share key files |
 | `share <path> --label <label>` | Share a file or directory |
 | `note <text> --group <name>` | Add a group-scoped note |
 | `edit <target> --content/--label/--scope` | Edit a shared item |
 | `rm <target>` | Remove a shared item |
 | `leave <group>` | Remove project from a group |
 | `delete-group <group>` | Delete a group entirely |
+| `link add <from> <to> --kind depends_on` | Connect services with a directional relationship |
+| `link list [--project <slug>]` | Inspect service links and group graphs |
+| `artifact depends <item> <slug> --kind references --reaction update` | Mark shared artifacts that depend on a service |
+| `artifact deps [item]` | List artifact dependency metadata |
+| `event create --kind service_changed --source <slug>` | Create service events and calculate affected projects/artifacts |
+| `event inbox` | Show open events affecting the current project |
 | `destroy [target]` | Remove current or targeted project from ai-workspace (keeps files) |
 | `status` | Show project info, groups, and items |
 | `export` | Export project config to `.ai-workspace.json` |
@@ -157,15 +164,15 @@ git add .ai-workspace.json
 git commit -m "chore: add shared workspace config"
 ```
 
-When a teammate clones the repo and runs `init`, they automatically get the same groups, shared files, and notes:
+When a teammate clones the repo and runs `init`, they automatically get the same groups, stable slug, shared files/directories, notes, and artifact dependency metadata:
 
 ```bash
 cd ~/cloned-repo
 ai-workspace init
-# → picks up name, groups, shares, and notes from .ai-workspace.json
+# → picks up name, slug, groups, shares, notes, and dependencies from .ai-workspace.json
 ```
 
-The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with `.ai-workspace.json` if present.
+The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with `.ai-workspace.json` if present. Event history is intentionally not exported.
 
 ## Documentation
 
