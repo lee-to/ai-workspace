@@ -162,10 +162,34 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
         BEGIN
             DELETE FROM files_fts WHERE rowid = OLD.id;
         END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_shared_items_delete_notes_fts
+        AFTER DELETE ON shared_items
+        WHEN OLD.kind = 'note'
+        BEGIN
+            DELETE FROM notes_fts WHERE rowid = OLD.id;
+        END;
         ",
     )?;
+    remove_orphaned_notes_fts_rows(conn)?;
     debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
     ensure_event_schema_objects(conn)?;
+    Ok(())
+}
+
+fn remove_orphaned_notes_fts_rows(conn: &Connection) -> Result<()> {
+    let removed = conn
+        .execute(
+            "DELETE FROM notes_fts
+             WHERE rowid NOT IN (
+                 SELECT id FROM shared_items WHERE kind = 'note'
+             )",
+            [],
+        )
+        .context("Failed to remove orphaned notes_fts rows")?;
+    if removed > 0 {
+        debug!("Removed {} orphaned notes_fts rows", removed);
+    }
     Ok(())
 }
 
@@ -404,6 +428,56 @@ mod tests {
             )
             .unwrap();
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn deleting_note_removes_notes_fts_row() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO projects (name, slug, path) VALUES ('p', 'p', '/tmp/p')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO shared_items (kind, content, project_id) VALUES ('note', 'hello', 1)",
+            [],
+        )
+        .unwrap();
+        let note_id = conn.last_insert_rowid();
+        conn.execute(
+            "INSERT INTO notes_fts (rowid, label, content) VALUES (?1, 'ctx', 'hello')",
+            params![note_id],
+        )
+        .unwrap();
+
+        conn.execute("DELETE FROM shared_items WHERE id = ?1", params![note_id])
+            .unwrap();
+
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE rowid = ?1",
+                params![note_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn init_db_removes_orphaned_notes_fts_rows() {
+        let conn = mem_conn();
+        conn.execute(
+            "INSERT INTO notes_fts (rowid, label, content) VALUES (99, 'orphan', 'stale')",
+            [],
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM notes_fts", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(n, 0);
     }
 
     #[test]

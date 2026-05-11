@@ -191,16 +191,6 @@ impl Db {
         info!("Deleting project {}", project_id);
         let tx = self.conn.unchecked_transaction()?;
 
-        // Clean up FTS entries for project-scoped notes
-        tx.execute(
-            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
-            params![project_id],
-        )?;
-        // Clean up FTS entries for group-scoped notes created by this project
-        tx.execute(
-            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
-            params![project_id],
-        )?;
         // created_by_project_id does not cascade in the schema, so remove those first.
         tx.execute(
             "DELETE FROM shared_items WHERE created_by_project_id = ?1",
@@ -370,16 +360,6 @@ impl Db {
             );
         }
 
-        tx.execute(
-            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE project_id = ?1 AND kind = 'note')",
-            params![project_id],
-        )
-        .context("Failed to clean project note FTS rows during destroy")?;
-        tx.execute(
-            "DELETE FROM notes_fts WHERE rowid IN (SELECT id FROM shared_items WHERE created_by_project_id = ?1 AND kind = 'note')",
-            params![project_id],
-        )
-        .context("Failed to clean group note FTS rows during destroy")?;
         tx.execute(
             "DELETE FROM shared_items WHERE created_by_project_id = ?1",
             params![project_id],
@@ -1793,12 +1773,6 @@ impl Db {
         let affected = self
             .conn
             .execute("DELETE FROM shared_items WHERE id = ?1", params![id])?;
-        if affected > 0 {
-            // Clean up FTS (entry may not exist for non-note items)
-            let _ = self
-                .conn
-                .execute("DELETE FROM notes_fts WHERE rowid = ?1", params![id]);
-        }
         Ok(affected > 0)
     }
 
@@ -1811,11 +1785,6 @@ impl Db {
             "DELETE FROM shared_items WHERE id = ?1 AND (project_id = ?2 OR created_by_project_id = ?2)",
             params![id, project_id],
         )?;
-        if affected > 0 {
-            let _ = self
-                .conn
-                .execute("DELETE FROM notes_fts WHERE rowid = ?1", params![id]);
-        }
         Ok(affected > 0)
     }
 
@@ -2562,7 +2531,6 @@ impl Db {
             if !matched_db_ids.contains(id) {
                 debug!("sync: removing note id={} label={:?}", id, label);
                 tx.execute("DELETE FROM shared_items WHERE id = ?1", params![id])?;
-                let _ = tx.execute("DELETE FROM notes_fts WHERE rowid = ?1", params![id]);
                 report.notes_removed += 1;
             }
         }
@@ -2755,6 +2723,22 @@ mod tests {
         Db::open(tmp.path()).unwrap()
     }
 
+    fn notes_fts_row_count(db: &Db) -> i64 {
+        db.conn
+            .query_row("SELECT COUNT(*) FROM notes_fts", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn notes_fts_row_count_for(db: &Db, id: i64) -> i64 {
+        db.conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE rowid = ?1",
+                params![id],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+
     // --- Projects ---
 
     #[test]
@@ -2871,12 +2855,14 @@ mod tests {
         let note_id = db
             .add_group_note(gid, pid, "group note", Some("ctx"))
             .unwrap();
+        assert_eq!(notes_fts_row_count_for(&db, note_id), 1);
 
         db.delete_project(pid).unwrap();
 
         assert!(db.get_project_by_id(pid).unwrap().is_none());
         assert!(db.get_item_by_id(note_id).unwrap().is_none());
         assert!(db.search_items("group note").unwrap().is_empty());
+        assert_eq!(notes_fts_row_count_for(&db, note_id), 0);
     }
 
     #[test]
@@ -3040,13 +3026,15 @@ mod tests {
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
         let gid = db.get_or_create_group("grp").unwrap();
         db.add_project_to_group(pid, gid).unwrap();
-        db.add_group_note(gid, pid, "group note", None).unwrap();
+        let note_id = db.add_group_note(gid, pid, "group note", None).unwrap();
+        assert_eq!(notes_fts_row_count_for(&db, note_id), 1);
 
         db.delete_group(gid).unwrap();
 
         assert!(db.get_group_by_name("grp").unwrap().is_none());
         assert_eq!(db.get_groups_for_project(pid).unwrap().len(), 0);
         assert_eq!(db.get_all_items_for_group(gid).unwrap().len(), 0);
+        assert_eq!(notes_fts_row_count_for(&db, note_id), 0);
     }
 
     // --- Service Links ---
@@ -3842,8 +3830,25 @@ mod tests {
             .unwrap();
 
         assert!(!db.search_items("searchable").unwrap().is_empty());
+        assert_eq!(notes_fts_row_count_for(&db, id), 1);
         db.remove_shared_item(id).unwrap();
         assert!(db.search_items("searchable").unwrap().is_empty());
+        assert_eq!(notes_fts_row_count_for(&db, id), 0);
+    }
+
+    #[test]
+    fn remove_group_note_cleans_fts() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let gid = db.get_or_create_group("grp").unwrap();
+        db.add_project_to_group(pid, gid).unwrap();
+        let id = db
+            .add_group_note(gid, pid, "group searchable content", None)
+            .unwrap();
+
+        assert_eq!(notes_fts_row_count(&db), 1);
+        assert!(db.remove_shared_item(id).unwrap());
+        assert_eq!(notes_fts_row_count(&db), 0);
     }
 
     // --- Group aggregation ---
