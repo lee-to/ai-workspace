@@ -2075,7 +2075,11 @@ impl Db {
                             path: path.clone(),
                             label: item.label.clone(),
                             kind: Some(item.kind),
-                            dependencies: Some(dependencies),
+                            dependencies: if dependencies.is_empty() {
+                                None
+                            } else {
+                                Some(dependencies)
+                            },
                         };
                         shares.push(entry);
                     }

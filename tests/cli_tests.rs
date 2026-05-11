@@ -1334,10 +1334,7 @@ fn test_export_creates_json() {
     assert_eq!(config["share"][0]["path"], "readme.md");
     assert_eq!(config["share"][0]["label"], "docs");
     assert_eq!(config["share"][0]["kind"], "file");
-    assert_eq!(
-        config["share"][0]["dependencies"].as_array().unwrap().len(),
-        0
-    );
+    assert!(config["share"][0]["dependencies"].is_null());
     assert_eq!(config["notes"][0]["content"], "important note");
 }
 

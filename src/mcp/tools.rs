@@ -819,7 +819,10 @@ fn workspace_service_graph(
         }
     } else if let Some(project_id) = project_id {
         match db.get_project_by_id(project_id) {
-            Ok(Some(project)) => service_graph_for_project(db, &project),
+            Ok(Some(project)) => match service_graph_for_project(db, &project) {
+                Ok(graph) => graph,
+                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
+            },
             Ok(None) => {
                 warn!(
                     "workspace_service_graph: project_id={} not found",
@@ -831,7 +834,10 @@ fn workspace_service_graph(
         }
     } else if let Some(project) = project {
         match db.resolve_project_target(project) {
-            Ok(Some(project)) => service_graph_for_project(db, &project),
+            Ok(Some(project)) => match service_graph_for_project(db, &project) {
+                Ok(graph) => graph,
+                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
+            },
             Ok(None) => {
                 warn!("workspace_service_graph: project='{}' not found", project);
                 return tool_error(id, &format!("Project '{}' not found", project));
@@ -861,47 +867,54 @@ fn workspace_service_graph(
 fn service_graph_for_project(
     db: &Db,
     project: &crate::models::Project,
-) -> (serde_json::Value, Vec<crate::models::ServiceLink>) {
+) -> anyhow::Result<(serde_json::Value, Vec<crate::models::ServiceLink>)> {
     debug!(
         "workspace_service_graph: listing graph for project id={} slug='{}'",
         project.id, project.slug
     );
-    let groups = db.get_groups_for_project(project.id).unwrap_or_default();
-    if let Some(group) = groups.first() {
-        let links = db.list_group_service_links(group.id).unwrap_or_default();
-        (
-            serde_json::json!({
-                "project_id": project.id,
-                "project": project.slug,
-                "group_id": group.id,
-                "group": group.name
-            }),
-            links,
-        )
-    } else {
+    let groups = db.get_groups_for_project(project.id)?;
+    if groups.is_empty() {
         warn!(
             "workspace_service_graph: project slug='{}' has no groups; returning direct links",
             project.slug
         );
-        let mut links = db
-            .list_outgoing_service_links(project.id)
-            .unwrap_or_default();
-        for link in db
-            .list_incoming_service_links(project.id)
-            .unwrap_or_default()
-        {
+        let mut links = db.list_outgoing_service_links(project.id)?;
+        for link in db.list_incoming_service_links(project.id)? {
             if !links.iter().any(|existing| existing.id == link.id) {
                 links.push(link);
             }
         }
-        (
+        return Ok((
             serde_json::json!({
                 "project_id": project.id,
                 "project": project.slug
             }),
             links,
-        )
+        ));
     }
+
+    let mut links: Vec<crate::models::ServiceLink> = Vec::new();
+    let mut scope_groups = Vec::new();
+    for group in groups {
+        scope_groups.push(serde_json::json!({
+            "id": group.id,
+            "name": group.name
+        }));
+        for link in db.list_group_service_links(group.id)? {
+            if !links.iter().any(|existing| existing.id == link.id) {
+                links.push(link);
+            }
+        }
+    }
+
+    Ok((
+        serde_json::json!({
+            "project_id": project.id,
+            "project": project.slug,
+            "groups": scope_groups
+        }),
+        links,
+    ))
 }
 
 fn workspace_events(
@@ -1249,10 +1262,63 @@ mod tests {
             .to_string();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["scope"]["project"], "api");
-        assert_eq!(parsed["scope"]["group"], "platform");
+        assert_eq!(parsed["scope"]["groups"][0]["name"], "platform");
         assert_eq!(parsed["links"][0]["from"], "api");
         assert_eq!(parsed["links"][0]["to"], "auth");
         assert_eq!(parsed["links"][0]["kind"], "depends_on");
+    }
+
+    #[test]
+    fn workspace_service_graph_returns_all_project_group_links() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth-multi-mcp", Some("auth"))
+            .unwrap();
+        let api = db
+            .create_project_with_slug("API", "/tmp/api-multi-mcp", Some("api"))
+            .unwrap();
+        let web = db
+            .create_project_with_slug("Web", "/tmp/web-multi-mcp", Some("web"))
+            .unwrap();
+        let platform = db.get_or_create_group("platform").unwrap();
+        let frontend = db.get_or_create_group("frontend").unwrap();
+        db.add_project_to_group(auth, platform).unwrap();
+        db.add_project_to_group(api, platform).unwrap();
+        db.add_project_to_group(api, frontend).unwrap();
+        db.add_project_to_group(web, frontend).unwrap();
+        db.create_service_link(
+            "api",
+            "auth",
+            crate::models::ServiceLinkKind::DependsOn,
+            Some("JWT"),
+        )
+        .unwrap();
+        db.create_service_link(
+            "web",
+            "api",
+            crate::models::ServiceLinkKind::DependsOn,
+            Some("API"),
+        )
+        .unwrap();
+
+        let resp = workspace_service_graph(json!(1), Some("api"), None, None, &db);
+        assert!(resp.error.is_none());
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["scope"]["project"], "api");
+        assert_eq!(parsed["scope"]["groups"].as_array().unwrap().len(), 2);
+
+        let links = parsed["links"].as_array().unwrap();
+        assert_eq!(links.len(), 2);
+        assert!(links.iter().any(|link| {
+            link["from"] == serde_json::json!("api") && link["to"] == serde_json::json!("auth")
+        }));
+        assert!(links.iter().any(|link| {
+            link["from"] == serde_json::json!("web") && link["to"] == serde_json::json!("api")
+        }));
     }
 
     #[test]

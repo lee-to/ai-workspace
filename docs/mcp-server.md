@@ -128,19 +128,19 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 
 ### `workspace_service_graph`
 
-Inspect directional service links for all projects, a specific group, or the group graph around one project.
+Inspect directional service links for all projects, a specific group, or the group graphs around one project.
 
 **Parameters:**
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
-| `project` | string | no | Project id, slug, or registered path whose group graph should be returned |
-| `project_id` | integer | no | Project ID whose group graph should be returned |
+| `project` | string | no | Project id, slug, or registered path whose group graphs should be returned |
+| `project_id` | integer | no | Project ID whose group graphs should be returned |
 | `group_id` | integer | no | Group ID whose service graph should be returned |
 
 Pass at most one selector. With no selector, the tool returns all service links.
 
-**Returns:** JSON object with a `scope` object and a `links` array. Each link includes id, source/target project ids and slugs, kind, label, and timestamps.
+**Returns:** JSON object with a `scope` object and a `links` array. For project-scoped requests, `scope.groups` lists every group included in the graph. Each link includes id, source/target project ids and slugs, kind, label, and timestamps.
 
 ### `workspace_events`
 
