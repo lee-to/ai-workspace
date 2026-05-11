@@ -1,7 +1,7 @@
 /target
 .idea/
-.claude
-.codex
+/.claude/
+/.codex/
 .ai-factory/PLAN.md
 .env
 .env.*
