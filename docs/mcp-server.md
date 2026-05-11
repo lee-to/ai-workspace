@@ -64,6 +64,8 @@ Read the content of a shared file, directory, or note. Supports two modes: by sh
 | `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`rel_path`) |
 | `project_id` | integer | — | Project ID to read from (use with `rel_path`) |
 | `rel_path` | string | — | Relative path within the project (use with `project_id`) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
 Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing both returns an `invalid_params` error.
 
@@ -72,6 +74,7 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - **Directory:** returns listing of filenames
 - **Note:** returns note content (only via `item_id`)
 - Path traversal protection: rejects paths outside the project directory
+- Hidden/dotfile and credential-like paths are blocked by default. Hidden sensitive paths such as `.ssh/id_rsa` require both `include_hidden: true` and `include_sensitive: true`.
 
 ### `workspace_search`
 
@@ -117,7 +120,8 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
-- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call).
+- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
+- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call); matching directory hits are revalidated before snippets are returned so stale aggregates cannot expose hidden/sensitive child content.
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
@@ -178,8 +182,10 @@ List the file tree of a project, respecting `.gitignore` rules.
 | `project_id` | integer | yes | The project ID |
 | `subdir` | string | no | Subdirectory to list (relative to project root) |
 | `max_depth` | integer | no | Maximum traversal depth (1 = immediate children only, default: unlimited) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown.
+**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown. Hidden/dotfile and credential-like paths are hidden by default; hidden sensitive paths require both opt-in flags.
 
 **Example output:**
 ```
@@ -201,8 +207,10 @@ Search project files for a regex pattern, respecting `.gitignore` rules.
 | `project_id` | integer | yes | The project ID |
 | `pattern` | string | yes | Regex pattern to search for |
 | `glob` | string | no | Glob to filter files (e.g. `*.rs`) |
+| `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
+| `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files and files larger than 1 MB.
+**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files, files larger than 1 MB, and hidden/dotfile or credential-like paths unless explicitly included.
 
 **Example output:**
 ```

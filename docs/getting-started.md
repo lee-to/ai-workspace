@@ -158,7 +158,7 @@ ai-workspace serve
 
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
 
-The server exposes 11 tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first.
+The server exposes 11 tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first. By default, MCP project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`.
 
 ## Data Storage
 

@@ -48,6 +48,14 @@ where
     })
 }
 
+fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
+    if let Some(rest) = path.strip_prefix(r"\\?\UNC\") {
+        Some(format!(r"\\{}", rest))
+    } else {
+        path.strip_prefix(r"\\?\").map(|rest| rest.to_string())
+    }
+}
+
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("AI_WORKSPACE_DB") {
@@ -471,6 +479,12 @@ impl Db {
         let slug = normalize_project_slug(target);
         if let Some(project) = self.get_project_by_slug(&slug)? {
             return Ok(Some(project));
+        }
+
+        if let Some(path) = strip_windows_verbatim_prefix(target)
+            && path != target
+        {
+            return self.get_project_by_path(&path);
         }
 
         Ok(None)
@@ -2726,6 +2740,21 @@ mod tests {
             .create_project_with_slug("Auth Service", "/tmp/auth", Some("auth"))
             .unwrap();
         let p = db.resolve_project_target("auth").unwrap().unwrap();
+        assert_eq!(p.id, id);
+    }
+
+    #[test]
+    fn resolve_project_target_accepts_windows_verbatim_path() {
+        let db = test_db();
+        let id = db
+            .create_project("proj", r"C:\tmp\ai-workspace-project")
+            .unwrap();
+
+        let p = db
+            .resolve_project_target(r"\\?\C:\tmp\ai-workspace-project")
+            .unwrap()
+            .unwrap();
+
         assert_eq!(p.id, id);
     }
 
