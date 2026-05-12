@@ -20,6 +20,18 @@ pub struct GrepMatch {
     pub line_content: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrepScopeKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepScope {
+    pub kind: GrepScopeKind,
+    pub rel_path: String,
+}
+
 /// Maximum file size for grep scanning (1 MB).
 const MAX_GREP_FILE_SIZE: u64 = 1_024 * 1_024;
 
@@ -439,7 +451,7 @@ pub fn grep_project(
 /// unshared files in default mode.
 pub fn grep_project_paths(
     root: &Path,
-    rel_paths: &[String],
+    scopes: &[GrepScope],
     pattern: &str,
     glob_pattern: Option<&str>,
     options: WalkOptions,
@@ -447,7 +459,7 @@ pub fn grep_project_paths(
     info!(
         "grep_project_paths: root={}, scopes={}, pattern={}, glob={:?}",
         root.display(),
-        rel_paths.len(),
+        scopes.len(),
         pattern,
         glob_pattern
     );
@@ -461,7 +473,7 @@ pub fn grep_project_paths(
     let mut matches = Vec::new();
     let mut seen = HashSet::new();
 
-    for rel_path in rel_paths {
+    for scope in scopes {
         if matches.len() >= MAX_GREP_MATCHES {
             debug!(
                 "grep_project_paths: hit max matches limit ({})",
@@ -470,26 +482,35 @@ pub fn grep_project_paths(
             break;
         }
 
-        let Some(normalized) = normalize_rel_path(rel_path) else {
-            warn!("grep_project_paths: skipping invalid scope '{}'", rel_path);
+        let Some(normalized) = normalize_rel_path(&scope.rel_path) else {
+            warn!(
+                "grep_project_paths: skipping invalid scope '{}'",
+                scope.rel_path
+            );
             continue;
         };
 
         if !path_allowed_by_options(&normalized, options) {
-            warn!("grep_project_paths: skipping blocked scope '{}'", rel_path);
+            warn!(
+                "grep_project_paths: skipping blocked scope '{}'",
+                scope.rel_path
+            );
             continue;
         }
 
         let target = canonical_root.join(normalized);
         let Ok(canonical_target) = target.canonicalize() else {
-            warn!("grep_project_paths: skipping missing scope '{}'", rel_path);
+            warn!(
+                "grep_project_paths: skipping missing scope '{}'",
+                scope.rel_path
+            );
             continue;
         };
 
         if !canonical_target.starts_with(&canonical_root) {
             warn!(
                 "grep_project_paths: skipping out-of-root scope '{}'",
-                rel_path
+                scope.rel_path
             );
             continue;
         }
@@ -500,26 +521,40 @@ pub fn grep_project_paths(
         if !path_allowed_by_options(canonical_target_rel, options) {
             warn!(
                 "grep_project_paths: skipping blocked canonical scope '{}'",
-                rel_path
+                scope.rel_path
             );
             continue;
         }
 
-        if canonical_target.is_file() {
-            scan_grep_file(
-                &canonical_root,
-                &canonical_target,
-                &re,
-                glob_pattern,
-                glob_matcher.as_ref(),
-                &mut matches,
-                &mut seen,
-            );
-            continue;
-        }
-
-        if !canonical_target.is_dir() {
-            continue;
+        match scope.kind {
+            GrepScopeKind::File => {
+                if canonical_target.is_file() {
+                    scan_grep_file(
+                        &canonical_root,
+                        &canonical_target,
+                        &re,
+                        glob_pattern,
+                        glob_matcher.as_ref(),
+                        &mut matches,
+                        &mut seen,
+                    );
+                } else {
+                    warn!(
+                        "grep_project_paths: skipping file scope that is not a file '{}'",
+                        scope.rel_path
+                    );
+                }
+                continue;
+            }
+            GrepScopeKind::Dir => {
+                if !canonical_target.is_dir() {
+                    warn!(
+                        "grep_project_paths: skipping dir scope that is not a directory '{}'",
+                        scope.rel_path
+                    );
+                    continue;
+                }
+            }
         }
 
         let mut builder = ignore::WalkBuilder::new(&canonical_target);

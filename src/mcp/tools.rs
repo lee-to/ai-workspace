@@ -209,12 +209,21 @@ fn subdir_intersects_shared_scope(subdir: &str, scopes: &[SharedPathScope]) -> b
     })
 }
 
-fn shared_scope_rel_paths(scopes: &[SharedPathScope]) -> Vec<String> {
-    let mut paths = std::collections::BTreeSet::new();
+fn shared_grep_scopes(scopes: &[SharedPathScope]) -> Vec<walk::GrepScope> {
+    let mut grep_scopes = Vec::new();
     for scope in scopes {
-        paths.insert(scope.rel_path.clone());
+        let kind = match scope.kind {
+            SharedItemKind::File => walk::GrepScopeKind::File,
+            SharedItemKind::Dir => walk::GrepScopeKind::Dir,
+            SharedItemKind::Note => continue,
+        };
+        grep_scopes.push(walk::GrepScope {
+            kind,
+            rel_path: scope.rel_path.clone(),
+        });
     }
-    paths.into_iter().collect()
+    grep_scopes.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    grep_scopes
 }
 
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
@@ -1073,8 +1082,8 @@ fn project_grep(
             Ok(scopes) => scopes,
             Err(e) => return tool_error(id, &e),
         };
-        let rel_paths = shared_scope_rel_paths(&scopes);
-        walk::grep_project_paths(&canonical_root, &rel_paths, pattern, glob, options)
+        let grep_scopes = shared_grep_scopes(&scopes);
+        walk::grep_project_paths(&canonical_root, &grep_scopes, pattern, glob, options)
     };
 
     let matches = match matches {

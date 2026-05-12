@@ -1903,6 +1903,43 @@ fn test_mcp_project_grep_shared_dir_skips_symlink_escape_by_default() {
 }
 
 #[test]
+fn test_mcp_project_grep_shared_file_scope_does_not_become_directory_scope() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    let shared_file_path = project_dir.path().join("src").join("lib.rs");
+
+    std::fs::remove_file(&shared_file_path).unwrap();
+    std::fs::create_dir(&shared_file_path).unwrap();
+    std::fs::write(
+        shared_file_path.join("leak.txt"),
+        "mutated_file_scope_token\n",
+    )
+    .unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "mutated_file_scope_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!content.contains("mutated_file_scope_token"));
+    assert!(!content.contains("src/lib.rs/leak.txt"));
+}
+
+#[test]
 fn test_mcp_project_grep_invalid_regex() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
