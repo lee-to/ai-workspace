@@ -100,24 +100,24 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_read",
-                    "description": "Read a shared file by item_id OR by project_id+path. Provide one or the other, not both.",
+                    "description": "Read a shared item by item_id, or read a project path only when it is inside shared scopes. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to allow project-wide path reads.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
                             "item_id": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "The shared item ID to read (mutually exclusive with project_id+path)"
+                                "description": "The shared item ID to read (mutually exclusive with project_id+rel_path)"
                             },
                             "project_id": {
                                 "type": "integer",
                                 "minimum": 1,
-                                "description": "Project ID to read from (use with path)"
+                                "description": "Project ID to read from (use with rel_path)"
                             },
                             "rel_path": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "Relative file location within the project (use with project_id)"
+                                "description": "Relative project path to read. By default this must be an explicitly shared file or inside a shared directory."
                             },
                             "include_hidden": {
                                 "type": "boolean",
@@ -151,7 +151,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "list_groups",
-                    "description": "List all groups with their member projects",
+                    "description": "List all groups with their member projects. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -160,7 +160,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "list_projects",
-                    "description": "List all projects with their groups",
+                    "description": "List all projects with their groups. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -169,7 +169,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "project_tree",
-                    "description": "List the file tree of a project, respecting .gitignore",
+                    "description": "List the shared file tree of a project by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project tree access.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -181,7 +181,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                             "subdir": {
                                 "type": "string",
                                 "minLength": 1,
-                                "description": "Optional subdirectory to list (relative to project root)"
+                                "description": "Optional subdirectory to list. By default it must intersect shared scopes."
                             },
                             "max_depth": {
                                 "type": "integer",
@@ -203,7 +203,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "project_grep",
-                    "description": "Search project files for a regex pattern, respecting .gitignore",
+                    "description": "Search shared project files for a regex pattern by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project search.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

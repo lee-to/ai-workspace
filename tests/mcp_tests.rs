@@ -1,5 +1,5 @@
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use rusqlite::{Connection, params};
@@ -10,15 +10,25 @@ fn binary_path() -> PathBuf {
     path
 }
 
-fn mcp_request(db_path: &PathBuf, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
-    let mut child = Command::new(binary_path())
+fn mcp_request_with_env(
+    db_path: &PathBuf,
+    requests: &[serde_json::Value],
+    envs: &[(&str, &str)],
+) -> Vec<serde_json::Value> {
+    let mut command = Command::new(binary_path());
+    command
         .arg("serve")
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to start MCP server");
+        .stderr(Stdio::piped());
+
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn().expect("Failed to start MCP server");
 
     let mut stdin = child.stdin.take().unwrap();
     for req in requests {
@@ -37,10 +47,24 @@ fn mcp_request(db_path: &PathBuf, requests: &[serde_json::Value]) -> Vec<serde_j
         .collect()
 }
 
+fn mcp_request(db_path: &PathBuf, requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    mcp_request_with_env(db_path, requests, &[])
+}
+
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+#[cfg(unix)]
+fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+#[cfg(windows)]
+fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::os::windows::fs::symlink_file(src, dst)
 }
 
 fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
@@ -290,6 +314,62 @@ fn seed_tree_project(db_path: &PathBuf) -> tempfile::TempDir {
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
         .output()
         .expect("seed command failed");
+
+    project_dir
+}
+
+/// Seed a project with explicit shared scopes and unshared files.
+fn seed_scoped_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+
+    std::fs::write(
+        project_dir.path().join("main.rs"),
+        "fn main() {\n    println!(\"unshared_println_token\");\n}\n",
+    )
+    .unwrap();
+    std::fs::write(project_dir.path().join("secret.txt"), "secret_token\n").unwrap();
+    std::fs::create_dir(project_dir.path().join("src")).unwrap();
+    std::fs::write(
+        project_dir.path().join("src/lib.rs"),
+        "pub fn shared() -> &'static str {\n    \"shared_lib_token\"\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("src/private.rs"),
+        "pub fn private() -> &'static str {\n    \"private_src_token\"\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(
+        project_dir.path().join("docs/guide.md"),
+        "# Guide\n\nshared_docs_token\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project_dir.path().join("docs/notes.txt"),
+        "shared_docs_text_token\n",
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(project_dir.path())
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command failed: {:?}\nstdout={}\nstderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(&["init", "--name", "scoped-proj"]);
+    run(&["share", "src/lib.rs", "--label", "shared-lib"]);
+    run(&["share", "docs", "--label", "shared-docs"]);
 
     project_dir
 }
@@ -633,6 +713,57 @@ fn test_mcp_workspace_context() {
 }
 
 #[test]
+fn test_mcp_workspace_context_hides_project_path_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_context",
+                "arguments": {}
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert!(context["projects"][0].get("path").is_none());
+}
+
+#[test]
+fn test_mcp_workspace_context_includes_project_path_when_project_wide_enabled() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_context",
+                "arguments": {}
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let context: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert!(context["projects"][0]["path"].as_str().is_some());
+}
+
+#[test]
 fn test_mcp_service_graph_events_and_event_details() {
     let (_db_dir, db_path) = temp_db();
     let (_auth_dir, _api_dir) = seed_service_event_data(&db_path);
@@ -917,6 +1048,57 @@ fn test_mcp_list_groups() {
 }
 
 #[test]
+fn test_mcp_list_groups_hides_project_path_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_groups",
+                "arguments": {}
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let groups: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(groups[0]["projects"][0].get("path").is_none());
+}
+
+#[test]
+fn test_mcp_list_groups_includes_project_path_when_project_wide_enabled() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_groups",
+                "arguments": {}
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let groups: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(groups[0]["projects"][0]["path"].as_str().is_some());
+}
+
+#[test]
 fn test_mcp_list_projects() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_data(&db_path);
@@ -944,12 +1126,121 @@ fn test_mcp_list_projects() {
     assert!(projects[0]["groups"].as_array().unwrap().len() > 0);
 }
 
+#[test]
+fn test_mcp_list_projects_hides_project_path_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_projects",
+                "arguments": {}
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let projects: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(projects[0].get("path").is_none());
+}
+
+#[test]
+fn test_mcp_list_projects_includes_project_path_when_project_wide_enabled() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_data(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "list_projects",
+                "arguments": {}
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let projects: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert!(projects[0]["path"].as_str().is_some());
+}
+
 // --- project_tree tests ---
 
 #[test]
-fn test_mcp_project_tree_basic() {
+fn test_mcp_project_tree_basic_when_project_wide_enabled() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("main.rs"));
+    assert!(content.contains("src/"));
+    assert!(content.contains("lib.rs"));
+    assert!(content.contains("utils.rs"));
+}
+
+#[test]
+fn test_mcp_project_tree_subpath_when_project_wide_enabled() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_tree_project(&db_path);
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "subdir": "src" }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("lib.rs"));
+    assert!(content.contains("utils.rs"));
+    // Should NOT contain main.rs (it's outside src/)
+    assert!(!content.contains("main.rs"));
+}
+
+#[test]
+fn test_mcp_project_tree_lists_only_shared_scopes_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
 
     let responses = mcp_request(
         &db_path,
@@ -964,20 +1255,23 @@ fn test_mcp_project_tree_basic() {
         })],
     );
 
-    assert_eq!(responses.len(), 1);
     let content = responses[0]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(content.contains("main.rs"));
     assert!(content.contains("src/"));
     assert!(content.contains("lib.rs"));
-    assert!(content.contains("utils.rs"));
+    assert!(content.contains("docs/"));
+    assert!(content.contains("guide.md"));
+    assert!(content.contains("notes.txt"));
+    assert!(!content.contains("main.rs"));
+    assert!(!content.contains("secret.txt"));
+    assert!(!content.contains("private.rs"));
 }
 
 #[test]
-fn test_mcp_project_tree_subpath() {
+fn test_mcp_project_tree_subdir_filters_to_shared_descendants_by_default() {
     let (_db_dir, db_path) = temp_db();
-    let _project_dir = seed_tree_project(&db_path);
+    let _project_dir = seed_scoped_project(&db_path);
 
     let responses = mcp_request(
         &db_path,
@@ -992,14 +1286,38 @@ fn test_mcp_project_tree_subpath() {
         })],
     );
 
-    assert_eq!(responses.len(), 1);
     let content = responses[0]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
     assert!(content.contains("lib.rs"));
-    assert!(content.contains("utils.rs"));
-    // Should NOT contain main.rs (it's outside src/)
+    assert!(!content.contains("private.rs"));
     assert!(!content.contains("main.rs"));
+}
+
+#[test]
+fn test_mcp_project_tree_unshared_subdir_empty_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    std::fs::create_dir(project_dir.path().join("tmp")).unwrap();
+    std::fs::write(project_dir.path().join("tmp/cache.txt"), "cache").unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "subdir": "tmp" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert_eq!(content, "");
 }
 
 #[test]
@@ -1031,7 +1349,7 @@ fn test_mcp_project_tree_hides_hidden_and_sensitive_by_default() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1042,6 +1360,7 @@ fn test_mcp_project_tree_hides_hidden_and_sensitive_by_default() {
                 "arguments": { "project_id": 1 }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1060,7 +1379,7 @@ fn test_mcp_project_tree_include_hidden_still_hides_sensitive() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1071,6 +1390,7 @@ fn test_mcp_project_tree_include_hidden_still_hides_sensitive() {
                 "arguments": { "project_id": 1, "include_hidden": true }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1087,7 +1407,7 @@ fn test_mcp_project_tree_include_hidden_and_sensitive_shows_sensitive() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1102,6 +1422,7 @@ fn test_mcp_project_tree_include_hidden_and_sensitive_shows_sensitive() {
                 }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1120,6 +1441,81 @@ fn test_mcp_workspace_read_by_path() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "src/lib.rs" }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("pub fn add"));
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_denies_unshared_file_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "secret.txt" }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Access denied"));
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_denies_unshared_missing_path_without_existence_leak() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "missing-secret.txt" }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("Access denied"));
+    assert!(!text.contains("Cannot resolve"));
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_allows_shared_file() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
     let responses = mcp_request(
         &db_path,
         &[serde_json::json!({
@@ -1133,11 +1529,59 @@ fn test_mcp_workspace_read_by_path() {
         })],
     );
 
-    assert_eq!(responses.len(), 1);
     let content = responses[0]["result"]["content"][0]["text"]
         .as_str()
         .unwrap();
-    assert!(content.contains("pub fn add"));
+    assert!(content.contains("shared_lib_token"));
+}
+
+#[test]
+fn test_mcp_workspace_read_by_path_allows_file_inside_shared_dir() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "docs/guide.md" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("shared_docs_token"));
+}
+
+#[test]
+fn test_mcp_workspace_read_item_id_shared_dir_still_lists_children() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": 2 }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("guide.md"));
+    assert!(content.contains("notes.txt"));
 }
 
 #[test]
@@ -1272,7 +1716,7 @@ fn test_mcp_workspace_read_by_path_allows_hidden_sensitive_with_opt_in() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1288,6 +1732,7 @@ fn test_mcp_workspace_read_by_path_allows_hidden_sensitive_with_opt_in() {
                 }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1301,7 +1746,7 @@ fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1312,6 +1757,7 @@ fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
                 "arguments": { "project_id": 1, "rel_path": "." }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1328,11 +1774,11 @@ fn test_mcp_workspace_read_directory_listing_filters_hidden_sensitive() {
 // --- project_grep tests ---
 
 #[test]
-fn test_mcp_project_grep_basic() {
+fn test_mcp_project_grep_basic_when_project_wide_enabled() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1343,6 +1789,7 @@ fn test_mcp_project_grep_basic() {
                 "arguments": { "project_id": 1, "pattern": "println" }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     assert_eq!(responses.len(), 1);
@@ -1356,11 +1803,11 @@ fn test_mcp_project_grep_basic() {
 }
 
 #[test]
-fn test_mcp_project_grep_glob_filter() {
+fn test_mcp_project_grep_glob_filter_when_project_wide_enabled() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1371,6 +1818,7 @@ fn test_mcp_project_grep_glob_filter() {
                 "arguments": { "project_id": 1, "pattern": "pub fn", "glob": "*.rs" }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     assert_eq!(responses.len(), 1);
@@ -1378,6 +1826,117 @@ fn test_mcp_project_grep_glob_filter() {
         .as_str()
         .unwrap();
     assert!(content.contains("pub fn"));
+}
+
+#[test]
+fn test_mcp_project_grep_searches_only_shared_scopes_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "token" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("src/lib.rs"));
+    assert!(content.contains("shared_lib_token"));
+    assert!(content.contains("docs/guide.md"));
+    assert!(content.contains("shared_docs_token"));
+    assert!(content.contains("docs/notes.txt"));
+    assert!(content.contains("shared_docs_text_token"));
+    assert!(!content.contains("main.rs"));
+    assert!(!content.contains("unshared_println_token"));
+    assert!(!content.contains("secret.txt"));
+    assert!(!content.contains("secret_token"));
+    assert!(!content.contains("private.rs"));
+    assert!(!content.contains("private_src_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_shared_dir_skips_symlink_escape_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(outside.path(), "outside_secret_token\n").unwrap();
+    let link_path = project_dir.path().join("docs").join("outside-link.txt");
+
+    if let Err(err) = symlink_file(outside.path(), &link_path) {
+        eprintln!(
+            "skipping symlink regression test because symlink creation failed: {}",
+            err
+        );
+        return;
+    }
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "outside_secret_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!content.contains("outside_secret_token"));
+    assert!(!content.contains("outside-link.txt"));
+}
+
+#[test]
+fn test_mcp_project_grep_shared_file_scope_does_not_become_directory_scope() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    let shared_file_path = project_dir.path().join("src").join("lib.rs");
+
+    std::fs::remove_file(&shared_file_path).unwrap();
+    std::fs::create_dir(&shared_file_path).unwrap();
+    std::fs::write(
+        shared_file_path.join("leak.txt"),
+        "mutated_file_scope_token\n",
+    )
+    .unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "mutated_file_scope_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(!content.contains("mutated_file_scope_token"));
+    assert!(!content.contains("src/lib.rs/leak.txt"));
 }
 
 #[test]
@@ -1433,7 +1992,7 @@ fn test_mcp_project_grep_hides_hidden_and_sensitive_by_default() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1444,6 +2003,7 @@ fn test_mcp_project_grep_hides_hidden_and_sensitive_by_default() {
                 "arguments": { "project_id": 1, "pattern": "marker" }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]
@@ -1461,7 +2021,7 @@ fn test_mcp_project_grep_include_hidden_and_sensitive_finds_sensitive() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
 
-    let responses = mcp_request(
+    let responses = mcp_request_with_env(
         &db_path,
         &[serde_json::json!({
             "jsonrpc": "2.0",
@@ -1477,6 +2037,7 @@ fn test_mcp_project_grep_include_hidden_and_sensitive_finds_sensitive() {
                 }
             }
         })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
     );
 
     let content = responses[0]["result"]["content"][0]["text"]

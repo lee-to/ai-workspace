@@ -1,9 +1,230 @@
 use log::{debug, error, info, warn};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
 use crate::db::Db;
+use crate::models::SharedItemKind;
 use crate::walk;
+
+const PROJECT_WIDE_TOOLS_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS";
+const ACCESS_DENIED_NOT_SHARED: &str = "Access denied: path is not shared";
+const ACCESS_DENIED_INVALID_PATH: &str = "Access denied: invalid path";
+
+#[derive(Debug, Clone)]
+struct SharedPathScope {
+    kind: SharedItemKind,
+    rel_path: String,
+    canonical_path: Option<PathBuf>,
+}
+
+fn project_wide_tools_enabled() -> bool {
+    let enabled = std::env::var(PROJECT_WIDE_TOOLS_ENV).ok().as_deref() == Some("1");
+    if enabled {
+        debug!(
+            "{}=1; project-wide MCP tools enabled",
+            PROJECT_WIDE_TOOLS_ENV
+        );
+    }
+    enabled
+}
+
+fn normalize_rel_path(input: &str) -> Result<String, String> {
+    if input.trim().is_empty() {
+        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+    }
+
+    if input.split(['/', '\\']).any(|part| part.is_empty()) {
+        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+    }
+
+    let path = Path::new(input);
+    if path.is_absolute() {
+        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+    }
+
+    let mut parts = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => {
+                let Some(part) = part.to_str() else {
+                    return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+                };
+                if part.is_empty() {
+                    return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+                }
+                parts.push(part.to_string());
+            }
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => {
+                return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
+    }
+
+    Ok(parts.join("/"))
+}
+
+fn rel_is_same_or_descendant(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn rel_is_ancestor(path: &str, descendant: &str) -> bool {
+    descendant
+        .strip_prefix(path)
+        .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn resolve_project_root(project_id: i64, db: &Db) -> Result<(PathBuf, PathBuf), String> {
+    let project = db
+        .get_project_by_id(project_id)
+        .map_err(|e| format!("DB error: {}", e))?
+        .ok_or_else(|| format!("Project {} not found", project_id))?;
+
+    let root = PathBuf::from(&project.path);
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+
+    Ok((root, canonical_root))
+}
+
+fn shared_path_scopes(
+    project_id: i64,
+    canonical_root: &Path,
+    db: &Db,
+) -> Result<Vec<SharedPathScope>, String> {
+    let items = db
+        .get_shared_items_for_project(project_id)
+        .map_err(|e| format!("Failed to list shared items: {}", e))?;
+
+    let mut scopes = Vec::new();
+    for item in items {
+        if !matches!(item.kind, SharedItemKind::File | SharedItemKind::Dir) {
+            continue;
+        }
+
+        let Some(path) = item.path.as_deref() else {
+            warn!("shared item {} missing path", item.id);
+            continue;
+        };
+
+        let rel_path = match normalize_rel_path(path) {
+            Ok(path) => path,
+            Err(e) => {
+                warn!("shared item {} has invalid path '{}': {}", item.id, path, e);
+                continue;
+            }
+        };
+
+        let candidate = canonical_root.join(&rel_path);
+        let canonical_path = match candidate.canonicalize() {
+            Ok(path) if path.starts_with(canonical_root) => Some(path),
+            Ok(path) => {
+                warn!(
+                    "shared item {} points outside project root: {}",
+                    item.id,
+                    path.display()
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "shared item {} path cannot canonicalize '{}': {}",
+                    item.id, rel_path, e
+                );
+                None
+            }
+        };
+
+        scopes.push(SharedPathScope {
+            kind: item.kind,
+            rel_path,
+            canonical_path,
+        });
+    }
+
+    debug!(
+        "loaded {} shared path scope(s) for project {}",
+        scopes.len(),
+        project_id
+    );
+    Ok(scopes)
+}
+
+fn find_shared_scope<'a>(
+    normalized_target: &str,
+    scopes: &'a [SharedPathScope],
+) -> Option<&'a SharedPathScope> {
+    scopes.iter().find(|scope| match scope.kind {
+        SharedItemKind::File => normalized_target == scope.rel_path,
+        SharedItemKind::Dir => rel_is_same_or_descendant(normalized_target, &scope.rel_path),
+        SharedItemKind::Note => false,
+    })
+}
+
+fn canonical_path_is_shared(target: &Path, scope: &SharedPathScope) -> bool {
+    let Some(scope_path) = scope.canonical_path.as_deref() else {
+        return false;
+    };
+
+    match scope.kind {
+        SharedItemKind::File => target == scope_path,
+        SharedItemKind::Dir => target == scope_path || target.starts_with(scope_path),
+        SharedItemKind::Note => false,
+    }
+}
+
+fn tree_path_visible(rel_path: &str, scopes: &[SharedPathScope]) -> bool {
+    scopes.iter().any(|scope| match scope.kind {
+        SharedItemKind::File => {
+            rel_path == scope.rel_path || rel_is_ancestor(rel_path, &scope.rel_path)
+        }
+        SharedItemKind::Dir => {
+            rel_is_same_or_descendant(rel_path, &scope.rel_path)
+                || rel_is_ancestor(rel_path, &scope.rel_path)
+        }
+        SharedItemKind::Note => false,
+    })
+}
+
+fn subdir_intersects_shared_scope(subdir: &str, scopes: &[SharedPathScope]) -> bool {
+    scopes.iter().any(|scope| match scope.kind {
+        SharedItemKind::File => {
+            subdir == scope.rel_path || rel_is_ancestor(subdir, &scope.rel_path)
+        }
+        SharedItemKind::Dir => {
+            rel_is_same_or_descendant(subdir, &scope.rel_path)
+                || rel_is_same_or_descendant(&scope.rel_path, subdir)
+        }
+        SharedItemKind::Note => false,
+    })
+}
+
+fn shared_grep_scopes(scopes: &[SharedPathScope]) -> Vec<walk::GrepScope> {
+    let mut grep_scopes = Vec::new();
+    for scope in scopes {
+        let kind = match scope.kind {
+            SharedItemKind::File => walk::GrepScopeKind::File,
+            SharedItemKind::Dir => walk::GrepScopeKind::Dir,
+            SharedItemKind::Note => continue,
+        };
+        grep_scopes.push(walk::GrepScope {
+            kind,
+            rel_path: scope.rel_path.clone(),
+        });
+    }
+    grep_scopes.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+    grep_scopes
+}
 
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -290,6 +511,7 @@ fn walk_options_from_args(arguments: &serde_json::Value) -> walk::WalkOptions {
 
 fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     info!("workspace_context: gathering metadata");
+    let include_project_paths = project_wide_tools_enabled();
 
     let projects = match db.list_projects() {
         Ok(p) => p,
@@ -341,11 +563,10 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
                 );
             }
         };
-        projects_arr.push(serde_json::json!({
+        let mut project = serde_json::json!({
             "id": p.id,
             "name": p.name,
             "slug": p.slug,
-            "path": p.path,
             "groups": project_groups.iter().map(|g| &g.name).collect::<Vec<_>>(),
             "shared_items": items.iter().map(|i| serde_json::json!({
                 "id": i.id,
@@ -361,7 +582,11 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
                     }))
                     .collect::<Vec<_>>()
             })).collect::<Vec<_>>()
-        }));
+        });
+        if include_project_paths {
+            project["path"] = serde_json::json!(p.path);
+        }
+        projects_arr.push(project);
     }
 
     let groups_arr = context["groups"].as_array_mut().unwrap();
@@ -551,14 +776,68 @@ fn workspace_read_by_path(
         project_id, path
     );
 
-    if !walk::path_allowed_by_options(Path::new(path), options) {
-        return tool_error(id, PATH_POLICY_DENIED);
-    }
-
-    let (canonical_root, canonical) = match resolve_project_path(project_id, Some(path), db) {
-        Ok(v) => v,
-        Err(e) => return tool_error(id, &e),
+    let project_wide = project_wide_tools_enabled();
+    let (root, canonical_root, normalized, matched_scope) = if project_wide {
+        let (root, canonical_root) = match resolve_project_root(project_id, db) {
+            Ok(v) => v,
+            Err(e) => return tool_error(id, &e),
+        };
+        let normalized = if path.trim() == "." {
+            String::new()
+        } else {
+            match normalize_rel_path(path) {
+                Ok(path) => path,
+                Err(e) => return tool_error(id, &e),
+            }
+        };
+        (root, canonical_root, normalized, None)
+    } else {
+        let normalized = match normalize_rel_path(path) {
+            Ok(path) => path,
+            Err(e) => {
+                warn!(
+                    "workspace_read_by_path denied invalid path '{}': {}",
+                    path, e
+                );
+                return tool_error(id, &e);
+            }
+        };
+        let (root, canonical_root) = match resolve_project_root(project_id, db) {
+            Ok(v) => v,
+            Err(e) => return tool_error(id, &e),
+        };
+        let scopes = match shared_path_scopes(project_id, &canonical_root, db) {
+            Ok(scopes) => scopes,
+            Err(e) => return tool_error(id, &e),
+        };
+        let Some(scope) = find_shared_scope(&normalized, &scopes).cloned() else {
+            warn!("workspace_read_by_path denied unshared path: {}", path);
+            return tool_error(id, ACCESS_DENIED_NOT_SHARED);
+        };
+        (root, canonical_root, normalized, Some(scope))
     };
+
+    let full_path = root.join(&normalized);
+    let canonical = match full_path.canonicalize() {
+        Ok(path) => path,
+        Err(e) => {
+            error!("Cannot resolve path {}: {}", full_path.display(), e);
+            return tool_error(id, "Cannot resolve path");
+        }
+    };
+    if !canonical.starts_with(&canonical_root) {
+        warn!("workspace_read_by_path denied project escape: {}", path);
+        return tool_error(id, "Access denied: path is outside project directory");
+    }
+    if let Some(scope) = matched_scope.as_ref()
+        && !canonical_path_is_shared(&canonical, scope)
+    {
+        warn!(
+            "workspace_read_by_path denied canonical path escape: {}",
+            path
+        );
+        return tool_error(id, ACCESS_DENIED_NOT_SHARED);
+    }
 
     read_visible_path(id, &canonical_root, &canonical, options)
 }
@@ -643,6 +922,7 @@ fn workspace_search_fulltext(
 
 fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     info!("list_groups");
+    let include_project_paths = project_wide_tools_enabled();
 
     let groups = match db.list_groups() {
         Ok(g) => g,
@@ -653,15 +933,24 @@ fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         .iter()
         .map(|g| {
             let projects = db.get_projects_for_group(g.id).unwrap_or_default();
+            let project_values: Vec<_> = projects
+                .iter()
+                .map(|p| {
+                    let mut project = serde_json::json!({
+                        "id": p.id,
+                        "name": p.name,
+                        "slug": p.slug
+                    });
+                    if include_project_paths {
+                        project["path"] = serde_json::json!(p.path);
+                    }
+                    project
+                })
+                .collect();
             serde_json::json!({
                 "id": g.id,
                 "name": g.name,
-                "projects": projects.iter().map(|p| serde_json::json!({
-                    "id": p.id,
-                    "name": p.name,
-                    "slug": p.slug,
-                    "path": p.path
-                })).collect::<Vec<_>>()
+                "projects": project_values
             })
         })
         .collect();
@@ -676,16 +965,8 @@ fn resolve_project_path(
     project_id: i64,
     subpath: Option<&str>,
     db: &Db,
-) -> Result<(std::path::PathBuf, std::path::PathBuf), String> {
-    let project = db
-        .get_project_by_id(project_id)
-        .map_err(|e| format!("DB error: {}", e))?
-        .ok_or_else(|| format!("Project {} not found", project_id))?;
-
-    let root = Path::new(&project.path);
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+) -> Result<(PathBuf, PathBuf), String> {
+    let (root, canonical_root) = resolve_project_root(project_id, db)?;
 
     let target = if let Some(sub) = subpath {
         let full = root.join(sub);
@@ -716,12 +997,53 @@ fn project_tree(
         project_id, path, max_depth
     );
 
-    let (canonical_root, _target) = match resolve_project_path(project_id, path, db) {
+    let (canonical_root, _) = match resolve_project_path(project_id, None, db) {
         Ok(v) => v,
         Err(e) => return tool_error(id, &e),
     };
 
-    let entries = walk::walk_project_tree(&canonical_root, path, max_depth, options);
+    let project_wide = project_wide_tools_enabled();
+    let scopes = if project_wide {
+        Vec::new()
+    } else {
+        match shared_path_scopes(project_id, &canonical_root, db) {
+            Ok(scopes) => scopes,
+            Err(e) => return tool_error(id, &e),
+        }
+    };
+
+    let normalized_subdir = match path {
+        Some(path) => match normalize_rel_path(path) {
+            Ok(path) => {
+                if !project_wide && !subdir_intersects_shared_scope(&path, &scopes) {
+                    debug!(
+                        "project_tree: subdir '{}' has no shared-scope intersection",
+                        path
+                    );
+                    return tool_result(id, String::new());
+                }
+                Some(path)
+            }
+            Err(e) => return tool_error(id, &e),
+        },
+        None => None,
+    };
+
+    let entries = walk::walk_project_tree(
+        &canonical_root,
+        normalized_subdir.as_deref(),
+        max_depth,
+        options,
+    );
+    let entries: Vec<_> = if project_wide {
+        entries
+    } else {
+        entries
+            .into_iter()
+            .filter(|entry| tree_path_visible(&entry.path, &scopes))
+            .collect()
+    };
+    debug!("project_tree: returning {} entries", entries.len());
 
     // Format as indented tree
     let mut lines = Vec::new();
@@ -753,7 +1075,18 @@ fn project_grep(
         Err(e) => return tool_error(id, &e),
     };
 
-    let matches = match walk::grep_project(&canonical_root, pattern, glob, options) {
+    let matches = if project_wide_tools_enabled() {
+        walk::grep_project(&canonical_root, pattern, glob, options)
+    } else {
+        let scopes = match shared_path_scopes(project_id, &canonical_root, db) {
+            Ok(scopes) => scopes,
+            Err(e) => return tool_error(id, &e),
+        };
+        let grep_scopes = shared_grep_scopes(&scopes);
+        walk::grep_project_paths(&canonical_root, &grep_scopes, pattern, glob, options)
+    };
+
+    let matches = match matches {
         Ok(m) => m,
         Err(e) => {
             return JsonRpcResponse::error(id, McpError::invalid_params(&e));
@@ -780,6 +1113,7 @@ fn project_grep(
 
 fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     info!("list_projects");
+    let include_project_paths = project_wide_tools_enabled();
 
     let projects = match db.list_projects() {
         Ok(p) => p,
@@ -790,16 +1124,19 @@ fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
         .iter()
         .map(|p| {
             let groups = db.get_groups_for_project(p.id).unwrap_or_default();
-            serde_json::json!({
+            let mut project = serde_json::json!({
                 "id": p.id,
                 "name": p.name,
                 "slug": p.slug,
-                "path": p.path,
                 "groups": groups.iter().map(|g| serde_json::json!({
                     "id": g.id,
                     "name": g.name
                 })).collect::<Vec<_>>()
-            })
+            });
+            if include_project_paths {
+                project["path"] = serde_json::json!(p.path);
+            }
+            project
         })
         .collect();
 

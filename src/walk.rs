@@ -1,7 +1,8 @@
 use log::{debug, info, warn};
 use serde::Serialize;
+use std::collections::HashSet;
 use std::io::{BufRead, Read as _};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 /// A single entry in the project file tree.
 #[derive(Debug, Clone, Serialize)]
@@ -17,6 +18,18 @@ pub struct GrepMatch {
     pub path: String,
     pub line_number: usize,
     pub line_content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GrepScopeKind {
+    File,
+    Dir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GrepScope {
+    pub kind: GrepScopeKind,
+    pub rel_path: String,
 }
 
 /// Maximum file size for grep scanning (1 MB).
@@ -92,6 +105,182 @@ fn is_binary(path: &Path) -> bool {
     buf[..n].contains(&0)
 }
 
+fn normalize_rel_path(input: &str) -> Option<PathBuf> {
+    if input.trim().is_empty() || input.split(['/', '\\']).any(|part| part.is_empty()) {
+        return None;
+    }
+
+    let path = Path::new(input);
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir
+            | Component::ParentDir
+            | Component::RootDir
+            | Component::Prefix(_) => return None,
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn build_glob_matcher(glob_pattern: Option<&str>) -> Result<Option<ignore::types::Types>, String> {
+    if let Some(glob) = glob_pattern {
+        let mut types_builder = ignore::types::TypesBuilder::new();
+        types_builder
+            .add("custom", glob)
+            .map_err(|e| format!("Invalid glob pattern: {}", e))?;
+        types_builder.select("custom");
+        Ok(Some(
+            types_builder
+                .build()
+                .map_err(|e| format!("Glob build error: {}", e))?,
+        ))
+    } else {
+        Ok(None)
+    }
+}
+
+fn glob_allows_file(
+    entry_path: &Path,
+    glob_pattern: Option<&str>,
+    glob_matcher: Option<&ignore::types::Types>,
+) -> bool {
+    let Some(types) = glob_matcher else {
+        return true;
+    };
+    let matched = types.matched(entry_path, false);
+    !(matched.is_ignore() || (!matched.is_whitelist() && glob_pattern.is_some()))
+}
+
+fn scan_grep_file(
+    root: &Path,
+    entry_path: &Path,
+    re: &regex::Regex,
+    glob_pattern: Option<&str>,
+    glob_matcher: Option<&ignore::types::Types>,
+    matches: &mut Vec<GrepMatch>,
+    seen: &mut HashSet<(String, usize, String)>,
+) {
+    if matches.len() >= MAX_GREP_MATCHES {
+        return;
+    }
+
+    if !glob_allows_file(entry_path, glob_pattern, glob_matcher) {
+        return;
+    }
+
+    let Ok(meta) = std::fs::metadata(entry_path) else {
+        return;
+    };
+    if meta.len() > MAX_GREP_FILE_SIZE {
+        debug!(
+            "grep: skipping large file {} ({} bytes)",
+            entry_path.display(),
+            meta.len()
+        );
+        return;
+    }
+
+    if is_binary(entry_path) {
+        debug!("grep: skipping binary file {}", entry_path.display());
+        return;
+    }
+
+    let Ok(file) = std::fs::File::open(entry_path) else {
+        return;
+    };
+
+    let rel = match entry_path.strip_prefix(root) {
+        Ok(r) => path_to_slash_string(r),
+        Err(_) => return,
+    };
+
+    let reader = std::io::BufReader::new(file);
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        if matches.len() >= MAX_GREP_MATCHES {
+            break;
+        }
+
+        let Ok(line) = line_result else {
+            break;
+        };
+
+        if re.is_match(&line) {
+            let line_number = line_idx + 1;
+            let key = (rel.clone(), line_number, line.clone());
+            if seen.insert(key) {
+                debug!("grep match: {}:{}", rel, line_number);
+                matches.push(GrepMatch {
+                    path: rel.clone(),
+                    line_number,
+                    line_content: line,
+                });
+            }
+        }
+    }
+}
+
+fn canonical_grep_candidate_allowed(
+    canonical_root: &Path,
+    canonical_scope_root: &Path,
+    candidate_path: &Path,
+    options: WalkOptions,
+) -> bool {
+    let Ok(canonical_candidate) = candidate_path.canonicalize() else {
+        warn!(
+            "grep: skipping candidate that cannot canonicalize: {}",
+            candidate_path.display()
+        );
+        return false;
+    };
+
+    if !canonical_candidate.starts_with(canonical_root) {
+        warn!(
+            "grep: skipping candidate outside project root: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    if !canonical_candidate.starts_with(canonical_scope_root) {
+        warn!(
+            "grep: skipping candidate outside shared scope: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    let rel = canonical_candidate
+        .strip_prefix(canonical_root)
+        .unwrap_or(canonical_candidate.as_path());
+    if !path_allowed_by_options(rel, options) {
+        warn!(
+            "grep: skipping candidate blocked by path policy: {}",
+            candidate_path.display()
+        );
+        return false;
+    }
+
+    true
+}
+
 /// Walk the project file tree, respecting .gitignore rules.
 ///
 /// If `subpath` is provided, only entries under that subdirectory are returned.
@@ -165,7 +354,7 @@ pub fn walk_project_tree(
             Err(_) => continue,
         };
 
-        let rel_str = rel.to_string_lossy().to_string();
+        let rel_str = path_to_slash_string(rel);
         let name = entry_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
@@ -204,6 +393,7 @@ pub fn grep_project(
     );
 
     let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+    let glob_matcher = build_glob_matcher(glob_pattern)?;
 
     let mut builder = ignore::WalkBuilder::new(root);
     builder
@@ -219,24 +409,9 @@ pub fn grep_project(
         path_allowed_by_options(rel, options)
     });
 
-    // Apply glob filter if provided
-    let glob_matcher = if let Some(glob) = glob_pattern {
-        let mut types_builder = ignore::types::TypesBuilder::new();
-        types_builder
-            .add("custom", glob)
-            .map_err(|e| format!("Invalid glob pattern: {}", e))?;
-        types_builder.select("custom");
-        Some(
-            types_builder
-                .build()
-                .map_err(|e| format!("Glob build error: {}", e))?,
-        )
-    } else {
-        None
-    };
-
     let walker = builder.build();
     let mut matches = Vec::new();
+    let mut seen = HashSet::new();
 
     for result in walker {
         if matches.len() >= MAX_GREP_MATCHES {
@@ -255,73 +430,195 @@ pub fn grep_project(
             continue;
         }
 
-        // Check glob filter
-        if let Some(ref types) = glob_matcher {
-            let matched = types.matched(entry_path, false);
-            if matched.is_ignore() || (!matched.is_whitelist() && glob_pattern.is_some()) {
-                continue;
-            }
-        }
-
-        // Check file size
-        let Ok(meta) = std::fs::metadata(entry_path) else {
-            continue;
-        };
-        if meta.len() > MAX_GREP_FILE_SIZE {
-            debug!(
-                "grep_project: skipping large file {} ({} bytes)",
-                entry_path.display(),
-                meta.len()
-            );
-            continue;
-        }
-
-        // Check binary
-        if is_binary(entry_path) {
-            debug!(
-                "grep_project: skipping binary file {}",
-                entry_path.display()
-            );
-            continue;
-        }
-
-        let Ok(file) = std::fs::File::open(entry_path) else {
-            continue;
-        };
-
-        let rel = match entry_path.strip_prefix(root) {
-            Ok(r) => r.to_string_lossy().to_string(),
-            Err(_) => continue,
-        };
-
-        let reader = std::io::BufReader::new(file);
-        for (line_idx, line_result) in reader.lines().enumerate() {
-            if matches.len() >= MAX_GREP_MATCHES {
-                break;
-            }
-
-            let Ok(line) = line_result else {
-                break;
-            };
-
-            if re.is_match(&line) {
-                debug!("grep match: {}:{}", rel, line_idx + 1);
-                matches.push(GrepMatch {
-                    path: rel.clone(),
-                    line_number: line_idx + 1,
-                    line_content: line,
-                });
-            }
-        }
+        scan_grep_file(
+            root,
+            entry_path,
+            &re,
+            glob_pattern,
+            glob_matcher.as_ref(),
+            &mut matches,
+            &mut seen,
+        );
     }
 
     info!("grep_project: found {} matches", matches.len());
     Ok(matches)
 }
 
+/// Grep only the provided project-relative file or directory paths.
+///
+/// This is used by MCP shared-scope access control so grep never opens
+/// unshared files in default mode.
+pub fn grep_project_paths(
+    root: &Path,
+    scopes: &[GrepScope],
+    pattern: &str,
+    glob_pattern: Option<&str>,
+    options: WalkOptions,
+) -> Result<Vec<GrepMatch>, String> {
+    info!(
+        "grep_project_paths: root={}, scopes={}, pattern={}, glob={:?}",
+        root.display(),
+        scopes.len(),
+        pattern,
+        glob_pattern
+    );
+
+    let re = regex::Regex::new(pattern).map_err(|e| format!("Invalid regex: {}", e))?;
+    let glob_matcher = build_glob_matcher(glob_pattern)?;
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+
+    let mut matches = Vec::new();
+    let mut seen = HashSet::new();
+
+    for scope in scopes {
+        if matches.len() >= MAX_GREP_MATCHES {
+            debug!(
+                "grep_project_paths: hit max matches limit ({})",
+                MAX_GREP_MATCHES
+            );
+            break;
+        }
+
+        let Some(normalized) = normalize_rel_path(&scope.rel_path) else {
+            warn!(
+                "grep_project_paths: skipping invalid scope '{}'",
+                scope.rel_path
+            );
+            continue;
+        };
+
+        if !path_allowed_by_options(&normalized, options) {
+            warn!(
+                "grep_project_paths: skipping blocked scope '{}'",
+                scope.rel_path
+            );
+            continue;
+        }
+
+        let target = canonical_root.join(normalized);
+        let Ok(canonical_target) = target.canonicalize() else {
+            warn!(
+                "grep_project_paths: skipping missing scope '{}'",
+                scope.rel_path
+            );
+            continue;
+        };
+
+        if !canonical_target.starts_with(&canonical_root) {
+            warn!(
+                "grep_project_paths: skipping out-of-root scope '{}'",
+                scope.rel_path
+            );
+            continue;
+        }
+
+        let canonical_target_rel = canonical_target
+            .strip_prefix(&canonical_root)
+            .unwrap_or(canonical_target.as_path());
+        if !path_allowed_by_options(canonical_target_rel, options) {
+            warn!(
+                "grep_project_paths: skipping blocked canonical scope '{}'",
+                scope.rel_path
+            );
+            continue;
+        }
+
+        match scope.kind {
+            GrepScopeKind::File => {
+                if canonical_target.is_file() {
+                    scan_grep_file(
+                        &canonical_root,
+                        &canonical_target,
+                        &re,
+                        glob_pattern,
+                        glob_matcher.as_ref(),
+                        &mut matches,
+                        &mut seen,
+                    );
+                } else {
+                    warn!(
+                        "grep_project_paths: skipping file scope that is not a file '{}'",
+                        scope.rel_path
+                    );
+                }
+                continue;
+            }
+            GrepScopeKind::Dir => {
+                if !canonical_target.is_dir() {
+                    warn!(
+                        "grep_project_paths: skipping dir scope that is not a directory '{}'",
+                        scope.rel_path
+                    );
+                    continue;
+                }
+            }
+        }
+
+        let mut builder = ignore::WalkBuilder::new(&canonical_target);
+        builder
+            .hidden(!options.include_hidden)
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true);
+
+        let policy_root = canonical_root.clone();
+        builder.filter_entry(move |entry| {
+            let path = entry.path();
+            let rel = path.strip_prefix(&policy_root).unwrap_or(path);
+            path_allowed_by_options(rel, options)
+        });
+
+        for result in builder.build() {
+            if matches.len() >= MAX_GREP_MATCHES {
+                break;
+            }
+
+            let Ok(entry) = result else {
+                continue;
+            };
+
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(true) {
+                continue;
+            }
+
+            if !canonical_grep_candidate_allowed(
+                &canonical_root,
+                &canonical_target,
+                entry.path(),
+                options,
+            ) {
+                continue;
+            }
+
+            scan_grep_file(
+                &canonical_root,
+                entry.path(),
+                &re,
+                glob_pattern,
+                glob_matcher.as_ref(),
+                &mut matches,
+                &mut seen,
+            );
+        }
+    }
+
+    debug!("grep_project_paths: found {} matches", matches.len());
+    Ok(matches)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn path_to_slash_string_uses_forward_slashes() {
+        let path = PathBuf::from("src").join("lib.rs");
+
+        assert_eq!(path_to_slash_string(&path), "src/lib.rs");
+    }
 
     #[test]
     fn path_policy_blocks_hidden_and_sensitive_by_default() {

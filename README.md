@@ -91,6 +91,8 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 That's it. The agent now has access to 11 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
 By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
 
+By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
+
 ## Example Prompts
 
 Once connected, you can talk to your AI agent naturally. Here are some examples:
@@ -110,11 +112,11 @@ Once connected, you can talk to your AI agent naturally. Here are some examples:
 - *"Are there any shared notes about the deploy process?"*
 - *"Find notes mentioning staging environment"*
 
-**Navigate project files:**
-- *"Show me the file tree of the api project"*
-- *"List the files under src/ in project 2"*
-- *"Search the api project for any function that mentions 'auth'"*
-- *"Grep the web project for TODO comments"*
+**Navigate shared project files:**
+- *"Show me the shared file tree of the api project"*
+- *"List the files under the shared src/ directory in project 2"*
+- *"Search the api project's shared files for any function that mentions 'auth'"*
+- *"Grep the web project's shared files for TODO comments"*
 
 **Cross-project tasks:**
 - *"I'm building a new endpoint — check the shared API schema and follow the same patterns"*

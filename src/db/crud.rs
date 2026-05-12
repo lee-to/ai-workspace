@@ -56,17 +56,27 @@ fn strip_windows_verbatim_prefix(path: &str) -> Option<String> {
     }
 }
 
-#[cfg(windows)]
-fn add_windows_verbatim_prefix(path: &str) -> Option<String> {
-    if path.starts_with(r"\\?\") {
-        None
-    } else if let Some(rest) = path.strip_prefix(r"\\") {
-        Some(format!(r"\\?\UNC\{}", rest))
-    } else if path.len() > 2 && path.as_bytes().get(1) == Some(&b':') {
-        Some(format!(r"\\?\{}", path))
-    } else {
-        None
+fn project_path_lookup_key(path: &str) -> String {
+    let path = strip_windows_verbatim_prefix(path).unwrap_or_else(|| path.to_string());
+    let path = path.replace('\\', "/");
+    let path = path.trim_end_matches('/').to_string();
+
+    #[cfg(windows)]
+    {
+        path.to_ascii_lowercase()
     }
+
+    #[cfg(not(windows))]
+    {
+        path
+    }
+}
+
+fn path_is_same_or_child(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
@@ -398,47 +408,29 @@ impl Db {
     /// Find project whose path is a prefix of the given cwd
     pub fn find_project_by_cwd(&self, cwd: &str) -> Result<Option<Project>> {
         debug!("Finding project by cwd: {}", cwd);
-        if let Some(project) = self.find_project_by_cwd_path(cwd)? {
-            return Ok(Some(project));
-        }
+        let cwd_key = project_path_lookup_key(cwd);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, slug, path, created_at FROM projects")?;
+        let projects = stmt
+            .query_map([], |row| {
+                Ok(Project {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    slug: row.get(2)?,
+                    path: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        #[cfg(windows)]
-        {
-            if let Some(path) = strip_windows_verbatim_prefix(cwd)
-                && path != cwd
-                && let Some(project) = self.find_project_by_cwd_path(&path)?
-            {
-                return Ok(Some(project));
-            }
-
-            if let Some(path) = add_windows_verbatim_prefix(cwd)
-                && path != cwd
-                && let Some(project) = self.find_project_by_cwd_path(&path)?
-            {
-                return Ok(Some(project));
-            }
-        }
-
-        Ok(None)
-    }
-
-    fn find_project_by_cwd_path(&self, cwd: &str) -> Result<Option<Project>> {
-        let mut stmt = self.conn.prepare(
-            "SELECT id, name, slug, path, created_at FROM projects WHERE ?1 = path OR ?1 LIKE path || '/%' ORDER BY length(path) DESC LIMIT 1",
-        )?;
-        let mut rows = stmt.query_map(params![cwd], |row| {
-            Ok(Project {
-                id: row.get(0)?,
-                name: row.get(1)?,
-                slug: row.get(2)?,
-                path: row.get(3)?,
-                created_at: row.get(4)?,
+        Ok(projects
+            .into_iter()
+            .filter(|project| {
+                let project_key = project_path_lookup_key(&project.path);
+                path_is_same_or_child(&cwd_key, &project_key)
             })
-        })?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
-        }
+            .max_by_key(|project| project_path_lookup_key(&project.path).len()))
     }
 
     pub fn get_project_by_id(&self, id: i64) -> Result<Option<Project>> {
@@ -2879,6 +2871,30 @@ mod tests {
         db.create_project("proj", "/home/user/proj").unwrap();
         let p = db
             .find_project_by_cwd("/home/user/proj/src/lib")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.name, "proj");
+    }
+
+    #[test]
+    fn find_project_by_cwd_accepts_windows_child_path() {
+        let db = test_db();
+        db.create_project("proj", r"C:\tmp\ai-workspace-project")
+            .unwrap();
+        let p = db
+            .find_project_by_cwd(r"C:\tmp\ai-workspace-project\src")
+            .unwrap()
+            .unwrap();
+        assert_eq!(p.name, "proj");
+    }
+
+    #[test]
+    fn find_project_by_cwd_accepts_windows_verbatim_registered_path() {
+        let db = test_db();
+        db.create_project("proj", r"\\?\C:\tmp\ai-workspace-project")
+            .unwrap();
+        let p = db
+            .find_project_by_cwd(r"C:\tmp\ai-workspace-project\src")
             .unwrap()
             .unwrap();
         assert_eq!(p.name, "proj");
