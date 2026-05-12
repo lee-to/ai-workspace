@@ -355,7 +355,7 @@ pub enum Command {
     },
     /// Show project status
     Status,
-    /// Export project config to .ai-workspace.json
+    /// Export project-scoped config to .ai-workspace.json (group notes stay local)
     Export,
     /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile .ai-workspace.json
     Sync,
