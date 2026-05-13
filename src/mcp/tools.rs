@@ -878,8 +878,8 @@ fn workspace_search_fulltext(
         query, limit
     );
 
-    // Bounded lazy refresh keeps common edits fresh; matching directory hits
-    // are revalidated below before snippets can be returned.
+    // Bounded lazy refresh keeps common edits fresh; matching directory-owned
+    // file hits are revalidated below before snippets can be returned.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {
         log::warn!("refresh_stale failed: {}", e);
         return tool_error(id, "Fulltext search refresh failed");

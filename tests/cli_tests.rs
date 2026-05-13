@@ -183,11 +183,33 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
-    let file_meta_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files_fts_meta", [], |row| row.get(0))
+    assert_eq!(version, 4);
+    let indexed_file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(file_meta_rows, 1);
+    assert_eq!(indexed_file_rows, 0);
+    let legacy_fts_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(legacy_fts_rows, 0);
+    drop(conn);
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["search", "legacy"]);
+    assert!(
+        success,
+        "search should lazily repopulate migrated index: {stderr}"
+    );
+    assert!(
+        stdout.contains("readme.md"),
+        "migrated search should find the shared file after lazy refresh: {stdout}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let indexed_file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed_file_rows, 1);
 }
 
 #[test]

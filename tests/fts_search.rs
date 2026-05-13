@@ -29,6 +29,15 @@ fn run(db: &PathBuf, dir: &std::path::Path, args: &[&str]) -> (String, String, b
     )
 }
 
+fn assert_hit_path(stdout: &str, path: &str) {
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(path) && line.contains("  [id=")),
+        "expected hit path {path}: {stdout}"
+    );
+}
+
 #[test]
 fn cli_search_finds_indexed_md_file() {
     let (_dbdir, db) = temp_db();
@@ -73,10 +82,59 @@ fn cli_search_dir_share_indexes_children() {
     run(&db, proj.path(), &["share", "docs"]);
 
     let (stdout, _, _) = run(&db, proj.path(), &["search", "alpha_topic"]);
-    assert!(stdout.contains("docs"), "expected docs hit: {}", stdout);
+    assert_hit_path(&stdout, "docs/a.md");
 
     let (stdout, _, _) = run(&db, proj.path(), &["search", "bravo_topic"]);
-    assert!(stdout.contains("docs"));
+    assert_hit_path(&stdout, "docs/b.md");
+}
+
+#[test]
+fn cli_search_dir_share_refreshes_edited_child_file() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proj.path().join("docs")).unwrap();
+    fs::write(proj.path().join("docs/a.md"), "old_child_marker").unwrap();
+    fs::write(proj.path().join("docs/b.md"), "steady_child_marker").unwrap();
+
+    run(&db, proj.path(), &["init", "--name", "p"]);
+    run(&db, proj.path(), &["share", "docs"]);
+
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    fs::write(proj.path().join("docs/a.md"), "new_child_marker").unwrap();
+
+    let (stdout, _, _) = run(&db, proj.path(), &["search", "new_child_marker"]);
+    assert_hit_path(&stdout, "docs/a.md");
+
+    let (stdout, _, _) = run(&db, proj.path(), &["search", "old_child_marker"]);
+    assert!(
+        !stdout.contains("docs/a.md"),
+        "old child content should disappear after lazy refresh: {}",
+        stdout
+    );
+}
+
+#[test]
+fn cli_search_dir_share_removes_deleted_child_file() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proj.path().join("docs")).unwrap();
+    fs::write(proj.path().join("docs/a.md"), "deleted_child_marker").unwrap();
+    fs::write(proj.path().join("docs/b.md"), "remaining_child_marker").unwrap();
+
+    run(&db, proj.path(), &["init", "--name", "p"]);
+    run(&db, proj.path(), &["share", "docs"]);
+
+    fs::remove_file(proj.path().join("docs/a.md")).unwrap();
+
+    let (stdout, _, _) = run(&db, proj.path(), &["search", "deleted_child_marker"]);
+    assert!(
+        !stdout.contains("docs/a.md"),
+        "deleted child should be removed from the index: {}",
+        stdout
+    );
+
+    let (stdout, _, _) = run(&db, proj.path(), &["search", "remaining_child_marker"]);
+    assert_hit_path(&stdout, "docs/b.md");
 }
 
 #[test]
