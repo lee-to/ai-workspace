@@ -6,7 +6,7 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::db::{Db, ScopeChange, SharedItemUpdate};
+use crate::db::{Db, ScopeChange, SharedItemUpdate, validate_project_rel_path};
 use crate::models::{
     ArtifactDependencyKind, ArtifactReaction, EventSeverity, EventStatus, ServiceLinkKind,
     WorkspaceEventKind,
@@ -888,25 +888,16 @@ pub fn run(cmd: Command) -> Result<()> {
             let project = require_project(&db)?;
 
             let project_root = Path::new(&project.path);
-            let full_path = project_root.join(&path);
+            let validated = validate_project_rel_path(project_root, &path)?;
 
-            // Verify the path exists and is within the project root
-            let canonical = full_path
-                .canonicalize()
-                .map_err(|_| anyhow::anyhow!("Path not found: {}", full_path.display()))?;
-            let canonical_root = project_root.canonicalize()?;
-            if !canonical.starts_with(&canonical_root) {
-                bail!("Path is outside project directory");
-            }
-
-            let share_id = if canonical.is_dir() {
-                info!("Sharing directory: {}", path);
-                let id = db.share_dir(project.id, &path, label.as_deref())?;
-                print_success(format!("Shared dir '{}' (id={})", path, id));
+            let share_id = if validated.canonical_path.is_dir() {
+                info!("Sharing directory: {}", validated.rel_path);
+                let id = db.share_dir(project.id, &validated.rel_path, label.as_deref())?;
+                print_success(format!("Shared dir '{}' (id={})", validated.rel_path, id));
                 id
             } else {
-                let id = db.share_file(project.id, &path, label.as_deref())?;
-                print_success(format!("Shared '{}' (id={})", path, id));
+                let id = db.share_file(project.id, &validated.rel_path, label.as_deref())?;
+                print_success(format!("Shared '{}' (id={})", validated.rel_path, id));
                 id
             };
 

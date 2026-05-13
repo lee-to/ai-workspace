@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
 use rusqlite::{Connection, Row, params, types::Type};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -28,6 +28,56 @@ pub struct SharedItemUpdate {
 
 pub struct Db {
     conn: Connection,
+}
+
+pub struct ValidatedProjectPath {
+    pub rel_path: String,
+    pub canonical_path: PathBuf,
+}
+
+pub fn validate_project_rel_path(
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<ValidatedProjectPath> {
+    let input = Path::new(rel_path);
+    let mut normalized = PathBuf::new();
+
+    for component in input.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("Path is outside project directory: {}", rel_path);
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("Path must be relative to project directory: {}", rel_path);
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("Path must name a file or directory inside project directory");
+    }
+
+    let canonical_root = project_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize project root: {}",
+            project_root.display()
+        )
+    })?;
+    let full_path = canonical_root.join(&normalized);
+    let canonical_path = full_path
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("Path not found: {}", full_path.display()))?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        anyhow::bail!("Path is outside project directory: {}", rel_path);
+    }
+
+    Ok(ValidatedProjectPath {
+        rel_path: normalized.to_string_lossy().replace('\\', "/"),
+        canonical_path,
+    })
 }
 
 fn parse_row_enum<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
@@ -2164,6 +2214,32 @@ impl Db {
             .get_project_by_id(project_id)?
             .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
         let mut report = SyncReport::default();
+        struct ValidatedConfigShare<'a> {
+            entry: &'a ShareEntry,
+            path: String,
+            kind: SharedItemKind,
+        }
+
+        let project_root = Path::new(&project.path);
+        let validated_shares = config
+            .share
+            .iter()
+            .map(|entry| {
+                let validated = validate_project_rel_path(project_root, entry.path())?;
+                let kind = entry.kind().unwrap_or_else(|| {
+                    if validated.canonical_path.is_dir() {
+                        SharedItemKind::Dir
+                    } else {
+                        SharedItemKind::File
+                    }
+                });
+                Ok(ValidatedConfigShare {
+                    entry,
+                    path: validated.rel_path,
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -2257,41 +2333,30 @@ impl Db {
             .map(|(_, p, _, _)| p.clone())
             .collect();
         let desired_share_paths: std::collections::HashSet<String> =
-            config.share.iter().map(|s| s.path().to_string()).collect();
+            validated_shares.iter().map(|s| s.path.clone()).collect();
 
         // Add missing shares (INSERT OR IGNORE to handle UNIQUE constraint)
-        for entry in &config.share {
-            let desired_kind = entry.kind().unwrap_or_else(|| {
-                let full_path = Path::new(&project.path).join(entry.path());
-                if full_path.is_dir() {
-                    SharedItemKind::Dir
-                } else {
-                    SharedItemKind::File
-                }
-            });
-            if !current_share_paths.contains(entry.path()) {
-                debug!(
-                    "sync: adding share '{}' kind={}",
-                    entry.path(),
-                    desired_kind
-                );
+        for share in &validated_shares {
+            let entry = share.entry;
+            if !current_share_paths.contains(&share.path) {
+                debug!("sync: adding share '{}' kind={}", share.path, share.kind);
                 tx.execute(
                     "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES (?1, ?2, ?3, ?4)",
-                    params![desired_kind.as_str(), entry.path(), project_id, entry.label()],
+                    params![share.kind.as_str(), share.path.as_str(), project_id, entry.label()],
                 )?;
                 if tx.changes() > 0 {
                     report.shares_added += 1;
                 }
             } else if let Some((id, _path, current_kind, current_label)) = current_shares
                 .iter()
-                .find(|(_, path, _, _)| path == entry.path())
-                && (*current_kind != desired_kind || current_label.as_deref() != entry.label())
+                .find(|(_, path, _, _)| path == &share.path)
+                && (*current_kind != share.kind || current_label.as_deref() != entry.label())
             {
                 debug!(
                     "sync: updating share '{}' kind {} -> {}, label {:?} -> {:?}",
-                    entry.path(),
+                    share.path,
                     current_kind,
-                    desired_kind,
+                    share.kind,
                     current_label,
                     entry.label()
                 );
@@ -2299,7 +2364,7 @@ impl Db {
                     "UPDATE shared_items
                      SET kind = ?1, label = ?2, updated_at = datetime('now')
                      WHERE id = ?3",
-                    params![desired_kind.as_str(), entry.label(), id],
+                    params![share.kind.as_str(), entry.label(), id],
                 )?;
             }
         }
@@ -2314,27 +2379,28 @@ impl Db {
         }
 
         // --- Artifact dependencies for project-owned shares ---
-        for entry in &config.share {
+        for share in &validated_shares {
+            let entry = share.entry;
             let Some(desired_dependencies) = entry.dependencies() else {
                 continue;
             };
             debug!(
                 "sync: reconciling {} dependencies for share '{}'",
                 desired_dependencies.len(),
-                entry.path()
+                share.path
             );
             let item_id: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM shared_items
                      WHERE project_id = ?1 AND path = ?2 AND kind IN ('file', 'dir')",
-                    params![project_id, entry.path()],
+                    params![project_id, share.path.as_str()],
                     |row| row.get(0),
                 )
                 .ok();
             let Some(item_id) = item_id else {
                 warn!(
                     "Config dependency sync skipped for missing share '{}'",
-                    entry.path()
+                    share.path
                 );
                 continue;
             };
@@ -2713,6 +2779,15 @@ mod tests {
     fn test_db() -> Db {
         let tmp = NamedTempFile::new().unwrap();
         Db::open(tmp.path()).unwrap()
+    }
+
+    fn temp_project(db: &Db, name: &str) -> (tempfile::TempDir, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let id = db
+            .create_project(name, path.to_string_lossy().as_ref())
+            .unwrap();
+        (dir, id)
     }
 
     fn notes_fts_row_count(db: &Db) -> i64 {
@@ -4253,7 +4328,9 @@ mod tests {
     #[test]
     fn sync_adds_missing_groups_and_shares() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        std::fs::write(dir.path().join("api.json"), "{}").unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
@@ -4285,7 +4362,8 @@ mod tests {
     #[test]
     fn sync_preserves_configured_share_kind() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
@@ -4308,10 +4386,55 @@ mod tests {
     }
 
     #[test]
+    fn sync_rejects_parent_directory_share_path() {
+        let db = test_db();
+        let (_dir, pid) = temp_project(&db, "proj");
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("../secret.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_rejects_symlink_escape_share_path() {
+        use std::os::unix::fs::symlink;
+
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), dir.path().join("escape.md")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("escape.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
     fn sync_reconciles_artifact_dependencies_from_config() {
         let db = test_db();
+        let api_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(api_dir.path().join("docs")).unwrap();
+        std::fs::write(api_dir.path().join("docs/auth.md"), "# Auth").unwrap();
+        let api_path = api_dir.path().canonicalize().unwrap();
         let api = db
-            .create_project_with_slug("API", "/tmp/api-sync", Some("api"))
+            .create_project_with_slug("API", api_path.to_string_lossy().as_ref(), Some("api"))
             .unwrap();
         db.create_project_with_slug("Auth", "/tmp/auth-sync", Some("auth"))
             .unwrap();
@@ -4455,7 +4578,8 @@ mod tests {
     #[test]
     fn sync_duplicate_share_path_handled() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("existing.txt"), "existing").unwrap();
         db.share_file(pid, "existing.txt", None).unwrap();
 
         let config = WorkspaceConfig {
@@ -4477,7 +4601,8 @@ mod tests {
     #[test]
     fn sync_idempotent() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("file.txt"), "file").unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
