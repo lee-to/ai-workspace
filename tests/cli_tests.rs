@@ -420,6 +420,51 @@ fn test_rm_by_label() {
 }
 
 #[test]
+fn test_rm_ambiguous_label_requires_id() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("first.txt"), "first").unwrap();
+    fs::write(project_dir.path().join("second.txt"), "second").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let (first_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["share", "first.txt", "--label", "dup"],
+    );
+    let (second_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["share", "second.txt", "--label", "dup"],
+    );
+    let first_id = parse_id(&first_stdout);
+    let second_id = parse_id(&second_stdout);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["rm", "dup"]);
+
+    assert!(!success, "ambiguous rm should fail");
+    assert!(stdout.contains("ID"));
+    assert!(stdout.contains("Kind"));
+    assert!(stdout.contains("Label"));
+    assert!(stdout.contains("Value"));
+    assert!(stdout.contains("Scope"));
+    assert!(stdout.contains("Source"));
+    assert!(stdout.contains(&first_id.to_string()));
+    assert!(stdout.contains(&second_id.to_string()));
+    assert!(stderr.contains("Label 'dup' matches multiple items. Re-run with item ID."));
+
+    let (stdout, _, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["rm", &first_id.to_string()]);
+    assert!(success, "rm by explicit id should succeed");
+    assert!(stdout.contains(&format!("Removed item id={first_id}")));
+
+    let (stdout, _, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success);
+    assert!(!stdout.contains("first.txt"));
+    assert!(stdout.contains("second.txt"));
+}
+
+#[test]
 fn test_rm_by_path() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -748,6 +793,77 @@ fn test_artifact_dependency_commands_and_status_summary() {
         "artifact deps after undepend should succeed: {stderr}"
     );
     assert!(stdout.contains("Artifact dependencies: (none)"));
+}
+
+#[test]
+fn test_artifact_depends_ambiguous_item_label_requires_id() {
+    let (_db_dir, db_path) = temp_db();
+    let api_dir = tempfile::tempdir().unwrap();
+    let auth_dir = tempfile::tempdir().unwrap();
+
+    fs::write(api_dir.path().join("first.yaml"), "first").unwrap();
+    fs::write(api_dir.path().join("second.yaml"), "second").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "core",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["init", "--name", "API", "--slug", "api", "--group", "core"],
+    );
+    let (first_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "first.yaml", "--label", "contract"],
+    );
+    let (second_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "second.yaml", "--label", "contract"],
+    );
+    let first_id = parse_id(&first_stdout);
+    let second_id = parse_id(&second_stdout);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "contract",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+
+    assert!(!success, "ambiguous artifact target should fail");
+    assert!(stdout.contains(&first_id.to_string()));
+    assert!(stdout.contains(&second_id.to_string()));
+    assert!(stderr.contains("Label 'contract' matches multiple items. Re-run with item ID."));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            &first_id.to_string(),
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    assert!(success, "artifact depends by id should succeed: {stderr}");
+    assert!(stdout.contains("Marked"));
 }
 
 #[test]
@@ -1109,6 +1225,53 @@ fn test_edit_note_label() {
 
     let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
     assert!(stdout.contains("new-label"));
+}
+
+#[test]
+fn test_edit_ambiguous_label_requires_id() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("notes.md"), "file").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let (file_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["share", "notes.md", "--label", "dup"],
+    );
+    let (note_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["note", "--scope", "project", "--label", "dup", "old text"],
+    );
+    let file_id = parse_id(&file_stdout);
+    let note_id = parse_id(&note_stdout);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["edit", "dup", "--label", "renamed"],
+    );
+
+    assert!(!success, "ambiguous edit should fail");
+    assert!(stdout.contains(&file_id.to_string()));
+    assert!(stdout.contains(&note_id.to_string()));
+    assert!(stdout.contains("notes.md"));
+    assert!(stdout.contains("old text"));
+    assert!(stderr.contains("Label 'dup' matches multiple items. Re-run with item ID."));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["edit", &note_id.to_string(), "--label", "renamed"],
+    );
+    assert!(success, "edit by explicit id should succeed: {stderr}");
+    assert!(stdout.contains("Updated item"));
+
+    let (stdout, _, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success);
+    assert!(stdout.contains("renamed"));
+    assert!(stdout.contains("notes.md"));
 }
 
 #[test]

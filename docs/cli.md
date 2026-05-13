@@ -103,6 +103,8 @@ ai-workspace edit <target> [--content <text>] [--label <label>] [--scope <scope>
 
 Target resolution follows the same order as `rm`: numeric ID, then label, then path.
 
+If a label matches more than one visible shared item, `edit` prints the matching candidates and exits without changing anything. Re-run the command with the numeric item ID shown in the table.
+
 At least one of `--content`, `--label`, or `--scope` must be provided.
 
 Changing `--content` or `--scope` is only valid for notes. Files and directories only support `--label` changes.
@@ -278,6 +280,20 @@ Resolution order:
 1. Try as numeric ID (scoped to current project)
 2. Try as label match
 3. Try as path match
+
+If a label matches more than one visible shared item, `rm` prints a candidate table with IDs and exits without deleting anything. Re-run with the numeric item ID to remove the intended item.
+
+Ambiguous labels are rejected:
+
+```text
++----+------+-------+------------+---------+--------+
+| ID | Kind | Label | Value      | Scope   | Source |
++----+------+-------+------------+---------+--------+
+| 12 | file | dup   | first.txt  | project | api    |
+| 13 | file | dup   | second.txt | project | api    |
++----+------+-------+------------+---------+--------+
+Error: Label 'dup' matches multiple items. Re-run with item ID.
+```
 
 ### `status`
 
