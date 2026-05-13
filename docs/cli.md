@@ -352,7 +352,8 @@ ai-workspace search <query> [--limit <n>]
 - Only `.md` files are indexed.
 - Files larger than 1 MB or with invalid UTF-8 are skipped.
 - Indexing happens automatically on `share` and when `init` auto-shares files.
-- Before each search, files whose mtime has changed on disk are lazily refreshed (bounded to 200 indexed rows per call), and shared directories are reconciled for added/deleted child `.md` files.
+- Before each search, files whose mtime has changed on disk are lazily refreshed with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
+- Deleted indexed child `.md` files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `reindex`.
 - Russian/English text is supported at the normalization level, but there is no stemming.
 
 For existing databases created before FTS was added, run `reindex` once to populate the index.

@@ -270,11 +270,18 @@ pub fn reindex_all(db: &Db) -> Result<IndexStats> {
 /// Bounded to `max_checks` to keep search latency predictable.
 pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
     let start = Instant::now();
-    let metas = db.list_file_index_meta()?;
+    if max_checks == 0 {
+        debug!("refresh_stale: refreshed 0 files in {:?}", start.elapsed());
+        return Ok(0);
+    }
+
+    let metas = db.list_file_index_meta(max_checks)?;
+    let mut remaining_checks = max_checks;
     let mut refreshed = 0usize;
     for (indexed_file_id, shared_item_id, rel_path, abs_path, old_mtime, old_size) in
-        metas.into_iter().take(max_checks)
+        metas.into_iter()
     {
+        remaining_checks -= 1;
         let Some(item) = db.get_item_by_id(shared_item_id)? else {
             db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
@@ -318,17 +325,25 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
         }
     }
 
-    for project in db.list_projects()? {
-        let project_root = PathBuf::from(&project.path);
-        for item in db.get_shared_items_for_project(project.id)? {
-            match item.kind {
-                SharedItemKind::File | SharedItemKind::Dir => {
-                    if refresh_if_stale(db, &item, &project_root)? {
-                        refreshed += 1;
-                    }
-                }
-                SharedItemKind::Note => {}
-            }
+    for item in db.list_unindexed_file_items(remaining_checks)? {
+        let Some(project_id) = item.project_id else {
+            db.delete_file_index(item.id)?;
+            refreshed += 1;
+            continue;
+        };
+        let Some(project) = db.get_project_by_id(project_id)? else {
+            db.delete_file_index(item.id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        let stats = index_shared_item(db, &item, &PathBuf::from(&project.path))?;
+        if stats.indexed > 0
+            || stats.skipped_size > 0
+            || stats.skipped_non_utf8 > 0
+            || stats.skipped_missing > 0
+        {
+            refreshed += 1;
         }
     }
 
@@ -545,6 +560,27 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(db.search_files("public_marker", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refresh_stale_zero_budget_does_not_reconcile_unindexed_directory() {
+        let (db, proj, pid) = setup();
+        fs::create_dir_all(proj.path().join("docs")).unwrap();
+        fs::write(
+            proj.path().join("docs/new.md"),
+            "zero_budget_directory_marker",
+        )
+        .unwrap();
+        db.share_dir(pid, "docs", None).unwrap();
+
+        let refreshed = refresh_stale(&db, 0).unwrap();
+
+        assert_eq!(refreshed, 0);
+        assert!(
+            db.search_files("zero_budget_directory_marker", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

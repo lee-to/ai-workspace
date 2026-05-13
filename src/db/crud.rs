@@ -2701,13 +2701,14 @@ impl Db {
 
     /// List all indexed files (for reindex / refresh passes).
     /// Returns (indexed_file_id, shared_item_id, rel_path, abs_path, mtime, size).
-    pub fn list_file_index_meta(&self) -> Result<Vec<IndexedFileMeta>> {
+    pub fn list_file_index_meta(&self, limit: usize) -> Result<Vec<IndexedFileMeta>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, shared_item_id, rel_path, abs_path, mtime, size
              FROM indexed_files
-             ORDER BY id",
+             ORDER BY id
+             LIMIT ?1",
         )?;
-        let rows = stmt.query_map([], |r| {
+        let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 r.get::<_, i64>(1)?,
@@ -2719,6 +2720,32 @@ impl Db {
         })?;
         let out = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    /// List file/dir shared items that have no indexed file rows yet.
+    pub fn list_unindexed_file_items(&self, limit: usize) -> Result<Vec<SharedItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT si.id,
+                    si.kind,
+                    si.path,
+                    si.content,
+                    si.label,
+                    si.project_id,
+                    si.group_id,
+                    si.created_by_project_id,
+                    si.created_at,
+                    si.updated_at
+             FROM shared_items si
+             WHERE (si.kind = 'dir' OR (si.kind = 'file' AND lower(si.path) LIKE '%.md'))
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM indexed_files i
+                   WHERE i.shared_item_id = si.id
+               )
+             ORDER BY si.id
+             LIMIT ?1",
+        )?;
+        self.map_shared_items(&mut stmt, params![limit as i64])
     }
 
     /// List indexed files for one shared item.
