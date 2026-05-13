@@ -3,6 +3,7 @@ use clap::{Subcommand, ValueEnum};
 use log::{debug, info};
 use std::collections::HashSet;
 use std::env;
+use std::fs;
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -23,6 +24,12 @@ pub enum ListTarget {
     All,
     Projects,
     Groups,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+pub enum InitPreset {
+    #[value(name = "ai-factory")]
+    AiFactory,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -269,6 +276,9 @@ pub enum Command {
         /// Group to join or create
         #[arg(short, long)]
         group: Option<String>,
+        /// Baseline project context preset to create and share
+        #[arg(long, value_enum)]
+        preset: Option<InitPreset>,
     },
     /// Share a file or directory with all project groups
     Share {
@@ -759,6 +769,63 @@ const AUTO_SHARE_FILES: &[&str] = &[
 /// Prefixes for key files that may have varying names (e.g. README.md, README.txt).
 const AUTO_SHARE_PREFIXES: &[&str] = &["README"];
 
+struct AiFactoryPresetFile {
+    path: &'static str,
+    label: &'static str,
+    content: &'static str,
+}
+
+struct AiFactoryPresetDir {
+    path: &'static str,
+    label: &'static str,
+}
+
+struct AiFactoryPresetReport {
+    files_created: usize,
+    shares_added: usize,
+    labels_updated: usize,
+}
+
+const AI_FACTORY_DESCRIPTION_TEMPLATE: &str = "# Project Description\n\nDescribe the project purpose, users, tech stack, and important runtime constraints.\n";
+
+const AI_FACTORY_ARCHITECTURE_TEMPLATE: &str = "# Architecture\n\nDocument the main modules, dependency rules, data flow, and important architecture decisions.\n";
+
+const AI_FACTORY_PLAN_TEMPLATE: &str =
+    "# Plan\n\nTrack active implementation plans, decisions, and follow-up tasks here.\n";
+
+const AI_FACTORY_PRESET_FILES: &[AiFactoryPresetFile] = &[
+    AiFactoryPresetFile {
+        path: ".ai-factory/DESCRIPTION.md",
+        label: "ai-factory-description",
+        content: AI_FACTORY_DESCRIPTION_TEMPLATE,
+    },
+    AiFactoryPresetFile {
+        path: ".ai-factory/ARCHITECTURE.md",
+        label: "ai-factory-architecture",
+        content: AI_FACTORY_ARCHITECTURE_TEMPLATE,
+    },
+    AiFactoryPresetFile {
+        path: ".ai-factory/PLAN.md",
+        label: "ai-factory-plan",
+        content: AI_FACTORY_PLAN_TEMPLATE,
+    },
+];
+
+const AI_FACTORY_OPTIONAL_DIRS: &[AiFactoryPresetDir] = &[
+    AiFactoryPresetDir {
+        path: ".ai-factory/references",
+        label: "ai-factory-references",
+    },
+    AiFactoryPresetDir {
+        path: ".ai-factory/patches",
+        label: "ai-factory-patches",
+    },
+    AiFactoryPresetDir {
+        path: ".ai-factory/specs",
+        label: "ai-factory-specs",
+    },
+];
+
 /// Auto-share key project files on init. Returns the count of files shared.
 fn auto_share_key_files(db: &Db, project_id: i64, project_dir: &Path) -> Result<usize> {
     debug!(
@@ -811,11 +878,102 @@ fn auto_share_key_files(db: &Db, project_id: i64, project_dir: &Path) -> Result<
     Ok(count)
 }
 
+fn apply_ai_factory_preset(
+    db: &Db,
+    project_id: i64,
+    project_dir: &Path,
+) -> Result<AiFactoryPresetReport> {
+    let mut files_created = 0;
+    let mut shares_added = 0;
+    let mut labels_updated = 0;
+    let existing_items = db.get_shared_items_for_project(project_id)?;
+
+    for preset_file in AI_FACTORY_PRESET_FILES {
+        let full_path = project_dir.join(preset_file.path);
+        if !full_path.exists() {
+            if let Some(parent) = full_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&full_path, preset_file.content)?;
+            files_created += 1;
+        }
+
+        if let Some(existing) = existing_items
+            .iter()
+            .find(|item| item.path.as_deref() == Some(preset_file.path))
+        {
+            if existing.label.as_deref() != Some(preset_file.label) {
+                let update = SharedItemUpdate {
+                    content: None,
+                    label: Some(Some(preset_file.label.to_string())),
+                    scope_change: None,
+                };
+                db.update_shared_item(existing.id, project_id, &update)?;
+                labels_updated += 1;
+            }
+            continue;
+        }
+
+        let share_id = db.share_file(project_id, preset_file.path, Some(preset_file.label))?;
+        shares_added += 1;
+        if let Some(item) = db.get_item_by_id(share_id)?
+            && let Err(err) = crate::indexer::index_shared_item(db, &item, project_dir)
+        {
+            log::warn!(
+                "FTS indexing failed for ai-factory preset item id={}: {}",
+                share_id,
+                err
+            );
+        }
+    }
+
+    for preset_dir in AI_FACTORY_OPTIONAL_DIRS {
+        let full_path = project_dir.join(preset_dir.path);
+        if !full_path.is_dir() {
+            debug!(
+                "ai-factory preset: optional directory missing, skipping {}",
+                preset_dir.path
+            );
+            continue;
+        }
+
+        if let Some(existing) = existing_items
+            .iter()
+            .find(|item| item.path.as_deref() == Some(preset_dir.path))
+        {
+            if existing.label.as_deref() != Some(preset_dir.label) {
+                let update = SharedItemUpdate {
+                    content: None,
+                    label: Some(Some(preset_dir.label.to_string())),
+                    scope_change: None,
+                };
+                db.update_shared_item(existing.id, project_id, &update)?;
+                labels_updated += 1;
+            }
+            continue;
+        }
+
+        db.share_dir(project_id, preset_dir.path, Some(preset_dir.label))?;
+        shares_added += 1;
+    }
+
+    Ok(AiFactoryPresetReport {
+        files_created,
+        shares_added,
+        labels_updated,
+    })
+}
+
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Serve => crate::mcp::serve(),
 
-        Command::Init { name, slug, group } => {
+        Command::Init {
+            name,
+            slug,
+            group,
+            preset,
+        } => {
             let cwd = env::current_dir()?;
             let cwd_str = cwd.to_string_lossy().to_string();
 
@@ -948,6 +1106,17 @@ pub fn run(cmd: Command) -> Result<()> {
                         "Updated .ai-workspace.json with CLI group at {}",
                         config_path.display()
                     );
+                }
+            }
+
+            if let Some(InitPreset::AiFactory) = preset {
+                let report = apply_ai_factory_preset(&db, project_id, &cwd)?;
+                print_success(format!(
+                    "Applied ai-factory preset: files +{}, shares +{}, labels ~{}",
+                    report.files_created, report.shares_added, report.labels_updated
+                ));
+                if let Some(project) = db.get_project_by_id(project_id)? {
+                    update_workspace_json_if_exists(&db, &project)?;
                 }
             }
 

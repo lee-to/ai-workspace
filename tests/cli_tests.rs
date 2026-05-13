@@ -293,6 +293,147 @@ fn test_init_idempotent() {
 }
 
 #[test]
+fn test_init_ai_factory_preset_creates_and_shares_baseline() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "init --preset ai-factory should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +3, shares +3"));
+
+    for path in [
+        ".ai-factory/DESCRIPTION.md",
+        ".ai-factory/ARCHITECTURE.md",
+        ".ai-factory/PLAN.md",
+    ] {
+        assert!(
+            project_dir.path().join(path).exists(),
+            "{path} should exist"
+        );
+    }
+
+    let conn = Connection::open(&db_path).unwrap();
+    let shared_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items
+             WHERE project_id = 1
+               AND kind = 'file'
+               AND path IN (
+                 '.ai-factory/DESCRIPTION.md',
+                 '.ai-factory/ARCHITECTURE.md',
+                 '.ai-factory/PLAN.md'
+               )
+               AND label IN (
+                 'ai-factory-description',
+                 'ai-factory-architecture',
+                 'ai-factory-plan'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_count, 3);
+}
+
+#[test]
+fn test_init_ai_factory_preset_is_idempotent_and_preserves_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::write(
+        project_dir.path().join(".ai-factory/DESCRIPTION.md"),
+        "custom description",
+    )
+    .unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "second init --preset ai-factory should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +0, shares +0"));
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join(".ai-factory/DESCRIPTION.md")).unwrap(),
+        "custom description"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let shared_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items
+             WHERE project_id = 1
+               AND path IN (
+                 '.ai-factory/DESCRIPTION.md',
+                 '.ai-factory/ARCHITECTURE.md',
+                 '.ai-factory/PLAN.md'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_count, 3);
+}
+
+#[test]
+fn test_init_ai_factory_preset_shares_optional_dirs_when_present() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/references")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/patches")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/specs")).unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "init --preset ai-factory should share optional dirs\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +3, shares +6"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    let dir_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items
+             WHERE project_id = 1
+               AND kind = 'dir'
+               AND path IN (
+                 '.ai-factory/references',
+                 '.ai-factory/patches',
+                 '.ai-factory/specs'
+               )
+               AND label IN (
+                 'ai-factory-references',
+                 'ai-factory-patches',
+                 'ai-factory-specs'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(dir_count, 3);
+}
+
+#[test]
 fn test_share_file() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
