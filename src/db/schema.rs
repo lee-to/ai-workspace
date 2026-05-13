@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::models::normalize_project_slug;
 
-const CURRENT_SCHEMA_VERSION: i64 = 3;
+const CURRENT_SCHEMA_VERSION: i64 = 4;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -86,6 +86,10 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
             debug!("Migration v3: add service graph and event tables");
             ensure_event_schema_objects(conn)
         }
+        4 => {
+            debug!("Migration v4: add per-file markdown index rows");
+            migrate_to_indexed_files(conn)
+        }
         _ => {
             error!("No migration registered for schema version {}", version);
             anyhow::bail!("No migration registered for schema version {}", version);
@@ -146,19 +150,24 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
             tokenize='unicode61 remove_diacritics 2'
         );
 
-        CREATE TABLE IF NOT EXISTS files_fts_meta (
-            shared_item_id INTEGER PRIMARY KEY REFERENCES shared_items(id) ON DELETE CASCADE,
+        CREATE TABLE IF NOT EXISTS indexed_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shared_item_id INTEGER NOT NULL REFERENCES shared_items(id) ON DELETE CASCADE,
+            rel_path TEXT NOT NULL,
             abs_path TEXT NOT NULL,
             mtime INTEGER NOT NULL,
             size INTEGER NOT NULL,
-            indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(shared_item_id, rel_path)
         );
 
         CREATE UNIQUE INDEX IF NOT EXISTS idx_shared_items_project_path
         ON shared_items (project_id, path) WHERE path IS NOT NULL;
 
-        CREATE TRIGGER IF NOT EXISTS trg_shared_items_delete_fts
-        AFTER DELETE ON shared_items
+        DROP TRIGGER IF EXISTS trg_shared_items_delete_fts;
+
+        CREATE TRIGGER IF NOT EXISTS trg_indexed_files_delete_fts
+        AFTER DELETE ON indexed_files
         BEGIN
             DELETE FROM files_fts WHERE rowid = OLD.id;
         END;
@@ -172,9 +181,40 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
         ",
     )?;
     remove_orphaned_notes_fts_rows(conn)?;
-    debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
+    debug!("files_fts virtual table + indexed_files created (unicode61 remove_diacritics 2)");
     ensure_event_schema_objects(conn)?;
     Ok(())
+}
+
+fn migrate_to_indexed_files(conn: &Connection) -> Result<()> {
+    execute_schema_step(
+        conn,
+        "indexed files schema",
+        "
+        CREATE TABLE IF NOT EXISTS indexed_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            shared_item_id INTEGER NOT NULL REFERENCES shared_items(id) ON DELETE CASCADE,
+            rel_path TEXT NOT NULL,
+            abs_path TEXT NOT NULL,
+            mtime INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(shared_item_id, rel_path)
+        );
+
+        DROP TRIGGER IF EXISTS trg_shared_items_delete_fts;
+
+        CREATE TRIGGER IF NOT EXISTS trg_indexed_files_delete_fts
+        AFTER DELETE ON indexed_files
+        BEGIN
+            DELETE FROM files_fts WHERE rowid = OLD.id;
+        END;
+
+        DELETE FROM files_fts;
+        DELETE FROM indexed_files;
+        DROP TABLE IF EXISTS files_fts_meta;
+        ",
+    )
 }
 
 fn remove_orphaned_notes_fts_rows(conn: &Connection) -> Result<()> {
@@ -403,7 +443,7 @@ mod tests {
         assert!(tables.contains(&"groups".to_string()));
         assert!(tables.contains(&"project_groups".to_string()));
         assert!(tables.contains(&"shared_items".to_string()));
-        assert!(tables.contains(&"files_fts_meta".to_string()));
+        assert!(tables.contains(&"indexed_files".to_string()));
         assert!(tables.contains(&"service_links".to_string()));
         assert!(tables.contains(&"artifact_dependencies".to_string()));
         assert!(tables.contains(&"workspace_events".to_string()));
