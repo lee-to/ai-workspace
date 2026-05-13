@@ -262,6 +262,14 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                     ),
                 );
             }
+            if item_id.is_none() && (project_id.is_none() || path.is_none()) {
+                return JsonRpcResponse::error(
+                    id,
+                    McpError::invalid_params(
+                        "Missing required parameters: provide item_id OR project_id+rel_path",
+                    ),
+                );
+            }
 
             let db = match open_db() {
                 Ok(db) => db,
@@ -270,15 +278,10 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
 
             if let Some(iid) = item_id {
                 workspace_read(id, iid, &db, options)
-            } else if let (Some(pid), Some(p)) = (project_id, path) {
-                workspace_read_by_path(id, pid, &p, &db, options)
             } else {
-                JsonRpcResponse::error(
-                    id,
-                    McpError::invalid_params(
-                        "Missing required parameters: provide item_id OR project_id+rel_path",
-                    ),
-                )
+                let pid = project_id.expect("project_id was validated");
+                let p = path.expect("rel_path was validated");
+                workspace_read_by_path(id, pid, &p, &db, options)
             }
         }
         "workspace_search" => {

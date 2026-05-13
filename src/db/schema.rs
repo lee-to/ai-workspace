@@ -18,8 +18,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let detected_version = schema_version(conn)?;
     debug!("Detected database schema version {}", detected_version);
 
-    ensure_current_schema_objects(conn)?;
     migrate_schema(conn, detected_version)?;
+    run_schema_maintenance(conn)?;
 
     info!("Database schema initialized");
     Ok(())
@@ -75,8 +75,8 @@ fn migrate_schema(conn: &Connection, from_version: i64) -> Result<()> {
 fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
     match version {
         1 => {
-            debug!("Migration v1: baseline schema compatibility check");
-            ensure_current_schema_objects(conn)
+            debug!("Migration v1: create core shared-context schema");
+            ensure_core_schema_objects(conn)
         }
         2 => {
             debug!("Migration v2: add project slugs");
@@ -93,10 +93,10 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
     }
 }
 
-fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
+fn ensure_core_schema_objects(conn: &Connection) -> Result<()> {
     execute_schema_step(
         conn,
-        "baseline tables and indexes",
+        "core tables, indexes, and triggers",
         "
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -173,7 +173,6 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
     )?;
     remove_orphaned_notes_fts_rows(conn)?;
     debug!("files_fts virtual table + files_fts_meta created (unicode61 remove_diacritics 2)");
-    ensure_event_schema_objects(conn)?;
     Ok(())
 }
 
@@ -283,6 +282,10 @@ fn unique_slug(base: &str, used_slugs: &mut std::collections::HashSet<String>) -
     }
     used_slugs.insert(candidate.clone());
     candidate
+}
+
+fn run_schema_maintenance(conn: &Connection) -> Result<()> {
+    remove_orphaned_notes_fts_rows(conn)
 }
 
 fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<()> {
@@ -507,6 +510,17 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("newer than supported")
+        );
+        let created_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created_tables, 0,
+            "future schema versions must be rejected before creating local schema objects"
         );
     }
 
