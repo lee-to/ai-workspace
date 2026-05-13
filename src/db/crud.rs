@@ -1788,7 +1788,9 @@ impl Db {
         let id: Option<i64> = self
             .conn
             .query_row(
-                "SELECT id FROM shared_items WHERE project_id = ?1 AND label = ?2 LIMIT 1",
+                "SELECT id FROM shared_items
+                 WHERE (project_id = ?1 OR created_by_project_id = ?1) AND label = ?2
+                 LIMIT 1",
                 params![project_id, label],
                 |row| row.get(0),
             )
@@ -3825,6 +3827,36 @@ mod tests {
         assert!(!db.remove_by_label(pid, "nonexistent").unwrap());
         assert!(db.remove_by_label(pid, "myfile").unwrap());
         assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_by_label_removes_group_note_created_by_project() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let gid = db.get_or_create_group("grp").unwrap();
+        db.add_project_to_group(pid, gid).unwrap();
+        let id = db
+            .add_group_note(gid, pid, "group note", Some("grp-note"))
+            .unwrap();
+
+        assert!(db.remove_by_label(pid, "grp-note").unwrap());
+        assert!(db.get_item_by_id(id).unwrap().is_none());
+    }
+
+    #[test]
+    fn remove_by_label_does_not_remove_group_note_created_by_other_project() {
+        let db = test_db();
+        let owner = db.create_project("owner", "/tmp/owner").unwrap();
+        let other = db.create_project("other", "/tmp/other").unwrap();
+        let gid = db.get_or_create_group("grp").unwrap();
+        db.add_project_to_group(owner, gid).unwrap();
+        db.add_project_to_group(other, gid).unwrap();
+        let id = db
+            .add_group_note(gid, owner, "group note", Some("grp-note"))
+            .unwrap();
+
+        assert!(!db.remove_by_label(other, "grp-note").unwrap());
+        assert!(db.get_item_by_id(id).unwrap().is_some());
     }
 
     #[test]
