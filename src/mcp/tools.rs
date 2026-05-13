@@ -263,6 +263,17 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 );
             }
 
+            let read_by_item_id = item_id.is_some();
+            let read_by_path = project_id.is_some() && path.is_some();
+            if !read_by_item_id && !read_by_path {
+                return JsonRpcResponse::error(
+                    id,
+                    McpError::invalid_params(
+                        "Missing required parameters: provide item_id OR project_id+rel_path",
+                    ),
+                );
+            }
+
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
@@ -273,12 +284,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             } else if let (Some(pid), Some(p)) = (project_id, path) {
                 workspace_read_by_path(id, pid, &p, &db, options)
             } else {
-                JsonRpcResponse::error(
-                    id,
-                    McpError::invalid_params(
-                        "Missing required parameters: provide item_id OR project_id+rel_path",
-                    ),
-                )
+                unreachable!("workspace_read parameters validated before opening the database")
             }
         }
         "workspace_search" => {
@@ -878,8 +884,8 @@ fn workspace_search_fulltext(
         query, limit
     );
 
-    // Bounded lazy refresh keeps common edits fresh; matching directory hits
-    // are revalidated below before snippets can be returned.
+    // Bounded lazy refresh keeps common edits fresh; matching directory-owned
+    // file hits are revalidated below before snippets can be returned.
     if let Err(e) = crate::indexer::refresh_stale(db, 200) {
         log::warn!("refresh_stale failed: {}", e);
         return tool_error(id, "Fulltext search refresh failed");

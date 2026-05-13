@@ -183,11 +183,33 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
-    let file_meta_rows: i64 = conn
-        .query_row("SELECT COUNT(*) FROM files_fts_meta", [], |row| row.get(0))
+    assert_eq!(version, 4);
+    let indexed_file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(file_meta_rows, 1);
+    assert_eq!(indexed_file_rows, 0);
+    let legacy_fts_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM files_fts", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(legacy_fts_rows, 0);
+    drop(conn);
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["search", "legacy"]);
+    assert!(
+        success,
+        "search should lazily repopulate migrated index: {stderr}"
+    );
+    assert!(
+        stdout.contains("readme.md"),
+        "migrated search should find the shared file after lazy refresh: {stdout}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let indexed_file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed_file_rows, 1);
 }
 
 #[test]
@@ -864,6 +886,158 @@ fn test_artifact_depends_ambiguous_item_label_requires_id() {
     );
     assert!(success, "artifact depends by id should succeed: {stderr}");
     assert!(stdout.contains("Marked"));
+}
+
+#[test]
+fn test_artifact_deps_ambiguous_item_label_requires_id() {
+    let (_db_dir, db_path) = temp_db();
+    let api_dir = tempfile::tempdir().unwrap();
+    let auth_dir = tempfile::tempdir().unwrap();
+
+    fs::write(api_dir.path().join("first.yaml"), "first").unwrap();
+    fs::write(api_dir.path().join("second.yaml"), "second").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "core",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["init", "--name", "API", "--slug", "api", "--group", "core"],
+    );
+    let (first_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "first.yaml", "--label", "contract"],
+    );
+    let (second_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "second.yaml", "--label", "contract"],
+    );
+    let first_id = parse_id(&first_stdout);
+    let second_id = parse_id(&second_stdout);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            &first_id.to_string(),
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    assert!(success, "artifact depends by id should succeed: {stderr}");
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, api_dir.path(), &["artifact", "deps", "contract"]);
+
+    assert!(!success, "ambiguous artifact deps target should fail");
+    assert!(stdout.contains(&first_id.to_string()));
+    assert!(stdout.contains(&second_id.to_string()));
+    assert!(stderr.contains("Label 'contract' matches multiple items. Re-run with item ID."));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["artifact", "deps", &first_id.to_string()],
+    );
+    assert!(success, "artifact deps by id should succeed: {stderr}");
+    assert!(stdout.contains("first.yaml"));
+    assert!(stdout.contains("auth"));
+    assert!(stdout.contains("references"));
+    assert!(stdout.contains("update"));
+}
+
+#[test]
+fn test_artifact_undepend_ambiguous_item_label_requires_id() {
+    let (_db_dir, db_path) = temp_db();
+    let api_dir = tempfile::tempdir().unwrap();
+    let auth_dir = tempfile::tempdir().unwrap();
+
+    fs::write(api_dir.path().join("first.yaml"), "first").unwrap();
+    fs::write(api_dir.path().join("second.yaml"), "second").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "core",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["init", "--name", "API", "--slug", "api", "--group", "core"],
+    );
+    let (first_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "first.yaml", "--label", "contract"],
+    );
+    let (second_stdout, _, _) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["share", "second.yaml", "--label", "contract"],
+    );
+    let first_id = parse_id(&first_stdout);
+    let second_id = parse_id(&second_stdout);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            &first_id.to_string(),
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    assert!(success, "artifact depends by id should succeed: {stderr}");
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "undepend",
+            "contract",
+            "auth",
+            "--kind",
+            "references",
+        ],
+    );
+
+    assert!(!success, "ambiguous artifact undepend target should fail");
+    assert!(stdout.contains(&first_id.to_string()));
+    assert!(stdout.contains(&second_id.to_string()));
+    assert!(stderr.contains("Label 'contract' matches multiple items. Re-run with item ID."));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "undepend",
+            &first_id.to_string(),
+            "auth",
+            "--kind",
+            "references",
+        ],
+    );
+    assert!(success, "artifact undepend by id should succeed: {stderr}");
+    assert!(stdout.contains("Removed 1 artifact dependency"));
 }
 
 #[test]

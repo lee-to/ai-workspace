@@ -44,6 +44,9 @@ impl std::fmt::Display for AmbiguousItemLabel {
 
 impl std::error::Error for AmbiguousItemLabel {}
 
+pub type IndexedFileMeta = (i64, i64, String, String, i64, i64);
+pub type SharedItemIndexedFileMeta = (String, String, i64, i64);
+
 pub struct Db {
     conn: Connection,
 }
@@ -2596,48 +2599,95 @@ impl Db {
             "index_file: id={} path={} size={} mtime={}",
             shared_item_id, rel_path, size, mtime
         );
-        self.conn.execute(
-            "DELETE FROM files_fts WHERE rowid = ?1",
-            params![shared_item_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
-            params![shared_item_id, rel_path, content],
-        )?;
-        self.conn.execute(
-            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size, indexed_at) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
-             ON CONFLICT(shared_item_id) DO UPDATE SET \
-                abs_path = excluded.abs_path, \
-                mtime = excluded.mtime, \
-                size = excluded.size, \
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO indexed_files (
+                 shared_item_id,
+                 rel_path,
+                 abs_path,
+                 mtime,
+                 size,
+                 indexed_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(shared_item_id, rel_path) DO UPDATE SET
+                abs_path = excluded.abs_path,
+                mtime = excluded.mtime,
+                size = excluded.size,
                 indexed_at = excluded.indexed_at",
-            params![shared_item_id, abs_path, mtime, size],
+            params![shared_item_id, rel_path, abs_path, mtime, size],
         )?;
+        let indexed_file_id: i64 = tx.query_row(
+            "SELECT id FROM indexed_files WHERE shared_item_id = ?1 AND rel_path = ?2",
+            params![shared_item_id, rel_path],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM files_fts WHERE rowid = ?1",
+            params![indexed_file_id],
+        )?;
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![indexed_file_id, rel_path, content],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Remove a file from the FTS index (and its meta row).
+    /// Remove all indexed files for a shared item from the FTS index.
     pub fn delete_file_index(&self, shared_item_id: i64) -> Result<()> {
         debug!("delete_file_index: id={}", shared_item_id);
         self.conn.execute(
-            "DELETE FROM files_fts WHERE rowid = ?1",
-            params![shared_item_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM files_fts_meta WHERE shared_item_id = ?1",
+            "DELETE FROM indexed_files WHERE shared_item_id = ?1",
             params![shared_item_id],
         )?;
         Ok(())
     }
 
-    /// Get (abs_path, mtime, size) of an indexed file, if present.
+    /// Remove one indexed file for a shared item from the FTS index.
+    pub fn delete_indexed_file(&self, shared_item_id: i64, rel_path: &str) -> Result<()> {
+        debug!(
+            "delete_indexed_file: shared_item_id={} rel_path={}",
+            shared_item_id, rel_path
+        );
+        self.conn.execute(
+            "DELETE FROM indexed_files WHERE shared_item_id = ?1 AND rel_path = ?2",
+            params![shared_item_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one indexed file by its indexed_files row id.
+    pub fn delete_indexed_file_by_id(&self, indexed_file_id: i64) -> Result<()> {
+        debug!("delete_indexed_file_by_id: id={}", indexed_file_id);
+        self.conn.execute(
+            "DELETE FROM indexed_files WHERE id = ?1",
+            params![indexed_file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove every indexed file row and every file FTS row.
+    pub fn clear_file_index(&self) -> Result<()> {
+        debug!("clear_file_index");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM indexed_files", [])?;
+        tx.execute("DELETE FROM files_fts", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get (abs_path, mtime, size) of an indexed file for a shared item, if present.
     #[allow(dead_code)]
     pub fn get_file_index_meta(&self, shared_item_id: i64) -> Result<Option<(String, i64, i64)>> {
         let row = self
             .conn
             .query_row(
-                "SELECT abs_path, mtime, size FROM files_fts_meta WHERE shared_item_id = ?1",
+                "SELECT abs_path, mtime, size
+                 FROM indexed_files
+                 WHERE shared_item_id = ?1
+                 ORDER BY id
+                 LIMIT 1",
                 params![shared_item_id],
                 |r| {
                     Ok((
@@ -2652,14 +2702,69 @@ impl Db {
     }
 
     /// List all indexed files (for reindex / refresh passes).
-    /// Returns (shared_item_id, abs_path, mtime, size).
-    pub fn list_file_index_meta(&self) -> Result<Vec<(i64, String, i64, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT shared_item_id, abs_path, mtime, size FROM files_fts_meta")?;
-        let rows = stmt.query_map([], |r| {
+    /// Returns (indexed_file_id, shared_item_id, rel_path, abs_path, mtime, size).
+    pub fn list_file_index_meta(&self, limit: usize) -> Result<Vec<IndexedFileMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shared_item_id, rel_path, abs_path, mtime, size
+             FROM indexed_files
+             ORDER BY id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let out = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// List file/dir shared items that have no indexed file rows yet.
+    pub fn list_unindexed_file_items(&self, limit: usize) -> Result<Vec<SharedItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT si.id,
+                    si.kind,
+                    si.path,
+                    si.content,
+                    si.label,
+                    si.project_id,
+                    si.group_id,
+                    si.created_by_project_id,
+                    si.created_at,
+                    si.updated_at
+             FROM shared_items si
+             WHERE (si.kind = 'dir' OR (si.kind = 'file' AND lower(si.path) LIKE '%.md'))
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM indexed_files i
+                   WHERE i.shared_item_id = si.id
+               )
+             ORDER BY si.id
+             LIMIT ?1",
+        )?;
+        self.map_shared_items(&mut stmt, params![limit as i64])
+    }
+
+    /// List indexed files for one shared item.
+    /// Returns (rel_path, abs_path, mtime, size).
+    pub fn list_indexed_files_for_item(
+        &self,
+        shared_item_id: i64,
+    ) -> Result<Vec<SharedItemIndexedFileMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path, abs_path, mtime, size
+             FROM indexed_files
+             WHERE shared_item_id = ?1
+             ORDER BY rel_path",
+        )?;
+        let rows = stmt.query_map(params![shared_item_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
@@ -2673,13 +2778,14 @@ impl Db {
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
         debug!("search_files: query='{}' limit={}", query, limit);
         let mut stmt = self.conn.prepare(
-            "SELECT f.rowid, \
+            "SELECT i.shared_item_id, \
                     s.project_id, \
                     f.path, \
                     snippet(files_fts, 1, '[', ']', '…', 12), \
                     bm25(files_fts) \
              FROM files_fts f \
-             JOIN shared_items s ON s.id = f.rowid \
+             JOIN indexed_files i ON i.id = f.rowid \
+             JOIN shared_items s ON s.id = i.shared_item_id \
              WHERE files_fts MATCH ?1 \
              ORDER BY bm25(files_fts) \
              LIMIT ?2",

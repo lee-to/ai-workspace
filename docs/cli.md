@@ -356,7 +356,7 @@ ai-workspace search <query> [--limit <n>]
 | `<query>` | — | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
 | `-l, --limit` | `20` | Maximum number of results |
 
-**Output:** Each hit shows path, shared item id, bm25 rank (lower = better), and a snippet with matched terms wrapped in `[...]`.
+**Output:** Each hit shows path, shared item id, bm25 rank (lower = better), and a snippet with matched terms wrapped in `[...]`. Hits inside shared directories show the exact child `.md` path, not just the shared directory path.
 
 **Query examples:**
 - `deploy` — files containing "deploy"
@@ -368,7 +368,8 @@ ai-workspace search <query> [--limit <n>]
 - Only `.md` files are indexed.
 - Files larger than 1 MB or with invalid UTF-8 are skipped.
 - Indexing happens automatically on `share` and when `init` auto-shares files.
-- Before each search, files whose mtime has changed on disk are lazily refreshed (bounded to 200 per call).
+- Before each search, files whose mtime has changed on disk are lazily refreshed with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
+- Deleted indexed child `.md` files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `reindex`.
 - Russian/English text is supported at the normalization level, but there is no stemming.
 
 For existing databases created before FTS was added, run `reindex` once to populate the index.
