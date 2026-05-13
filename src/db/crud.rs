@@ -26,6 +26,24 @@ pub struct SharedItemUpdate {
     pub scope_change: Option<ScopeChange>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AmbiguousItemLabel {
+    pub label: String,
+    pub matches: Vec<SharedItem>,
+}
+
+impl std::fmt::Display for AmbiguousItemLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Label '{}' matches multiple items. Re-run with item ID.",
+            self.label
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousItemLabel {}
+
 pub type IndexedFileMeta = (i64, i64, String, String, i64, i64);
 pub type SharedItemIndexedFileMeta = (String, String, i64, i64);
 
@@ -529,6 +547,24 @@ impl Db {
             .conn
             .prepare("SELECT id, name, created_at FROM groups WHERE name = ?1")?;
         let mut rows = stmt.query_map(params![name], |row| {
+            Ok(Group {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_group_by_id(&self, id: i64) -> Result<Option<Group>> {
+        debug!("Looking up group by id: {}", id);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM groups WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], |row| {
             Ok(Group {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -1783,43 +1819,6 @@ impl Db {
         Ok(affected > 0)
     }
 
-    pub fn remove_by_label(&self, project_id: i64, label: &str) -> Result<bool> {
-        debug!(
-            "Removing by label: project_id={}, label={}",
-            project_id, label
-        );
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM shared_items
-                 WHERE (project_id = ?1 OR created_by_project_id = ?1) AND label = ?2
-                 LIMIT 1",
-                params![project_id, label],
-                |row| row.get(0),
-            )
-            .ok();
-        match id {
-            Some(id) => self.remove_shared_item(id),
-            None => Ok(false),
-        }
-    }
-
-    pub fn remove_by_path(&self, project_id: i64, path: &str) -> Result<bool> {
-        debug!("Removing by path: project_id={}, path={}", project_id, path);
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM shared_items WHERE project_id = ?1 AND path = ?2 LIMIT 1",
-                params![project_id, path],
-                |row| row.get(0),
-            )
-            .ok();
-        match id {
-            Some(id) => self.remove_shared_item(id),
-            None => Ok(false),
-        }
-    }
-
     pub fn get_shared_items_for_project(&self, project_id: i64) -> Result<Vec<SharedItem>> {
         debug!("Getting shared items for project {}", project_id);
         let mut stmt = self.conn.prepare(
@@ -1827,6 +1826,24 @@ impl Db {
              FROM shared_items WHERE project_id = ?1 ORDER BY created_at",
         )?;
         self.map_shared_items(&mut stmt, params![project_id])
+    }
+
+    pub fn find_items_by_label_for_project(
+        &self,
+        project_id: i64,
+        label: &str,
+    ) -> Result<Vec<SharedItem>> {
+        debug!(
+            "Finding shared items by label: project_id={}, label={}",
+            project_id, label
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
+             FROM shared_items
+             WHERE (project_id = ?1 OR created_by_project_id = ?1) AND label = ?2
+             ORDER BY id",
+        )?;
+        self.map_shared_items(&mut stmt, params![project_id, label])
     }
 
     pub fn search_items(&self, query: &str) -> Result<Vec<SharedItem>> {
@@ -1937,33 +1954,16 @@ impl Db {
         }
 
         // 2. Try as label
-        let item: Option<SharedItem> = self
-            .conn
-            .query_row(
-                "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
-                 FROM shared_items
-                 WHERE (project_id = ?2 OR created_by_project_id = ?2) AND label = ?1
-                 LIMIT 1",
-                params![target, project_id],
-                |row| {
-                    let kind_str: String = row.get(1)?;
-                    Ok(SharedItem {
-                        id: row.get(0)?,
-                        kind: kind_str.parse().unwrap_or(SharedItemKind::File),
-                        path: row.get(2)?,
-                        content: row.get(3)?,
-                        label: row.get(4)?,
-                        project_id: row.get(5)?,
-                        group_id: row.get(6)?,
-                        created_by_project_id: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
-                    })
-                },
-            )
-            .ok();
-        if item.is_some() {
-            return Ok(item);
+        let label_matches = self.find_items_by_label_for_project(project_id, target)?;
+        if label_matches.len() > 1 {
+            return Err(AmbiguousItemLabel {
+                label: target.to_string(),
+                matches: label_matches,
+            }
+            .into());
+        }
+        if let Some(item) = label_matches.into_iter().next() {
+            return Ok(Some(item));
         }
 
         // 3. Try as path
@@ -3925,57 +3925,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_by_label() {
-        let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
-        db.share_file(pid, "file.txt", Some("myfile")).unwrap();
-
-        assert!(!db.remove_by_label(pid, "nonexistent").unwrap());
-        assert!(db.remove_by_label(pid, "myfile").unwrap());
-        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
-    }
-
-    #[test]
-    fn remove_by_label_removes_group_note_created_by_project() {
-        let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
-        let gid = db.get_or_create_group("grp").unwrap();
-        db.add_project_to_group(pid, gid).unwrap();
-        let id = db
-            .add_group_note(gid, pid, "group note", Some("grp-note"))
-            .unwrap();
-
-        assert!(db.remove_by_label(pid, "grp-note").unwrap());
-        assert!(db.get_item_by_id(id).unwrap().is_none());
-    }
-
-    #[test]
-    fn remove_by_label_does_not_remove_group_note_created_by_other_project() {
-        let db = test_db();
-        let owner = db.create_project("owner", "/tmp/owner").unwrap();
-        let other = db.create_project("other", "/tmp/other").unwrap();
-        let gid = db.get_or_create_group("grp").unwrap();
-        db.add_project_to_group(owner, gid).unwrap();
-        db.add_project_to_group(other, gid).unwrap();
-        let id = db
-            .add_group_note(gid, owner, "group note", Some("grp-note"))
-            .unwrap();
-
-        assert!(!db.remove_by_label(other, "grp-note").unwrap());
-        assert!(db.get_item_by_id(id).unwrap().is_some());
-    }
-
-    #[test]
-    fn remove_by_path() {
-        let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
-        db.share_file(pid, "file.txt", None).unwrap();
-
-        assert!(!db.remove_by_path(pid, "other.txt").unwrap());
-        assert!(db.remove_by_path(pid, "file.txt").unwrap());
-    }
-
-    #[test]
     fn remove_note_cleans_fts() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -4074,6 +4023,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(item.id, id);
+    }
+
+    #[test]
+    fn resolve_by_ambiguous_label_errors() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let first = db
+            .add_project_note(pid, "first duplicate", Some("dup"))
+            .unwrap();
+        let second = db.share_file(pid, "dup.txt", Some("dup")).unwrap();
+
+        let err = db.resolve_item_for_project("dup", pid).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Label 'dup' matches multiple items. Re-run with item ID."
+        );
+
+        let ambiguous = err.downcast_ref::<AmbiguousItemLabel>().unwrap();
+        assert_eq!(ambiguous.label, "dup");
+        assert_eq!(ambiguous.matches.len(), 2);
+        assert!(ambiguous.matches.iter().any(|item| item.id == first));
+        assert!(ambiguous.matches.iter().any(|item| item.id == second));
     }
 
     #[test]

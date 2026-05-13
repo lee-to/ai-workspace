@@ -1,4 +1,4 @@
 mod crud;
 mod schema;
 
-pub use crud::{Db, ScopeChange, SharedItemUpdate};
+pub use crud::{AmbiguousItemLabel, Db, ScopeChange, SharedItemUpdate};
