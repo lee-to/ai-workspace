@@ -60,12 +60,24 @@ pub fn validate_project_rel_path(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<ValidatedProjectPath> {
+    #[cfg(unix)]
+    if rel_path.contains('\\') {
+        anyhow::bail!(
+            "Path must use forward slashes and cannot contain backslashes: {}",
+            rel_path
+        );
+    }
+
     let input = Path::new(rel_path);
     let mut normalized = PathBuf::new();
+    let mut stored_parts = Vec::new();
 
     for component in input.components() {
         match component {
-            Component::Normal(part) => normalized.push(part),
+            Component::Normal(part) => {
+                normalized.push(part);
+                stored_parts.push(part.to_string_lossy().to_string());
+            }
             Component::CurDir => {}
             Component::ParentDir => {
                 anyhow::bail!("Path is outside project directory: {}", rel_path);
@@ -96,7 +108,7 @@ pub fn validate_project_rel_path(
     }
 
     Ok(ValidatedProjectPath {
-        rel_path: normalized.to_string_lossy().replace('\\', "/"),
+        rel_path: stored_parts.join("/"),
         canonical_path,
     })
 }
@@ -2843,6 +2855,10 @@ impl Db {
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
         debug!("search_files: query='{}' limit={}", query, limit);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = limit.saturating_mul(4).max(limit.saturating_add(16));
         let mut stmt = self.conn.prepare(
             "SELECT i.id, \
                     i.shared_item_id, \
@@ -2862,7 +2878,7 @@ impl Db {
              ORDER BY bm25(files_fts) \
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |r| {
+        let rows = stmt.query_map(params![query, fetch_limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 FileSearchHit {
@@ -2931,6 +2947,9 @@ impl Db {
             }
 
             hits.push(hit);
+            if hits.len() == limit {
+                break;
+            }
         }
         debug!("search_files: {} hits", hits.len());
         Ok(hits)
@@ -4645,6 +4664,26 @@ mod tests {
         assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn sync_rejects_backslash_ambiguous_share_path() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join(r"..\outside.md"), "decoy").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly(r"..\outside.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("backslashes"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
     #[test]
     fn sync_reconciles_artifact_dependencies_from_config() {
         let db = test_db();
@@ -4927,5 +4966,57 @@ mod tests {
         .unwrap();
         let hits = db.search_files("полнотекстовый", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_files_returns_valid_hit_when_limited_stale_hit_is_first() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "p");
+        let stale_path = dir.path().join("stale.md");
+        let valid_path = dir.path().join("valid.md");
+        std::fs::write(&stale_path, "limit_marker").unwrap();
+        std::fs::write(&valid_path, "limit_marker filler filler filler").unwrap();
+
+        let stale_id = db.share_file(pid, "stale.md", None).unwrap();
+        let valid_id = db.share_file(pid, "valid.md", None).unwrap();
+        db.index_file(
+            stale_id,
+            "stale.md",
+            &stale_path.to_string_lossy(),
+            "limit_marker",
+            1,
+            12,
+        )
+        .unwrap();
+        db.index_file(
+            valid_id,
+            "valid.md",
+            &valid_path.to_string_lossy(),
+            "limit_marker filler filler filler",
+            1,
+            33,
+        )
+        .unwrap();
+        std::fs::remove_file(&stale_path).unwrap();
+
+        let first_raw_path: String = db
+            .conn
+            .query_row(
+                "SELECT f.path
+                 FROM files_fts f
+                 WHERE files_fts MATCH ?1
+                 ORDER BY bm25(files_fts)
+                 LIMIT 1",
+                params!["limit_marker"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_raw_path, "stale.md");
+
+        let hits = db.search_files("limit_marker", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "valid.md");
+        assert!(db.get_file_index_meta(stale_id).unwrap().is_none());
+        assert!(db.get_file_index_meta(valid_id).unwrap().is_some());
     }
 }
