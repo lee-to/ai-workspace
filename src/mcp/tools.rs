@@ -226,6 +226,23 @@ fn shared_grep_scopes(scopes: &[SharedPathScope]) -> Vec<walk::GrepScope> {
     grep_scopes
 }
 
+fn shared_ai_factory_options(
+    scopes: &[SharedPathScope],
+    options: walk::WalkOptions,
+) -> walk::WalkOptions {
+    if scopes.iter().any(|scope| {
+        walk::path_allowed_for_shared_ai_factory(Path::new(&scope.rel_path), options)
+            && !walk::path_allowed_by_options(Path::new(&scope.rel_path), options)
+    }) {
+        walk::WalkOptions {
+            include_hidden: true,
+            include_sensitive: options.include_sensitive,
+        }
+    } else {
+        options
+    }
+}
+
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = params
@@ -656,13 +673,28 @@ fn path_allowed_under_root(root: &Path, path: &Path, options: walk::WalkOptions)
     walk::path_allowed_by_options(rel, options)
 }
 
+fn path_allowed_for_shared_context_under_root(
+    root: &Path,
+    path: &Path,
+    options: walk::WalkOptions,
+) -> bool {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    walk::path_allowed_for_shared_ai_factory(rel, options)
+}
+
 fn read_visible_path(
     id: serde_json::Value,
     canonical_root: &Path,
     canonical: &Path,
     options: walk::WalkOptions,
+    allow_shared_ai_factory: bool,
 ) -> JsonRpcResponse {
-    if !path_allowed_under_root(canonical_root, canonical, options) {
+    let path_allowed = if allow_shared_ai_factory {
+        path_allowed_for_shared_context_under_root(canonical_root, canonical, options)
+    } else {
+        path_allowed_under_root(canonical_root, canonical, options)
+    };
+    if !path_allowed {
         return tool_error(id, PATH_POLICY_DENIED);
     }
 
@@ -675,7 +707,17 @@ fn read_visible_path(
             Ok(entries) => {
                 let mut listing: Vec<String> = entries
                     .filter_map(|e| e.ok())
-                    .filter(|e| path_allowed_under_root(canonical_root, &e.path(), options))
+                    .filter(|e| {
+                        if allow_shared_ai_factory {
+                            path_allowed_for_shared_context_under_root(
+                                canonical_root,
+                                &e.path(),
+                                options,
+                            )
+                        } else {
+                            path_allowed_under_root(canonical_root, &e.path(), options)
+                        }
+                    })
                     .map(|e| e.file_name().to_string_lossy().to_string())
                     .collect();
                 listing.sort();
@@ -737,7 +779,7 @@ fn workspace_read(
         Some(p) => p,
         None => return tool_error(id, "Invalid shared item: missing path"),
     };
-    if !walk::path_allowed_by_options(Path::new(&rel_path), options) {
+    if !walk::path_allowed_for_shared_ai_factory(Path::new(&rel_path), options) {
         return tool_error(id, PATH_POLICY_DENIED);
     }
 
@@ -767,7 +809,7 @@ fn workspace_read(
         return tool_error(id, "Access denied: path is outside project directory");
     }
 
-    read_visible_path(id, &canonical_root, &canonical, options)
+    read_visible_path(id, &canonical_root, &canonical, options, true)
 }
 
 fn workspace_read_by_path(
@@ -845,7 +887,13 @@ fn workspace_read_by_path(
         return tool_error(id, ACCESS_DENIED_NOT_SHARED);
     }
 
-    read_visible_path(id, &canonical_root, &canonical, options)
+    read_visible_path(
+        id,
+        &canonical_root,
+        &canonical,
+        options,
+        matched_scope.is_some(),
+    )
 }
 
 fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcResponse {
@@ -905,10 +953,14 @@ fn workspace_search_fulltext(
                 }
             }
 
-            let options = walk::WalkOptions::default();
             let results: Vec<_> = hits
                 .iter()
-                .filter(|h| walk::path_allowed_by_options(Path::new(&h.path), options))
+                .filter(|h| {
+                    walk::path_allowed_for_shared_ai_factory(
+                        Path::new(&h.path),
+                        walk::WalkOptions::default(),
+                    )
+                })
                 .map(|h| {
                     serde_json::json!({
                         "shared_item_id": h.shared_item_id,
@@ -1035,11 +1087,16 @@ fn project_tree(
         None => None,
     };
 
+    let effective_options = if project_wide {
+        options
+    } else {
+        shared_ai_factory_options(&scopes, options)
+    };
     let entries = walk::walk_project_tree(
         &canonical_root,
         normalized_subdir.as_deref(),
         max_depth,
-        options,
+        effective_options,
     );
     let entries: Vec<_> = if project_wide {
         entries
@@ -1089,7 +1146,14 @@ fn project_grep(
             Err(e) => return tool_error(id, &e),
         };
         let grep_scopes = shared_grep_scopes(&scopes);
-        walk::grep_project_paths(&canonical_root, &grep_scopes, pattern, glob, options)
+        let effective_options = shared_ai_factory_options(&scopes, options);
+        walk::grep_project_paths(
+            &canonical_root,
+            &grep_scopes,
+            pattern,
+            glob,
+            effective_options,
+        )
     };
 
     let matches = match matches {

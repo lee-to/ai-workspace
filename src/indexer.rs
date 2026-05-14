@@ -39,6 +39,19 @@ fn mtime_epoch(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+fn walk_options_for_shared_path(rel: &str) -> WalkOptions {
+    if walk::path_allowed_for_shared_ai_factory(Path::new(rel), WalkOptions::default())
+        && !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default())
+    {
+        WalkOptions {
+            include_hidden: true,
+            include_sensitive: false,
+        }
+    } else {
+        WalkOptions::default()
+    }
+}
+
 /// Read a file and push it into the FTS index. Returns true if indexed,
 /// false if skipped (size/non-utf8/missing).
 fn index_single(
@@ -115,7 +128,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 db.delete_file_index(item.id)?;
                 return Ok(stats);
             }
-            if !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default()) {
+            if !walk::path_allowed_for_shared_ai_factory(Path::new(rel), WalkOptions::default()) {
                 debug!("index: remove hidden/sensitive file share {}", rel);
                 db.delete_file_index(item.id)?;
                 return Ok(stats);
@@ -126,7 +139,12 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
             let Some(rel) = item.path.as_deref() else {
                 return Ok(stats);
             };
-            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
+            let entries = walk_project_tree(
+                project_root,
+                Some(rel),
+                None,
+                walk_options_for_shared_path(rel),
+            );
             let mut seen = std::collections::HashSet::new();
             for entry in entries {
                 if entry.is_dir || !is_md_path(Path::new(&entry.path)) {
@@ -163,7 +181,7 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
                 db.delete_file_index(item.id)?;
                 return Ok(false);
             }
-            if !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default()) {
+            if !walk::path_allowed_for_shared_ai_factory(Path::new(rel), WalkOptions::default()) {
                 db.delete_file_index(item.id)?;
                 return Ok(true);
             }
@@ -184,12 +202,17 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
             }
         }
         SharedItemKind::Dir => {
-            if !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default()) {
+            if !walk::path_allowed_for_shared_ai_factory(Path::new(rel), WalkOptions::default()) {
                 db.delete_file_index(item.id)?;
                 return Ok(true);
             }
 
-            let entries = walk_project_tree(project_root, Some(rel), None, WalkOptions::default());
+            let entries = walk_project_tree(
+                project_root,
+                Some(rel),
+                None,
+                walk_options_for_shared_path(rel),
+            );
             let mut current = std::collections::HashMap::new();
             for entry in entries {
                 if entry.is_dir || !is_md_path(Path::new(&entry.path)) {
@@ -289,9 +312,11 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
         };
 
         if item.path.as_deref().is_none_or(|rel| {
-            !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default())
-        }) || !walk::path_allowed_by_options(Path::new(&rel_path), WalkOptions::default())
-        {
+            !walk::path_allowed_for_shared_ai_factory(Path::new(rel), WalkOptions::default())
+        }) || !walk::path_allowed_for_shared_ai_factory(
+            Path::new(&rel_path),
+            WalkOptions::default(),
+        ) {
             db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
@@ -364,7 +389,7 @@ pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
     let mut refreshed = 0usize;
 
     for hit in hits {
-        if !walk::path_allowed_by_options(Path::new(&hit.path), WalkOptions::default()) {
+        if !walk::path_allowed_for_shared_ai_factory(Path::new(&hit.path), WalkOptions::default()) {
             db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
             refreshed += 1;
             continue;

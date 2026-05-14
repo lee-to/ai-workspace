@@ -1,9 +1,10 @@
-use anyhow::{Result, bail};
+use anyhow::{Context as _, Result, bail};
 use clap::{Subcommand, ValueEnum};
 use log::{debug, info};
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::ErrorKind;
 use std::io::IsTerminal;
 use std::path::Path;
 
@@ -826,6 +827,78 @@ const AI_FACTORY_OPTIONAL_DIRS: &[AiFactoryPresetDir] = &[
     },
 ];
 
+fn ensure_inside_project(path: &Path, canonical_project_dir: &Path, rel_path: &str) -> Result<()> {
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("Cannot resolve ai-factory preset path {rel_path}"))?;
+    if !canonical.starts_with(canonical_project_dir) {
+        bail!("ai-factory preset path escapes project root: {rel_path}");
+    }
+    Ok(())
+}
+
+fn validate_creatable_parent(
+    parent: &Path,
+    canonical_project_dir: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let mut current = parent;
+    loop {
+        match fs::symlink_metadata(current) {
+            Ok(metadata) => {
+                if !metadata.is_dir() {
+                    bail!("ai-factory preset parent is not a directory: {rel_path}");
+                }
+                ensure_inside_project(current, canonical_project_dir, rel_path)?;
+                return Ok(());
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                current = current.parent().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot find existing parent for ai-factory preset path {rel_path}"
+                    )
+                })?;
+            }
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("Cannot inspect ai-factory preset path {rel_path}"));
+            }
+        }
+    }
+}
+
+fn ensure_regular_preset_file(
+    full_path: &Path,
+    canonical_project_dir: &Path,
+    rel_path: &str,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(full_path)
+        .with_context(|| format!("Cannot inspect ai-factory preset file {rel_path}"))?;
+    if !metadata.is_file() {
+        bail!("ai-factory preset file target is not a regular file: {rel_path}");
+    }
+    ensure_inside_project(full_path, canonical_project_dir, rel_path)
+}
+
+fn ensure_real_preset_dir(
+    full_path: &Path,
+    canonical_project_dir: &Path,
+    rel_path: &str,
+) -> Result<bool> {
+    match fs::symlink_metadata(full_path) {
+        Ok(metadata) => {
+            if !metadata.is_dir() {
+                bail!("ai-factory preset directory target is not a real directory: {rel_path}");
+            }
+            ensure_inside_project(full_path, canonical_project_dir, rel_path)?;
+            Ok(true)
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
+        Err(err) => Err(err)
+            .with_context(|| format!("Cannot inspect ai-factory preset directory {rel_path}")),
+    }
+}
+
 /// Auto-share key project files on init. Returns the count of files shared.
 fn auto_share_key_files(db: &Db, project_id: i64, project_dir: &Path) -> Result<usize> {
     debug!(
@@ -887,15 +960,30 @@ fn apply_ai_factory_preset(
     let mut shares_added = 0;
     let mut labels_updated = 0;
     let existing_items = db.get_shared_items_for_project(project_id)?;
+    let canonical_project_dir = project_dir
+        .canonicalize()
+        .context("Cannot resolve project directory for ai-factory preset")?;
 
     for preset_file in AI_FACTORY_PRESET_FILES {
         let full_path = project_dir.join(preset_file.path);
-        if !full_path.exists() {
-            if let Some(parent) = full_path.parent() {
-                fs::create_dir_all(parent)?;
+        match fs::symlink_metadata(&full_path) {
+            Ok(_) => {
+                ensure_regular_preset_file(&full_path, &canonical_project_dir, preset_file.path)?;
             }
-            fs::write(&full_path, preset_file.content)?;
-            files_created += 1;
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                if let Some(parent) = full_path.parent() {
+                    validate_creatable_parent(parent, &canonical_project_dir, preset_file.path)?;
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&full_path, preset_file.content)?;
+                ensure_regular_preset_file(&full_path, &canonical_project_dir, preset_file.path)?;
+                files_created += 1;
+            }
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!("Cannot inspect ai-factory preset file {}", preset_file.path)
+                });
+            }
         }
 
         if let Some(existing) = existing_items
@@ -929,7 +1017,7 @@ fn apply_ai_factory_preset(
 
     for preset_dir in AI_FACTORY_OPTIONAL_DIRS {
         let full_path = project_dir.join(preset_dir.path);
-        if !full_path.is_dir() {
+        if !ensure_real_preset_dir(&full_path, &canonical_project_dir, preset_dir.path)? {
             debug!(
                 "ai-factory preset: optional directory missing, skipping {}",
                 preset_dir.path

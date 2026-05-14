@@ -93,6 +93,19 @@ pub fn path_allowed_by_options(path: &Path, options: WalkOptions) -> bool {
         && (options.include_sensitive || !is_sensitive_path(path))
 }
 
+pub fn path_allowed_for_shared_ai_factory(path: &Path, options: WalkOptions) -> bool {
+    if path_allowed_by_options(path, options) {
+        return true;
+    }
+
+    let mut components = path.components();
+    let Some(Component::Normal(first)) = components.next() else {
+        return false;
+    };
+
+    first == ".ai-factory" && (options.include_sensitive || !is_sensitive_path(path))
+}
+
 /// Check if a file is likely binary by looking for null bytes in the first 8KB.
 fn is_binary(path: &Path) -> bool {
     let Ok(mut file) = std::fs::File::open(path) else {
