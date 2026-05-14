@@ -401,6 +401,16 @@ fn update_workspace_json_if_exists(db: &Db, project: &crate::models::Project) ->
     Ok(())
 }
 
+fn validate_config_share_paths(
+    project_dir: &Path,
+    config: &crate::models::WorkspaceConfig,
+) -> Result<()> {
+    for entry in &config.share {
+        validate_project_rel_path(project_dir, entry.path())?;
+    }
+    Ok(())
+}
+
 fn print_success(message: impl AsRef<str>) {
     let prefix = style_ok("[ok]");
     println!("{} {}", prefix, message.as_ref());
@@ -769,6 +779,9 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
             });
             let project_slug = slug.or_else(|| config.as_ref().and_then(|cfg| cfg.slug.clone()));
+            if let Some(ref cfg) = config {
+                validate_config_share_paths(&cwd, cfg)?;
+            }
 
             info!("Initializing project '{}' at {}", project_name, cwd_str);
             let db = Db::open_default()?;
@@ -1710,7 +1723,21 @@ pub fn run(cmd: Command) -> Result<()> {
                 debug!("Refreshed {} stale files before search", refreshed);
             }
 
-            let hits = db.search_files(&query, limit)?;
+            let mut hits = db.search_files(&query, limit)?;
+            match crate::indexer::refresh_search_hits(&db, &hits) {
+                Ok(refreshed) if refreshed > 0 => {
+                    debug!(
+                        "Refreshed {} matching files before search output",
+                        refreshed
+                    );
+                    hits = db.search_files(&query, limit)?;
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    log::warn!("refresh_search_hits failed: {}", e);
+                    bail!("Search refresh failed");
+                }
+            }
             if hits.is_empty() {
                 print_info(format!("No matches for '{}'", query));
                 return Ok(());

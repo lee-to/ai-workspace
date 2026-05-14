@@ -2739,25 +2739,35 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT f.rowid, \
                     s.project_id, \
+                    s.path, \
+                    p.path, \
+                    m.abs_path, \
                     f.path, \
                     snippet(files_fts, 1, '[', ']', '…', 12), \
                     bm25(files_fts) \
              FROM files_fts f \
              JOIN shared_items s ON s.id = f.rowid \
+             JOIN projects p ON p.id = s.project_id \
+             LEFT JOIN files_fts_meta m ON m.shared_item_id = f.rowid \
              WHERE files_fts MATCH ?1 \
              ORDER BY bm25(files_fts) \
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![query, limit as i64], |r| {
-            Ok(FileSearchHit {
-                shared_item_id: r.get(0)?,
-                project_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                path: r.get(2)?,
-                snippet: r.get(3)?,
-                rank: r.get(4)?,
-            })
+            Ok((
+                FileSearchHit {
+                    shared_item_id: r.get(0)?,
+                    project_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                    path: r.get(5)?,
+                    snippet: r.get(6)?,
+                    rank: r.get(7)?,
+                },
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
         })?;
-        let hits: Vec<FileSearchHit> = rows
+        let rows: Vec<(FileSearchHit, String, String, Option<String>)> = rows
             .filter_map(|r| match r {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -2766,6 +2776,48 @@ impl Db {
                 }
             })
             .collect();
+        drop(stmt);
+
+        let mut hits = Vec::new();
+        for (hit, item_path, project_path, abs_path) in rows {
+            let item_rel = Path::new(&item_path);
+            let hit_rel = Path::new(&hit.path);
+            let options = crate::walk::WalkOptions::default();
+            if !crate::walk::path_allowed_by_options(item_rel, options)
+                || !crate::walk::path_allowed_by_options(hit_rel, options)
+            {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            }
+
+            let project_root = Path::new(&project_path);
+            let Ok(validated_item) = validate_project_rel_path(project_root, &item_path) else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            let Ok(validated_hit) = validate_project_rel_path(project_root, &hit.path) else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            if validated_hit.canonical_path != validated_item.canonical_path {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            }
+            let Some(abs_path) = abs_path else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            let Ok(canonical_meta) = Path::new(&abs_path).canonicalize() else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            if canonical_meta != validated_item.canonical_path {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            }
+
+            hits.push(hit);
+        }
         debug!("search_files: {} hits", hits.len());
         Ok(hits)
     }
@@ -4427,6 +4479,58 @@ mod tests {
     }
 
     #[test]
+    fn sync_canonicalizes_valid_alias_share_paths() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        std::fs::write(dir.path().join("docs/guide.md"), "# Guide").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![
+                ShareEntry::PathOnly("./README.md".to_string()),
+                ShareEntry::PathOnly("docs/./guide.md".to_string()),
+            ],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 2);
+
+        let mut paths = db
+            .get_shared_items_for_project(pid)
+            .unwrap()
+            .into_iter()
+            .filter_map(|item| item.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["README.md", "docs/guide.md"]);
+    }
+
+    #[test]
+    fn sync_rejects_parent_component_even_when_final_path_is_inside_root() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs/../README.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
     fn sync_reconciles_artifact_dependencies_from_config() {
         let db = test_db();
         let api_dir = tempfile::tempdir().unwrap();
@@ -4636,12 +4740,14 @@ mod tests {
     #[test]
     fn index_and_search_file() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("doc.md"), "hello rustaceans world").unwrap();
         let id = db.share_file(pid, "doc.md", None).unwrap();
+        let abs_path = dir.path().join("doc.md");
         db.index_file(
             id,
             "doc.md",
-            "/tmp/p/doc.md",
+            &abs_path.to_string_lossy(),
             "hello rustaceans world",
             100,
             22,
@@ -4658,11 +4764,13 @@ mod tests {
     #[test]
     fn index_file_upsert_replaces_content() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("a.md"), "bravo").unwrap();
         let id = db.share_file(pid, "a.md", None).unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "alpha", 1, 5)
+        let abs_path = dir.path().join("a.md");
+        db.index_file(id, "a.md", &abs_path.to_string_lossy(), "alpha", 1, 5)
             .unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "bravo", 2, 5)
+        db.index_file(id, "a.md", &abs_path.to_string_lossy(), "bravo", 2, 5)
             .unwrap();
 
         let hits = db.search_files("bravo", 10).unwrap();
@@ -4689,12 +4797,14 @@ mod tests {
     #[test]
     fn search_cyrillic() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("ru.md"), "привет мир полнотекстовый поиск").unwrap();
         let id = db.share_file(pid, "ru.md", None).unwrap();
+        let abs_path = dir.path().join("ru.md");
         db.index_file(
             id,
             "ru.md",
-            "/tmp/p/ru.md",
+            &abs_path.to_string_lossy(),
             "привет мир полнотекстовый поиск",
             1,
             40,

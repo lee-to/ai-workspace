@@ -1451,7 +1451,8 @@ fn test_init_rejects_json_share_path_traversal() {
     }"#;
     fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
 
-    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--group", "team-a"]);
     assert!(
         !success,
         "init should reject path traversal from config\nstderr:\n{stderr}"
@@ -1459,6 +1460,13 @@ fn test_init_rejects_json_share_path_traversal() {
     assert!(
         stderr.contains("outside project directory"),
         "stderr should explain unsafe path\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["list"]);
+    assert!(success, "list should succeed after rejected init: {stderr}");
+    assert!(
+        !stdout.contains("unsafe") && !stdout.contains("team-a"),
+        "rejected init should not persist project or group state\nstdout:\n{stdout}"
     );
 }
 
