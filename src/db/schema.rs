@@ -18,8 +18,8 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     let detected_version = schema_version(conn)?;
     debug!("Detected database schema version {}", detected_version);
 
-    ensure_current_schema_objects(conn)?;
     migrate_schema(conn, detected_version)?;
+    run_schema_maintenance(conn)?;
 
     info!("Database schema initialized");
     Ok(())
@@ -75,8 +75,8 @@ fn migrate_schema(conn: &Connection, from_version: i64) -> Result<()> {
 fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
     match version {
         1 => {
-            debug!("Migration v1: baseline schema compatibility check");
-            ensure_current_schema_objects(conn)
+            debug!("Migration v1: create core shared-context schema");
+            ensure_core_schema_objects(conn)
         }
         2 => {
             debug!("Migration v2: add project slugs");
@@ -97,10 +97,10 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
     }
 }
 
-fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
+fn ensure_core_schema_objects(conn: &Connection) -> Result<()> {
     execute_schema_step(
         conn,
-        "baseline tables and indexes",
+        "core tables, indexes, and triggers",
         "
         CREATE TABLE IF NOT EXISTS projects (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,7 +182,6 @@ fn ensure_current_schema_objects(conn: &Connection) -> Result<()> {
     )?;
     remove_orphaned_notes_fts_rows(conn)?;
     debug!("files_fts virtual table + indexed_files created (unicode61 remove_diacritics 2)");
-    ensure_event_schema_objects(conn)?;
     Ok(())
 }
 
@@ -323,6 +322,10 @@ fn unique_slug(base: &str, used_slugs: &mut std::collections::HashSet<String>) -
     }
     used_slugs.insert(candidate.clone());
     candidate
+}
+
+fn run_schema_maintenance(conn: &Connection) -> Result<()> {
+    remove_orphaned_notes_fts_rows(conn)
 }
 
 fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<()> {
@@ -548,6 +551,179 @@ mod tests {
                 .to_string()
                 .contains("newer than supported")
         );
+        let created_tables: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'projects'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            created_tables, 0,
+            "future schema versions must be rejected before creating local schema objects"
+        );
+    }
+
+    #[test]
+    fn init_db_migrates_legacy_schema_snapshot() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                path TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE project_groups (
+                project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+                group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+                PRIMARY KEY (project_id, group_id)
+            );
+
+            CREATE TABLE shared_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL CHECK (kind IN ('file', 'dir', 'note')),
+                path TEXT,
+                content TEXT,
+                label TEXT,
+                project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+                group_id INTEGER REFERENCES groups(id) ON DELETE CASCADE,
+                created_by_project_id INTEGER REFERENCES projects(id),
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                CHECK (
+                    (kind IN ('file', 'dir') AND path IS NOT NULL AND project_id IS NOT NULL AND content IS NULL AND group_id IS NULL)
+                    OR
+                    (kind = 'note' AND content IS NOT NULL AND project_id IS NOT NULL AND group_id IS NULL AND path IS NULL)
+                    OR
+                    (kind = 'note' AND content IS NOT NULL AND group_id IS NOT NULL AND project_id IS NULL AND path IS NULL AND created_by_project_id IS NOT NULL)
+                )
+            );
+
+            CREATE VIRTUAL TABLE notes_fts USING fts5(label, content);
+            CREATE VIRTUAL TABLE files_fts USING fts5(
+                path,
+                content,
+                tokenize='unicode61 remove_diacritics 2'
+            );
+            CREATE TABLE files_fts_meta (
+                shared_item_id INTEGER PRIMARY KEY REFERENCES shared_items(id) ON DELETE CASCADE,
+                abs_path TEXT NOT NULL,
+                mtime INTEGER NOT NULL,
+                size INTEGER NOT NULL,
+                indexed_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE UNIQUE INDEX idx_shared_items_project_path
+            ON shared_items (project_id, path) WHERE path IS NOT NULL;
+
+            INSERT INTO projects (id, name, path) VALUES
+                (1, 'Legacy API', '/tmp/legacy-api'),
+                (2, 'Legacy API', '/tmp/legacy-api-copy');
+            INSERT INTO groups (id, name) VALUES (1, 'legacy-group');
+            INSERT INTO project_groups (project_id, group_id) VALUES (1, 1);
+            INSERT INTO shared_items (id, kind, path, label, project_id)
+            VALUES (1, 'file', 'readme.md', 'legacy-readme', 1);
+            INSERT INTO shared_items (id, kind, content, label, group_id, created_by_project_id)
+            VALUES (2, 'note', 'legacy note content', 'legacy-note', 1, 1);
+            INSERT INTO notes_fts (rowid, label, content)
+            VALUES (2, 'legacy-note', 'legacy note content');
+            INSERT INTO files_fts (rowid, path, content)
+            VALUES (1, 'readme.md', 'legacy file token');
+            ",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+
+        let slugs: Vec<String> = conn
+            .prepare("SELECT slug FROM projects ORDER BY id")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(slugs, vec!["legacy-api", "legacy-api-2"]);
+
+        let unique_slug_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_projects_slug'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unique_slug_index, 1);
+
+        for (kind, name) in [
+            ("index", "idx_workspace_events_source"),
+            ("trigger", "trg_shared_items_delete_notes_fts"),
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = ?1 AND name = ?2",
+                    params![kind, name],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{name} should exist after migration");
+        }
+
+        for table in [
+            "indexed_files",
+            "service_links",
+            "artifact_dependencies",
+            "workspace_events",
+            "event_targets",
+            "event_artifacts",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    params![table],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "{table} should exist after migration");
+        }
+
+        let removed_legacy_meta_table: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'files_fts_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(removed_legacy_meta_table, 0);
+
+        let shared_file_label: String = conn
+            .query_row(
+                "SELECT label FROM shared_items WHERE project_id = 1 AND path = 'readme.md'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(shared_file_label, "legacy-readme");
+
+        let note_matches: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM notes_fts WHERE notes_fts MATCH 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(note_matches, 1);
     }
 
     #[test]
