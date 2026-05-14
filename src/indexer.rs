@@ -147,7 +147,7 @@ fn index_single(
                 e
             );
             stats.skipped_missing += 1;
-            db.delete_file_index(shared_item_id)?;
+            db.delete_indexed_file(shared_item_id, &validated.rel_path)?;
             return Ok(false);
         }
     };
@@ -159,6 +159,7 @@ fn index_single(
             validated.canonical_path.display()
         );
         stats.skipped_size += 1;
+        db.delete_indexed_file(shared_item_id, &validated.rel_path)?;
         return Ok(false);
     }
     let bytes = match std::fs::read(&validated.canonical_path) {
@@ -170,7 +171,7 @@ fn index_single(
                 e
             );
             stats.skipped_missing += 1;
-            db.delete_file_index(shared_item_id)?;
+            db.delete_indexed_file(shared_item_id, &validated.rel_path)?;
             return Ok(false);
         }
     };
@@ -182,6 +183,7 @@ fn index_single(
                 validated.canonical_path.display()
             );
             stats.skipped_non_utf8 += 1;
+            db.delete_indexed_file(shared_item_id, &validated.rel_path)?;
             return Ok(false);
         }
     };
@@ -220,9 +222,6 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
             index_single(db, item.id, &validated, &mut stats)?;
         }
         SharedItemKind::Dir => {
-            // MVP: index all .md files under the shared dir as a single
-            // aggregate document keyed by the dir's shared_item_id. This keeps
-            // the FTS→shared_items FK simple at the cost of coarser snippets.
             let Some(rel) = item.path.as_deref() else {
                 return Ok(stats);
             };
@@ -249,9 +248,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 None,
                 WalkOptions::default(),
             );
-            let mut aggregate = String::new();
-            let mut total_size: u64 = 0;
-            let mut latest_mtime: i64 = 0;
+            let mut seen = std::collections::HashSet::new();
             for entry in entries {
                 if entry.is_dir || !is_md_path(Path::new(&entry.path)) {
                     continue;
@@ -259,44 +256,15 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 let Some(child) = validate_child_markdown_path(&root, &entry.path)? else {
                     continue;
                 };
-                let Ok(meta) = std::fs::metadata(&child.canonical_path) else {
-                    stats.skipped_missing += 1;
-                    continue;
-                };
-                if meta.len() > MAX_INDEX_FILE_SIZE {
-                    stats.skipped_size += 1;
-                    debug!("index: skip (size) {}", child.canonical_path.display());
-                    continue;
+                if index_single(db, item.id, &child, &mut stats)? {
+                    seen.insert(child.rel_path);
                 }
-                let Ok(bytes) = std::fs::read(&child.canonical_path) else {
-                    stats.skipped_missing += 1;
-                    continue;
-                };
-                let Ok(text) = String::from_utf8(bytes) else {
-                    stats.skipped_non_utf8 += 1;
-                    warn!("index: skip non-utf8 {}", child.canonical_path.display());
-                    continue;
-                };
-                aggregate.push_str("\n\n### ");
-                aggregate.push_str(&child.rel_path);
-                aggregate.push_str("\n\n");
-                aggregate.push_str(&text);
-                total_size += meta.len();
-                latest_mtime = latest_mtime.max(mtime_epoch(&meta));
-                stats.indexed += 1;
             }
-            if !aggregate.is_empty() {
-                db.index_file(
-                    item.id,
-                    &validated.rel_path,
-                    &validated.canonical_path.to_string_lossy(),
-                    &aggregate,
-                    latest_mtime,
-                    total_size as i64,
-                )?;
-            } else {
-                // No .md content under this dir — ensure index is empty
-                db.delete_file_index(item.id)?;
+
+            for (indexed_rel_path, _, _, _) in db.list_indexed_files_for_item(item.id)? {
+                if !seen.contains(&indexed_rel_path) {
+                    db.delete_indexed_file(item.id, &indexed_rel_path)?;
+                }
             }
         }
         SharedItemKind::Note => {}
@@ -314,17 +282,27 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
     let Some(validated) = validate_indexed_item_path(db, item.id, project_root, rel, None)? else {
         return Ok(true);
     };
-    let Some((_abs, old_mtime, old_size)) = db.get_file_index_meta(item.id)? else {
-        // Not yet indexed — index it now.
-        index_shared_item(db, item, project_root)?;
-        return Ok(true);
-    };
 
     match item.kind {
         SharedItemKind::File => {
-            let Ok(meta) = std::fs::metadata(&validated.canonical_path) else {
+            if !is_md_path(Path::new(rel)) {
                 db.delete_file_index(item.id)?;
                 return Ok(false);
+            }
+            let Some((abs_path, old_mtime, old_size)) = db.get_file_index_meta(item.id)? else {
+                index_shared_item(db, item, project_root)?;
+                return Ok(true);
+            };
+            if canonical_meta_path_allowed(project_root, &abs_path)?.as_ref()
+                != Some(&validated.canonical_path)
+            {
+                index_shared_item(db, item, project_root)?;
+                return Ok(true);
+            }
+
+            let Ok(meta) = std::fs::metadata(&validated.canonical_path) else {
+                db.delete_indexed_file(item.id, rel)?;
+                return Ok(true);
             };
             if meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime {
                 debug!(
@@ -336,7 +314,6 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
             }
         }
         SharedItemKind::Dir => {
-            // For directories we re-scan and compare aggregate mtime/size.
             let root = canonical_root(project_root)?;
             let entries = walk_project_tree(
                 &root,
@@ -344,8 +321,7 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
                 None,
                 WalkOptions::default(),
             );
-            let mut total_size: u64 = 0;
-            let mut latest_mtime: i64 = 0;
+            let mut current = std::collections::HashMap::new();
             for entry in entries {
                 if entry.is_dir || !is_md_path(Path::new(&entry.path)) {
                     continue;
@@ -359,11 +335,33 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
                 if meta.len() > MAX_INDEX_FILE_SIZE {
                     continue;
                 }
-                total_size += meta.len();
-                latest_mtime = latest_mtime.max(mtime_epoch(&meta));
+                current.insert(
+                    child.rel_path,
+                    (child.canonical_path, mtime_epoch(&meta), meta.len() as i64),
+                );
             }
-            if total_size as i64 != old_size || latest_mtime != old_mtime {
-                debug!("refresh: dir aggregate changed for {}", rel);
+
+            let indexed = db.list_indexed_files_for_item(item.id)?;
+            let mut stale = indexed.len() != current.len();
+            if !stale {
+                for (indexed_rel_path, indexed_abs_path, indexed_mtime, indexed_size) in &indexed {
+                    let Some((canonical_path, mtime, size)) = current.get(indexed_rel_path) else {
+                        stale = true;
+                        break;
+                    };
+                    if *mtime != *indexed_mtime
+                        || *size != *indexed_size
+                        || canonical_meta_path_allowed(&root, indexed_abs_path)?.as_ref()
+                            != Some(canonical_path)
+                    {
+                        stale = true;
+                        break;
+                    }
+                }
+            }
+
+            if stale {
+                debug!("refresh: dir children changed for {}", rel);
                 index_shared_item(db, item, project_root)?;
                 return Ok(true);
             }
@@ -378,6 +376,7 @@ pub fn reindex_all(db: &Db) -> Result<IndexStats> {
     let start = Instant::now();
     info!("reindex_all: starting full rebuild");
     let mut stats = IndexStats::default();
+    db.clear_file_index()?;
 
     for project in db.list_projects()? {
         let project_root = PathBuf::from(&project.path);
@@ -413,65 +412,118 @@ pub fn reindex_all(db: &Db) -> Result<IndexStats> {
 /// Bounded to `max_checks` to keep search latency predictable.
 pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
     let start = Instant::now();
-    let metas = db.list_file_index_meta()?;
+    if max_checks == 0 {
+        debug!("refresh_stale: refreshed 0 files in {:?}", start.elapsed());
+        return Ok(0);
+    }
+
+    let metas = db.list_file_index_meta(max_checks)?;
+    let mut remaining_checks = max_checks;
     let mut refreshed = 0usize;
-    for (id, abs_path, old_mtime, old_size) in metas.into_iter().take(max_checks) {
-        let Some(item) = db.get_item_by_id(id)? else {
-            db.delete_file_index(id)?;
+    for (indexed_file_id, shared_item_id, rel_path, abs_path, old_mtime, old_size) in
+        metas.into_iter()
+    {
+        remaining_checks -= 1;
+        let Some(item) = db.get_item_by_id(shared_item_id)? else {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
 
         let Some(pid) = item.project_id else {
-            db.delete_file_index(id)?;
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
         let Some(project) = db.get_project_by_id(pid)? else {
-            db.delete_file_index(id)?;
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
         let root = PathBuf::from(&project.path);
         let Some(rel) = item.path.as_deref() else {
-            db.delete_file_index(id)?;
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
-        let Some(validated) = validate_indexed_item_path(db, id, &root, rel, None)? else {
+        let Some(validated_item) =
+            validate_indexed_item_path(db, shared_item_id, &root, rel, None)?
+        else {
             refreshed += 1;
             continue;
         };
+        let Some(validated_indexed) = validate_child_markdown_path(&root, &rel_path)? else {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
+            refreshed += 1;
+            continue;
+        };
+        let indexed_in_item_scope = match item.kind {
+            SharedItemKind::File => {
+                validated_indexed.canonical_path == validated_item.canonical_path
+            }
+            SharedItemKind::Dir => validated_indexed
+                .canonical_path
+                .starts_with(&validated_item.canonical_path),
+            SharedItemKind::Note => false,
+        };
+        if !indexed_in_item_scope {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
+            refreshed += 1;
+            continue;
+        }
         let Some(canonical_meta) = canonical_meta_path_allowed(&root, &abs_path)? else {
             warn!(
-                "refresh_stale: dropping stale meta path outside project for id={}: {}",
-                id, abs_path
+                "refresh_stale: dropping stale meta path outside project for indexed_file_id={}: {}",
+                indexed_file_id, abs_path
             );
-            db.delete_file_index(id)?;
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
-        if canonical_meta != validated.canonical_path {
-            index_shared_item(db, &item, &root)?;
+        if canonical_meta != validated_indexed.canonical_path {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         }
 
-        let Ok(meta) = std::fs::metadata(&validated.canonical_path) else {
-            db.delete_file_index(id)?;
+        let Ok(meta) = std::fs::metadata(&validated_indexed.canonical_path) else {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
             refreshed += 1;
             continue;
         };
 
-        if item.kind == SharedItemKind::Dir || meta.is_dir() {
-            if refresh_if_stale(db, &item, &root)? {
-                refreshed += 1;
-            }
+        if meta.is_dir() || meta.len() > MAX_INDEX_FILE_SIZE {
+            db.delete_indexed_file_by_id(indexed_file_id)?;
+            refreshed += 1;
         } else if meta.len() as i64 != old_size || mtime_epoch(&meta) != old_mtime {
-            index_shared_item(db, &item, &root)?;
+            let mut stats = IndexStats::default();
+            index_single(db, shared_item_id, &validated_indexed, &mut stats)?;
             refreshed += 1;
         }
     }
+
+    for item in db.list_unindexed_file_items(remaining_checks)? {
+        let Some(project_id) = item.project_id else {
+            db.delete_file_index(item.id)?;
+            refreshed += 1;
+            continue;
+        };
+        let Some(project) = db.get_project_by_id(project_id)? else {
+            db.delete_file_index(item.id)?;
+            refreshed += 1;
+            continue;
+        };
+
+        let stats = index_shared_item(db, &item, &PathBuf::from(&project.path))?;
+        if stats.indexed > 0
+            || stats.skipped_size > 0
+            || stats.skipped_non_utf8 > 0
+            || stats.skipped_missing > 0
+        {
+            refreshed += 1;
+        }
+    }
+
     debug!(
         "refresh_stale: refreshed {} files in {:?}",
         refreshed,
@@ -483,14 +535,14 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
 /// Revalidate FTS hits that could otherwise expose stale unsafe snippets.
 ///
 /// `refresh_stale` is intentionally bounded for latency. Before returning
-/// search snippets, reindex matching directory aggregates because their visible
-/// row path can still contain old hidden/sensitive child content.
+/// search snippets, reindex matching directory-owned file hits because old
+/// indexed rows may still point at hidden/sensitive child paths.
 pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
     let mut refreshed = 0usize;
 
     for hit in hits {
         if !walk::path_allowed_by_options(Path::new(&hit.path), WalkOptions::default()) {
-            db.delete_file_index(hit.shared_item_id)?;
+            db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
             refreshed += 1;
             continue;
         }
@@ -522,21 +574,32 @@ pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
             refreshed += 1;
             continue;
         };
-        if let Some((abs_path, _mtime, _size)) = db.get_file_index_meta(hit.shared_item_id)?
-            && canonical_meta_path_allowed(&root, &abs_path)?.as_ref()
-                != Some(&validated.canonical_path)
-        {
-            db.delete_file_index(hit.shared_item_id)?;
+        let Some(validated_hit) = validate_child_markdown_path(&root, &hit.path)? else {
+            db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
             refreshed += 1;
             continue;
-        }
+        };
 
-        if item.kind != SharedItemKind::Dir && hit.path == validated.rel_path {
-            continue;
+        match item.kind {
+            SharedItemKind::File => {
+                if validated_hit.canonical_path != validated.canonical_path {
+                    db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
+                    refreshed += 1;
+                }
+            }
+            SharedItemKind::Dir => {
+                if !validated_hit
+                    .canonical_path
+                    .starts_with(&validated.canonical_path)
+                {
+                    db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
+                    refreshed += 1;
+                } else if refresh_if_stale(db, &item, &root)? {
+                    refreshed += 1;
+                }
+            }
+            SharedItemKind::Note => {}
         }
-
-        index_shared_item(db, &item, &root)?;
-        refreshed += 1;
     }
 
     Ok(refreshed)
@@ -614,7 +677,7 @@ mod tests {
     }
 
     #[test]
-    fn index_dir_aggregates_md_files() {
+    fn index_dir_indexes_md_files_individually() {
         let (db, proj, pid) = setup();
         fs::create_dir_all(proj.path().join("docs")).unwrap();
         fs::write(proj.path().join("docs/a.md"), "alpha unique_word_aaa").unwrap();
@@ -624,8 +687,12 @@ mod tests {
         let item = db.get_item_by_id(id).unwrap().unwrap();
         let stats = index_shared_item(&db, &item, proj.path()).unwrap();
         assert_eq!(stats.indexed, 2);
-        assert_eq!(db.search_files("unique_word_aaa", 10).unwrap().len(), 1);
-        assert_eq!(db.search_files("unique_word_bbb", 10).unwrap().len(), 1);
+        let a_hits = db.search_files("unique_word_aaa", 10).unwrap();
+        let b_hits = db.search_files("unique_word_bbb", 10).unwrap();
+        assert_eq!(a_hits.len(), 1);
+        assert_eq!(a_hits[0].path, "docs/a.md");
+        assert_eq!(b_hits.len(), 1);
+        assert_eq!(b_hits[0].path, "docs/b.md");
     }
 
     #[test]
@@ -678,7 +745,7 @@ mod tests {
 
         let refreshed = refresh_stale(&db, 200).unwrap();
 
-        assert_eq!(refreshed, 1);
+        assert!(refreshed >= 1);
         assert!(
             db.search_files("stale_secret_marker", 10)
                 .unwrap()
@@ -707,13 +774,34 @@ mod tests {
 
         let refreshed = refresh_stale(&db, 200).unwrap();
 
-        assert_eq!(refreshed, 1);
+        assert!(refreshed >= 1);
         assert!(
             db.search_files("stale_hidden_marker", 10)
                 .unwrap()
                 .is_empty()
         );
         assert_eq!(db.search_files("public_marker", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn refresh_stale_zero_budget_does_not_reconcile_unindexed_directory() {
+        let (db, proj, pid) = setup();
+        fs::create_dir_all(proj.path().join("docs")).unwrap();
+        fs::write(
+            proj.path().join("docs/new.md"),
+            "zero_budget_directory_marker",
+        )
+        .unwrap();
+        db.share_dir(pid, "docs", None).unwrap();
+
+        let refreshed = refresh_stale(&db, 0).unwrap();
+
+        assert_eq!(refreshed, 0);
+        assert!(
+            db.search_files("zero_budget_directory_marker", 10)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

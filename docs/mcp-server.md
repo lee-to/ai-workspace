@@ -135,16 +135,20 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `shared_item_id` | integer | Shared item row id (use with `workspace_read`) |
+| `shared_item_id` | integer | Owning shared item row id |
 | `project_id` | integer | Project the file belongs to |
 | `path` | string | File path relative to the project root |
 | `snippet` | string | Context snippet with matched terms wrapped in `[...]` |
 | `rank` | number | bm25 score (lower = better match) |
 
+Use `workspace_read` with `project_id` and `rel_path` set to the returned `path` to read the exact matched file. This matters for hits inside shared directories because `shared_item_id` points to the shared directory item.
+
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
 - Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
-- Files are indexed automatically when shared. Files whose mtime has changed on disk are lazily refreshed before each search (bounded to 200 per call); matching directory hits are revalidated before snippets are returned so stale aggregates cannot expose hidden/sensitive child content.
+- Files are indexed automatically when shared. Each `.md` file inside a shared directory is indexed as its own search document, so hits point at the exact child path.
+- Files whose mtime has changed on disk are lazily refreshed before each search with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
+- Deleted indexed child files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `ai-workspace reindex`.
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.

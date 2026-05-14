@@ -26,6 +26,27 @@ pub struct SharedItemUpdate {
     pub scope_change: Option<ScopeChange>,
 }
 
+#[derive(Debug, Clone)]
+pub struct AmbiguousItemLabel {
+    pub label: String,
+    pub matches: Vec<SharedItem>,
+}
+
+impl std::fmt::Display for AmbiguousItemLabel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Label '{}' matches multiple items. Re-run with item ID.",
+            self.label
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousItemLabel {}
+
+pub type IndexedFileMeta = (i64, i64, String, String, i64, i64);
+pub type SharedItemIndexedFileMeta = (String, String, i64, i64);
+
 pub struct Db {
     conn: Connection,
 }
@@ -576,6 +597,24 @@ impl Db {
             .conn
             .prepare("SELECT id, name, created_at FROM groups WHERE name = ?1")?;
         let mut rows = stmt.query_map(params![name], |row| {
+            Ok(Group {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                created_at: row.get(2)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn get_group_by_id(&self, id: i64) -> Result<Option<Group>> {
+        debug!("Looking up group by id: {}", id);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id, name, created_at FROM groups WHERE id = ?1")?;
+        let mut rows = stmt.query_map(params![id], |row| {
             Ok(Group {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -1830,41 +1869,6 @@ impl Db {
         Ok(affected > 0)
     }
 
-    pub fn remove_by_label(&self, project_id: i64, label: &str) -> Result<bool> {
-        debug!(
-            "Removing by label: project_id={}, label={}",
-            project_id, label
-        );
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM shared_items WHERE project_id = ?1 AND label = ?2 LIMIT 1",
-                params![project_id, label],
-                |row| row.get(0),
-            )
-            .ok();
-        match id {
-            Some(id) => self.remove_shared_item(id),
-            None => Ok(false),
-        }
-    }
-
-    pub fn remove_by_path(&self, project_id: i64, path: &str) -> Result<bool> {
-        debug!("Removing by path: project_id={}, path={}", project_id, path);
-        let id: Option<i64> = self
-            .conn
-            .query_row(
-                "SELECT id FROM shared_items WHERE project_id = ?1 AND path = ?2 LIMIT 1",
-                params![project_id, path],
-                |row| row.get(0),
-            )
-            .ok();
-        match id {
-            Some(id) => self.remove_shared_item(id),
-            None => Ok(false),
-        }
-    }
-
     pub fn get_shared_items_for_project(&self, project_id: i64) -> Result<Vec<SharedItem>> {
         debug!("Getting shared items for project {}", project_id);
         let mut stmt = self.conn.prepare(
@@ -1872,6 +1876,24 @@ impl Db {
              FROM shared_items WHERE project_id = ?1 ORDER BY created_at",
         )?;
         self.map_shared_items(&mut stmt, params![project_id])
+    }
+
+    pub fn find_items_by_label_for_project(
+        &self,
+        project_id: i64,
+        label: &str,
+    ) -> Result<Vec<SharedItem>> {
+        debug!(
+            "Finding shared items by label: project_id={}, label={}",
+            project_id, label
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
+             FROM shared_items
+             WHERE (project_id = ?1 OR created_by_project_id = ?1) AND label = ?2
+             ORDER BY id",
+        )?;
+        self.map_shared_items(&mut stmt, params![project_id, label])
     }
 
     pub fn search_items(&self, query: &str) -> Result<Vec<SharedItem>> {
@@ -1982,33 +2004,16 @@ impl Db {
         }
 
         // 2. Try as label
-        let item: Option<SharedItem> = self
-            .conn
-            .query_row(
-                "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
-                 FROM shared_items
-                 WHERE (project_id = ?2 OR created_by_project_id = ?2) AND label = ?1
-                 LIMIT 1",
-                params![target, project_id],
-                |row| {
-                    let kind_str: String = row.get(1)?;
-                    Ok(SharedItem {
-                        id: row.get(0)?,
-                        kind: kind_str.parse().unwrap_or(SharedItemKind::File),
-                        path: row.get(2)?,
-                        content: row.get(3)?,
-                        label: row.get(4)?,
-                        project_id: row.get(5)?,
-                        group_id: row.get(6)?,
-                        created_by_project_id: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
-                    })
-                },
-            )
-            .ok();
-        if item.is_some() {
-            return Ok(item);
+        let label_matches = self.find_items_by_label_for_project(project_id, target)?;
+        if label_matches.len() > 1 {
+            return Err(AmbiguousItemLabel {
+                label: target.to_string(),
+                matches: label_matches,
+            }
+            .into());
+        }
+        if let Some(item) = label_matches.into_iter().next() {
+            return Ok(Some(item));
         }
 
         // 3. Try as path
@@ -2660,48 +2665,95 @@ impl Db {
             "index_file: id={} path={} size={} mtime={}",
             shared_item_id, rel_path, size, mtime
         );
-        self.conn.execute(
-            "DELETE FROM files_fts WHERE rowid = ?1",
-            params![shared_item_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
-            params![shared_item_id, rel_path, content],
-        )?;
-        self.conn.execute(
-            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size, indexed_at) \
-             VALUES (?1, ?2, ?3, ?4, datetime('now')) \
-             ON CONFLICT(shared_item_id) DO UPDATE SET \
-                abs_path = excluded.abs_path, \
-                mtime = excluded.mtime, \
-                size = excluded.size, \
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute(
+            "INSERT INTO indexed_files (
+                 shared_item_id,
+                 rel_path,
+                 abs_path,
+                 mtime,
+                 size,
+                 indexed_at
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))
+             ON CONFLICT(shared_item_id, rel_path) DO UPDATE SET
+                abs_path = excluded.abs_path,
+                mtime = excluded.mtime,
+                size = excluded.size,
                 indexed_at = excluded.indexed_at",
-            params![shared_item_id, abs_path, mtime, size],
+            params![shared_item_id, rel_path, abs_path, mtime, size],
         )?;
+        let indexed_file_id: i64 = tx.query_row(
+            "SELECT id FROM indexed_files WHERE shared_item_id = ?1 AND rel_path = ?2",
+            params![shared_item_id, rel_path],
+            |row| row.get(0),
+        )?;
+        tx.execute(
+            "DELETE FROM files_fts WHERE rowid = ?1",
+            params![indexed_file_id],
+        )?;
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![indexed_file_id, rel_path, content],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Remove a file from the FTS index (and its meta row).
+    /// Remove all indexed files for a shared item from the FTS index.
     pub fn delete_file_index(&self, shared_item_id: i64) -> Result<()> {
         debug!("delete_file_index: id={}", shared_item_id);
         self.conn.execute(
-            "DELETE FROM files_fts WHERE rowid = ?1",
-            params![shared_item_id],
-        )?;
-        self.conn.execute(
-            "DELETE FROM files_fts_meta WHERE shared_item_id = ?1",
+            "DELETE FROM indexed_files WHERE shared_item_id = ?1",
             params![shared_item_id],
         )?;
         Ok(())
     }
 
-    /// Get (abs_path, mtime, size) of an indexed file, if present.
+    /// Remove one indexed file for a shared item from the FTS index.
+    pub fn delete_indexed_file(&self, shared_item_id: i64, rel_path: &str) -> Result<()> {
+        debug!(
+            "delete_indexed_file: shared_item_id={} rel_path={}",
+            shared_item_id, rel_path
+        );
+        self.conn.execute(
+            "DELETE FROM indexed_files WHERE shared_item_id = ?1 AND rel_path = ?2",
+            params![shared_item_id, rel_path],
+        )?;
+        Ok(())
+    }
+
+    /// Remove one indexed file by its indexed_files row id.
+    pub fn delete_indexed_file_by_id(&self, indexed_file_id: i64) -> Result<()> {
+        debug!("delete_indexed_file_by_id: id={}", indexed_file_id);
+        self.conn.execute(
+            "DELETE FROM indexed_files WHERE id = ?1",
+            params![indexed_file_id],
+        )?;
+        Ok(())
+    }
+
+    /// Remove every indexed file row and every file FTS row.
+    pub fn clear_file_index(&self) -> Result<()> {
+        debug!("clear_file_index");
+        let tx = self.conn.unchecked_transaction()?;
+        tx.execute("DELETE FROM indexed_files", [])?;
+        tx.execute("DELETE FROM files_fts", [])?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Get (abs_path, mtime, size) of an indexed file for a shared item, if present.
     #[allow(dead_code)]
     pub fn get_file_index_meta(&self, shared_item_id: i64) -> Result<Option<(String, i64, i64)>> {
         let row = self
             .conn
             .query_row(
-                "SELECT abs_path, mtime, size FROM files_fts_meta WHERE shared_item_id = ?1",
+                "SELECT abs_path, mtime, size
+                 FROM indexed_files
+                 WHERE shared_item_id = ?1
+                 ORDER BY id
+                 LIMIT 1",
                 params![shared_item_id],
                 |r| {
                     Ok((
@@ -2716,14 +2768,69 @@ impl Db {
     }
 
     /// List all indexed files (for reindex / refresh passes).
-    /// Returns (shared_item_id, abs_path, mtime, size).
-    pub fn list_file_index_meta(&self) -> Result<Vec<(i64, String, i64, i64)>> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT shared_item_id, abs_path, mtime, size FROM files_fts_meta")?;
-        let rows = stmt.query_map([], |r| {
+    /// Returns (indexed_file_id, shared_item_id, rel_path, abs_path, mtime, size).
+    pub fn list_file_index_meta(&self, limit: usize) -> Result<Vec<IndexedFileMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, shared_item_id, rel_path, abs_path, mtime, size
+             FROM indexed_files
+             ORDER BY id
+             LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], |r| {
             Ok((
                 r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, i64>(5)?,
+            ))
+        })?;
+        let out = rows.collect::<Result<Vec<_>, _>>()?;
+        Ok(out)
+    }
+
+    /// List file/dir shared items that have no indexed file rows yet.
+    pub fn list_unindexed_file_items(&self, limit: usize) -> Result<Vec<SharedItem>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT si.id,
+                    si.kind,
+                    si.path,
+                    si.content,
+                    si.label,
+                    si.project_id,
+                    si.group_id,
+                    si.created_by_project_id,
+                    si.created_at,
+                    si.updated_at
+             FROM shared_items si
+             WHERE (si.kind = 'dir' OR (si.kind = 'file' AND lower(si.path) LIKE '%.md'))
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM indexed_files i
+                   WHERE i.shared_item_id = si.id
+               )
+             ORDER BY si.id
+             LIMIT ?1",
+        )?;
+        self.map_shared_items(&mut stmt, params![limit as i64])
+    }
+
+    /// List indexed files for one shared item.
+    /// Returns (rel_path, abs_path, mtime, size).
+    pub fn list_indexed_files_for_item(
+        &self,
+        shared_item_id: i64,
+    ) -> Result<Vec<SharedItemIndexedFileMeta>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT rel_path, abs_path, mtime, size
+             FROM indexed_files
+             WHERE shared_item_id = ?1
+             ORDER BY rel_path",
+        )?;
+        let rows = stmt.query_map(params![shared_item_id], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
                 r.get::<_, i64>(2)?,
                 r.get::<_, i64>(3)?,
@@ -2737,37 +2844,41 @@ impl Db {
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
         debug!("search_files: query='{}' limit={}", query, limit);
         let mut stmt = self.conn.prepare(
-            "SELECT f.rowid, \
+            "SELECT i.id, \
+                    i.shared_item_id, \
                     s.project_id, \
+                    s.kind, \
                     s.path, \
                     p.path, \
-                    m.abs_path, \
+                    i.abs_path, \
                     f.path, \
                     snippet(files_fts, 1, '[', ']', '…', 12), \
                     bm25(files_fts) \
              FROM files_fts f \
-             JOIN shared_items s ON s.id = f.rowid \
+             JOIN indexed_files i ON i.id = f.rowid \
+             JOIN shared_items s ON s.id = i.shared_item_id \
              JOIN projects p ON p.id = s.project_id \
-             LEFT JOIN files_fts_meta m ON m.shared_item_id = f.rowid \
              WHERE files_fts MATCH ?1 \
              ORDER BY bm25(files_fts) \
              LIMIT ?2",
         )?;
         let rows = stmt.query_map(params![query, limit as i64], |r| {
             Ok((
+                r.get::<_, i64>(0)?,
                 FileSearchHit {
-                    shared_item_id: r.get(0)?,
-                    project_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                    path: r.get(5)?,
-                    snippet: r.get(6)?,
-                    rank: r.get(7)?,
+                    shared_item_id: r.get(1)?,
+                    project_id: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    path: r.get(7)?,
+                    snippet: r.get(8)?,
+                    rank: r.get(9)?,
                 },
-                r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
             ))
         })?;
-        let rows: Vec<(FileSearchHit, String, String, Option<String>)> = rows
+        let rows: Vec<(i64, FileSearchHit, String, String, String, String)> = rows
             .filter_map(|r| match r {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -2779,14 +2890,14 @@ impl Db {
         drop(stmt);
 
         let mut hits = Vec::new();
-        for (hit, item_path, project_path, abs_path) in rows {
+        for (indexed_file_id, hit, item_kind, item_path, project_path, abs_path) in rows {
             let item_rel = Path::new(&item_path);
             let hit_rel = Path::new(&hit.path);
             let options = crate::walk::WalkOptions::default();
             if !crate::walk::path_allowed_by_options(item_rel, options)
                 || !crate::walk::path_allowed_by_options(hit_rel, options)
             {
-                self.delete_file_index(hit.shared_item_id)?;
+                self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             }
 
@@ -2796,23 +2907,26 @@ impl Db {
                 continue;
             };
             let Ok(validated_hit) = validate_project_rel_path(project_root, &hit.path) else {
-                self.delete_file_index(hit.shared_item_id)?;
+                self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             };
-            if validated_hit.canonical_path != validated_item.canonical_path {
-                self.delete_file_index(hit.shared_item_id)?;
+            let hit_in_item_scope = match item_kind.as_str() {
+                "file" => validated_hit.canonical_path == validated_item.canonical_path,
+                "dir" => validated_hit
+                    .canonical_path
+                    .starts_with(&validated_item.canonical_path),
+                _ => false,
+            };
+            if !hit_in_item_scope {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             }
-            let Some(abs_path) = abs_path else {
-                self.delete_file_index(hit.shared_item_id)?;
-                continue;
-            };
             let Ok(canonical_meta) = Path::new(&abs_path).canonicalize() else {
-                self.delete_file_index(hit.shared_item_id)?;
+                self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             };
-            if canonical_meta != validated_item.canonical_path {
-                self.delete_file_index(hit.shared_item_id)?;
+            if canonical_meta != validated_hit.canonical_path {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             }
 
@@ -3944,27 +4058,6 @@ mod tests {
     }
 
     #[test]
-    fn remove_by_label() {
-        let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
-        db.share_file(pid, "file.txt", Some("myfile")).unwrap();
-
-        assert!(!db.remove_by_label(pid, "nonexistent").unwrap());
-        assert!(db.remove_by_label(pid, "myfile").unwrap());
-        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
-    }
-
-    #[test]
-    fn remove_by_path() {
-        let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
-        db.share_file(pid, "file.txt", None).unwrap();
-
-        assert!(!db.remove_by_path(pid, "other.txt").unwrap());
-        assert!(db.remove_by_path(pid, "file.txt").unwrap());
-    }
-
-    #[test]
     fn remove_note_cleans_fts() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -4063,6 +4156,28 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(item.id, id);
+    }
+
+    #[test]
+    fn resolve_by_ambiguous_label_errors() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let first = db
+            .add_project_note(pid, "first duplicate", Some("dup"))
+            .unwrap();
+        let second = db.share_file(pid, "dup.txt", Some("dup")).unwrap();
+
+        let err = db.resolve_item_for_project("dup", pid).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Label 'dup' matches multiple items. Re-run with item ID."
+        );
+
+        let ambiguous = err.downcast_ref::<AmbiguousItemLabel>().unwrap();
+        assert_eq!(ambiguous.label, "dup");
+        assert_eq!(ambiguous.matches.len(), 2);
+        assert!(ambiguous.matches.iter().any(|item| item.id == first));
+        assert!(ambiguous.matches.iter().any(|item| item.id == second));
     }
 
     #[test]
