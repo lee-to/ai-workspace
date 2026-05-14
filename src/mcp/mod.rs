@@ -128,11 +128,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                                 "description": "Include credential-like paths such as .env, .ssh, .aws, *.pem, and *.key (default: false)"
                             }
                         },
-                        "additionalProperties": false,
-                        "oneOf": [
-                            {"required": ["item_id"]},
-                            {"required": ["project_id", "rel_path"]}
-                        ]
+                        "additionalProperties": false
                     }
                 },
                 {
@@ -367,6 +363,22 @@ mod tests {
         assert!(names.contains(&"workspace_service_graph"));
         assert!(names.contains(&"workspace_events"));
         assert!(names.contains(&"workspace_event_details"));
+    }
+
+    #[test]
+    fn workspace_read_schema_uses_claude_api_compatible_top_level_keywords() {
+        let resp = handle_tools_list(json!(1));
+        let result = resp.result.unwrap();
+        let tools = result["tools"].as_array().unwrap();
+        let workspace_read = tools
+            .iter()
+            .find(|tool| tool["name"] == "workspace_read")
+            .expect("workspace_read tool should be present");
+        let input_schema = &workspace_read["inputSchema"];
+
+        assert!(input_schema["oneOf"].is_null());
+        assert!(input_schema["anyOf"].is_null());
+        assert!(input_schema["allOf"].is_null());
     }
 
     #[test]
