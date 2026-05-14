@@ -172,7 +172,7 @@ ai-workspace init
 # → picks up name, slug, groups, shares, notes, and dependencies from .ai-workspace.json
 ```
 
-The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with `.ai-workspace.json` if present. Event history is intentionally not exported.
+The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with `.ai-workspace.json` if present. `.ai-workspace.json` exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
 
 ## Documentation
 

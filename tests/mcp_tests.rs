@@ -268,7 +268,11 @@ fn test_mcp_migrates_legacy_database_and_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
+    let indexed_file_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(indexed_file_rows, 0);
 }
 
 /// Seed a project with a file tree suitable for project_tree/project_grep tests
@@ -516,7 +520,7 @@ fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
-/// Seed a stale directory aggregate beyond workspace_search_fulltext's bounded refresh window.
+/// Seed a stale hidden directory child beyond workspace_search_fulltext's bounded refresh window.
 fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tempfile::TempDir {
     const FILLER_COUNT: usize = 201;
 
@@ -574,18 +578,20 @@ fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tem
         .unwrap();
         let id = tx.last_insert_rowid();
         tx.execute(
-            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
-            params![id, rel, format!("filler_{i:03}_marker")],
-        )
-        .unwrap();
-        tx.execute(
-            "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO indexed_files (shared_item_id, rel_path, abs_path, mtime, size) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 id,
+                &rel,
                 abs.to_string_lossy(),
                 mtime_epoch(&meta),
                 meta.len() as i64
             ],
+        )
+        .unwrap();
+        let indexed_file_id = tx.last_insert_rowid();
+        tx.execute(
+            "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+            params![indexed_file_id, &rel, format!("filler_{i:03}_marker")],
         )
         .unwrap();
     }
@@ -596,19 +602,26 @@ fn seed_stale_directory_fulltext_beyond_refresh_window(db_path: &PathBuf) -> tem
     )
     .unwrap();
     let docs_id = tx.last_insert_rowid();
-    let docs_abs = project_dir.path().join("docs");
-    let stale_aggregate = "### docs/public.md\npublic_beyond_window_marker\n\n### docs/.hidden.md\nstale_hidden_beyond_window_marker\n";
+    let hidden_rel = "docs/.hidden.md";
+    let hidden_abs = project_dir.path().join("docs").join(".hidden.md");
+    let hidden_meta = std::fs::metadata(&hidden_abs).unwrap();
     tx.execute(
-        "INSERT INTO files_fts (rowid, path, content) VALUES (?1, 'docs', ?2)",
-        params![docs_id, stale_aggregate],
-    )
-    .unwrap();
-    tx.execute(
-        "INSERT INTO files_fts_meta (shared_item_id, abs_path, mtime, size) VALUES (?1, ?2, 1, ?3)",
+        "INSERT INTO indexed_files (shared_item_id, rel_path, abs_path, mtime, size) VALUES (?1, ?2, ?3, 1, ?4)",
         params![
             docs_id,
-            docs_abs.to_string_lossy(),
-            stale_aggregate.len() as i64
+            hidden_rel,
+            hidden_abs.to_string_lossy(),
+            hidden_meta.len() as i64
+        ],
+    )
+    .unwrap();
+    let hidden_indexed_file_id = tx.last_insert_rowid();
+    tx.execute(
+        "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
+        params![
+            hidden_indexed_file_id,
+            hidden_rel,
+            "stale_hidden_beyond_window_marker\n"
         ],
     )
     .unwrap();
@@ -983,7 +996,7 @@ fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_childre
         1,
         "only public directory markdown should match: {content}"
     );
-    assert_eq!(results[0]["path"], "docs");
+    assert_eq!(results[0]["path"], "docs/public.md");
     assert!(!content.contains("directory_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_hidden_fulltext_marker"));
 }
@@ -1015,7 +1028,7 @@ fn test_mcp_workspace_search_fulltext_revalidates_stale_directory_beyond_refresh
     let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
     assert!(
         results.is_empty(),
-        "stale directory aggregate beyond refresh window should be revalidated: {content}"
+        "stale hidden directory child beyond refresh window should be revalidated: {content}"
     );
 }
 

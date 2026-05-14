@@ -103,6 +103,8 @@ ai-workspace edit <target> [--content <text>] [--label <label>] [--scope <scope>
 
 Target resolution follows the same order as `rm`: numeric ID, then label, then path.
 
+If a label matches more than one visible shared item, `edit` prints the matching candidates and exits without changing anything. Re-run the command with the numeric item ID shown in the table.
+
 At least one of `--content`, `--label`, or `--scope` must be provided.
 
 Changing `--content` or `--scope` is only valid for notes. Files and directories only support `--label` changes.
@@ -279,6 +281,20 @@ Resolution order:
 2. Try as label match
 3. Try as path match
 
+If a label matches more than one visible shared item, `rm` prints a candidate table with IDs and exits without deleting anything. Re-run with the numeric item ID to remove the intended item.
+
+Ambiguous labels are rejected:
+
+```text
++----+------+-------+------------+---------+--------+
+| ID | Kind | Label | Value      | Scope   | Source |
++----+------+-------+------------+---------+--------+
+| 12 | file | dup   | first.txt  | project | api    |
+| 13 | file | dup   | second.txt | project | api    |
++----+------+-------+------------+---------+--------+
+Error: Label 'dup' matches multiple items. Re-run with item ID.
+```
+
 ### `status`
 
 Show project info, groups, shared items, artifact dependency summaries, and group notes.
@@ -340,7 +356,7 @@ ai-workspace search <query> [--limit <n>]
 | `<query>` | — | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
 | `-l, --limit` | `20` | Maximum number of results |
 
-**Output:** Each hit shows path, shared item id, bm25 rank (lower = better), and a snippet with matched terms wrapped in `[...]`.
+**Output:** Each hit shows path, shared item id, bm25 rank (lower = better), and a snippet with matched terms wrapped in `[...]`. Hits inside shared directories show the exact child `.md` path, not just the shared directory path.
 
 **Query examples:**
 - `deploy` — files containing "deploy"
@@ -352,7 +368,8 @@ ai-workspace search <query> [--limit <n>]
 - Only `.md` files are indexed.
 - Files larger than 1 MB or with invalid UTF-8 are skipped.
 - Indexing happens automatically on `share` and when `init` auto-shares files.
-- Before each search, files whose mtime has changed on disk are lazily refreshed (bounded to 200 per call).
+- Before each search, files whose mtime has changed on disk are lazily refreshed with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
+- Deleted indexed child `.md` files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `reindex`.
 - Russian/English text is supported at the normalization level, but there is no stemming.
 
 For existing databases created before FTS was added, run `reindex` once to populate the index.
