@@ -6,10 +6,10 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::Path;
 
-use crate::db::{Db, ScopeChange, SharedItemUpdate};
+use crate::db::{AmbiguousItemLabel, Db, ScopeChange, SharedItemUpdate};
 use crate::models::{
     ArtifactDependencyKind, ArtifactReaction, EventSeverity, EventStatus, ServiceLinkKind,
-    WorkspaceEventKind,
+    SharedItem, SharedItemKind, WorkspaceEventKind,
 };
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -355,7 +355,7 @@ pub enum Command {
     },
     /// Show project status
     Status,
-    /// Export project config to .ai-workspace.json
+    /// Export project-scoped config to .ai-workspace.json (group notes stay local)
     Export,
     /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile .ai-workspace.json
     Sync,
@@ -589,6 +589,77 @@ fn print_artifact_dependencies(db: &Db, deps: &[crate::models::ArtifactDependenc
     }
     print_table(&["ID", "Item", "Service", "Kind", "Reaction"], &rows);
     Ok(())
+}
+
+fn shared_item_value(item: &SharedItem) -> String {
+    match item.kind {
+        SharedItemKind::Note => item.content.as_deref().unwrap_or("").to_string(),
+        SharedItemKind::File | SharedItemKind::Dir => {
+            item.path.as_deref().unwrap_or("?").to_string()
+        }
+    }
+}
+
+fn normalize_table_cell(input: &str) -> String {
+    input.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn shared_item_scope(db: &Db, item: &SharedItem) -> Result<String> {
+    if item.project_id.is_some() {
+        return Ok("project".to_string());
+    }
+
+    if let Some(group_id) = item.group_id {
+        let group = db
+            .get_group_by_id(group_id)?
+            .map(|group| group.name)
+            .unwrap_or_else(|| format!("group={group_id}"));
+        return Ok(format!("group:{group}"));
+    }
+
+    Ok("-".to_string())
+}
+
+fn shared_item_source(db: &Db, item: &SharedItem) -> Result<String> {
+    if let Some(project_id) = item.project_id.or(item.created_by_project_id) {
+        return project_display_slug(db, project_id);
+    }
+
+    Ok("-".to_string())
+}
+
+fn print_ambiguous_label_candidates(db: &Db, ambiguous: &AmbiguousItemLabel) -> Result<()> {
+    let mut rows = Vec::with_capacity(ambiguous.matches.len());
+    for item in &ambiguous.matches {
+        rows.push(vec![
+            item.id.to_string(),
+            item.kind.to_string(),
+            normalize_table_cell(item.label.as_deref().unwrap_or("-")),
+            truncate_for_cell(&normalize_table_cell(&shared_item_value(item)), 72),
+            normalize_table_cell(&shared_item_scope(db, item)?),
+            normalize_table_cell(&shared_item_source(db, item)?),
+        ]);
+    }
+
+    print_table(&["ID", "Kind", "Label", "Value", "Scope", "Source"], &rows);
+    Ok(())
+}
+
+fn with_ambiguous_label_table<T>(db: &Db, result: Result<T>) -> Result<T> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err) => {
+            if let Some(ambiguous) = err.downcast_ref::<AmbiguousItemLabel>()
+                && let Err(render_err) = print_ambiguous_label_candidates(db, ambiguous)
+            {
+                log::warn!(
+                    "Failed to render ambiguous label candidates: {}",
+                    render_err
+                );
+            }
+            Err(err)
+        }
+    }
 }
 
 fn print_workspace_events(events: &[crate::models::WorkspaceEvent]) {
@@ -990,9 +1061,9 @@ pub fn run(cmd: Command) -> Result<()> {
                 bail!("Nothing to edit. Provide --content, --label, or --scope.");
             }
 
-            let item = db
-                .resolve_item_for_project(&target, project.id)?
-                .ok_or_else(|| anyhow::anyhow!("Item '{}' not found", target))?;
+            let item =
+                with_ambiguous_label_table(&db, db.resolve_item_for_project(&target, project.id))?
+                    .ok_or_else(|| anyhow::anyhow!("Item '{}' not found", target))?;
 
             // Content and scope changes only for notes
             if item.kind != crate::models::SharedItemKind::Note
@@ -1045,33 +1116,30 @@ pub fn run(cmd: Command) -> Result<()> {
             let db = Db::open_default()?;
             let project = require_project(&db)?;
 
-            // Try as numeric ID first (scoped to current project)
-            if let Ok(id) = target.parse::<i64>() {
-                let removed = db.remove_shared_item_for_project(id, project.id)?;
-                if removed {
-                    print_success(format!("Removed item id={}", id));
-                    update_workspace_json_if_exists(&db, &project)?;
-                    return Ok(());
-                }
+            let item =
+                with_ambiguous_label_table(&db, db.resolve_item_for_project(&target, project.id))?;
+
+            let Some(item) = item else {
+                print_info(format!("Item '{}' not found", target));
+                return Ok(());
+            };
+
+            let removed = db.remove_shared_item_for_project(item.id, project.id)?;
+            if !removed {
+                print_info(format!("Item '{}' not found", target));
+                return Ok(());
             }
 
-            // Try as label
-            info!("Trying rm by label: {}", target);
-            if db.remove_by_label(project.id, &target)? {
+            if target.parse::<i64>().ok() == Some(item.id) {
+                print_success(format!("Removed item id={}", item.id));
+            } else if item.label.as_deref() == Some(target.as_str()) {
                 print_success(format!("Removed item with label '{}'", target));
-                update_workspace_json_if_exists(&db, &project)?;
-                return Ok(());
-            }
-
-            // Try as path
-            info!("Trying rm by path: {}", target);
-            if db.remove_by_path(project.id, &target)? {
+            } else if item.path.as_deref() == Some(target.as_str()) {
                 print_success(format!("Removed item with path '{}'", target));
-                update_workspace_json_if_exists(&db, &project)?;
-                return Ok(());
+            } else {
+                print_success(format!("Removed item id={}", item.id));
             }
-
-            print_info(format!("Item '{}' not found", target));
+            update_workspace_json_if_exists(&db, &project)?;
             Ok(())
         }
 
@@ -1336,12 +1404,15 @@ pub fn run(cmd: Command) -> Result<()> {
                         "Parsed artifact depends command: item='{}', service='{}', kind={}, reaction={}",
                         item, service_slug, kind, reaction
                     );
-                    let id = db.add_artifact_dependency(
-                        project.id,
-                        &item,
-                        &service_slug,
-                        kind,
-                        reaction,
+                    let id = with_ambiguous_label_table(
+                        &db,
+                        db.add_artifact_dependency(
+                            project.id,
+                            &item,
+                            &service_slug,
+                            kind,
+                            reaction,
+                        ),
                     )?;
                     info!(
                         "Added artifact dependency id={} project_slug='{}' item='{}' service='{}'",
@@ -1360,7 +1431,10 @@ pub fn run(cmd: Command) -> Result<()> {
                             "Listing artifact dependencies for project_slug='{}' item='{}'",
                             project.slug, item_target
                         );
-                        db.list_artifact_dependencies_for_item(project.id, &item_target)?
+                        with_ambiguous_label_table(
+                            &db,
+                            db.list_artifact_dependencies_for_item(project.id, &item_target),
+                        )?
                     } else {
                         info!(
                             "Listing artifact dependencies for project_slug='{}'",
@@ -1381,8 +1455,10 @@ pub fn run(cmd: Command) -> Result<()> {
                         "Parsed artifact undepend command: item='{}', service='{}', kind={:?}",
                         item, service_slug, kind
                     );
-                    let removed =
-                        db.remove_artifact_dependency(project.id, &item, &service_slug, kind)?;
+                    let removed = with_ambiguous_label_table(
+                        &db,
+                        db.remove_artifact_dependency(project.id, &item, &service_slug, kind),
+                    )?;
                     if removed == 0 {
                         print_info(format!(
                             "No artifact dependencies removed for '{}' -> '{}'",
