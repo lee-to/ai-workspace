@@ -1697,7 +1697,7 @@ fn test_mcp_workspace_read_both_params_error() {
 }
 
 #[test]
-fn test_mcp_workspace_read_invalid_params_before_db_open() {
+fn test_mcp_workspace_read_missing_or_incomplete_selectors_error_before_db_open() {
     let db_dir = tempfile::tempdir().unwrap();
     let db_path = db_dir.path().join("missing-parent").join("workspace.db");
 
@@ -1736,13 +1736,11 @@ fn test_mcp_workspace_read_invalid_params_before_db_open() {
 
     assert_eq!(responses.len(), 3);
     for response in responses {
+        assert!(response["error"].is_object());
         assert_eq!(response["error"]["code"], -32602);
-        assert!(
-            response["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("Missing required parameters"),
-            "workspace_read shape errors should be reported before attempting to open the DB"
+        assert_eq!(
+            response["error"]["message"],
+            "Invalid params: Missing required parameters: provide item_id OR project_id+rel_path"
         );
     }
 }
