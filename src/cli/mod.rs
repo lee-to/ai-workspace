@@ -1,6 +1,6 @@
 use anyhow::{Result, bail};
 use clap::{Subcommand, ValueEnum};
-use log::{debug, info};
+use log::{debug, info, warn};
 use std::collections::HashSet;
 use std::env;
 use std::io::IsTerminal;
@@ -377,7 +377,7 @@ pub enum Command {
 
 /// Resolve the current project from cwd
 fn require_project(db: &Db) -> Result<crate::models::Project> {
-    let cwd = env::current_dir()?;
+    let cwd = current_project_dir()?;
     let cwd_str = cwd.to_string_lossy();
     debug!("Current directory: {}", cwd_str);
     match db.find_project_by_cwd(&cwd_str)? {
@@ -386,6 +386,21 @@ fn require_project(db: &Db) -> Result<crate::models::Project> {
             Ok(p)
         }
         None => bail!("No project found for current directory.\nRun `ai-workspace init` first."),
+    }
+}
+
+fn current_project_dir() -> Result<std::path::PathBuf> {
+    let cwd = env::current_dir()?;
+    match cwd.canonicalize() {
+        Ok(path) => Ok(path),
+        Err(err) => {
+            warn!(
+                "Could not canonicalize current directory '{}': {}",
+                cwd.display(),
+                err
+            );
+            Ok(cwd)
+        }
     }
 }
 
@@ -826,7 +841,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Serve => crate::mcp::serve(),
 
         Command::Init { name, slug, group } => {
-            let cwd = env::current_dir()?;
+            let cwd = current_project_dir()?;
             let cwd_str = cwd.to_string_lossy().to_string();
 
             // Check for .ai-workspace.json
@@ -1745,7 +1760,7 @@ pub fn run(cmd: Command) -> Result<()> {
             }
 
             // Step 2: sync from .ai-workspace.json if present
-            let cwd = env::current_dir()?;
+            let cwd = current_project_dir()?;
             let cwd_str = cwd.to_string_lossy();
             if let Some(project) = db.find_project_by_cwd(&cwd_str)? {
                 let config_path = Path::new(&project.path).join(".ai-workspace.json");

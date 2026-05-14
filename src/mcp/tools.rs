@@ -262,6 +262,14 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                     ),
                 );
             }
+            if item_id.is_none() && (project_id.is_none() || path.is_none()) {
+                return JsonRpcResponse::error(
+                    id,
+                    McpError::invalid_params(
+                        "Missing required parameters: provide item_id OR project_id+rel_path",
+                    ),
+                );
+            }
 
             let read_by_item_id = item_id.is_some();
             let read_by_path = project_id.is_some() && path.is_some();
@@ -284,7 +292,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             } else if let (Some(pid), Some(p)) = (project_id, path) {
                 workspace_read_by_path(id, pid, &p, &db, options)
             } else {
-                unreachable!("workspace_read parameters validated before opening the database")
+                unreachable!("workspace_read parameters are validated before DB access")
             }
         }
         "workspace_search" => {

@@ -1697,6 +1697,55 @@ fn test_mcp_workspace_read_both_params_error() {
 }
 
 #[test]
+fn test_mcp_workspace_read_missing_or_incomplete_selectors_error_before_db_open() {
+    let db_dir = tempfile::tempdir().unwrap();
+    let db_path = db_dir.path().join("missing-parent").join("workspace.db");
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": {}
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": { "project_id": 1 }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": { "rel_path": "readme.md" }
+                }
+            }),
+        ],
+    );
+
+    assert_eq!(responses.len(), 3);
+    for response in responses {
+        assert!(response["error"].is_object());
+        assert_eq!(response["error"]["code"], -32602);
+        assert_eq!(
+            response["error"]["message"],
+            "Invalid params: Missing required parameters: provide item_id OR project_id+rel_path"
+        );
+    }
+}
+
+#[test]
 fn test_mcp_workspace_read_by_path_blocks_hidden_sensitive_by_default() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_tree_project(&db_path);
