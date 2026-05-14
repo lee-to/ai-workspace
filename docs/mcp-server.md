@@ -98,6 +98,7 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads
 - Path traversal protection: rejects absolute paths, parent-directory traversal, and paths outside the project directory
 - Hidden/dotfile and credential-like paths are blocked by default. Hidden sensitive paths such as `.ssh/id_rsa` require both `include_hidden: true` and `include_sensitive: true`.
+- Explicitly shared `.ai-factory` context files are a narrow exception: non-sensitive `.ai-factory/...` paths are readable/searchable by default for the AI Factory preset. This exception is path-scoped and does not make hidden files in other shared directories visible.
 
 ### `workspace_search`
 
@@ -212,7 +213,7 @@ List the shared file tree of a project, respecting `.gitignore` rules. By defaul
 | `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
 | `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown. Hidden/dotfile and credential-like paths are hidden by default; hidden sensitive paths require both opt-in flags.
+**Returns:** Indented text tree of files and directories. Directories are suffixed with `/`. Entries excluded by `.gitignore` are not shown. Hidden/dotfile and credential-like paths are hidden by default; hidden sensitive paths require both opt-in flags. Non-sensitive explicitly shared `.ai-factory/...` context can appear by default, but that exception does not apply to hidden files under other shared scopes.
 
 **Example output:**
 ```
@@ -236,7 +237,7 @@ Search shared project files for a regex pattern, respecting `.gitignore` rules. 
 | `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
 | `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
-**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files, files larger than 1 MB, and hidden/dotfile or credential-like paths unless explicitly included. Unshared files are not opened in the default mode.
+**Returns:** Matches grouped by file with line numbers. Returns up to 100 matches. Skips binary files, files larger than 1 MB, and hidden/dotfile or credential-like paths unless explicitly included. Unshared files are not opened in the default mode. Non-sensitive explicitly shared `.ai-factory/...` context is searchable by default without broadening hidden-file access for other shared scopes.
 
 **Example output:**
 ```

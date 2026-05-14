@@ -30,6 +30,7 @@ pub enum GrepScopeKind {
 pub struct GrepScope {
     pub kind: GrepScopeKind,
     pub rel_path: String,
+    pub allow_shared_ai_factory: bool,
 }
 
 /// Maximum file size for grep scanning (1 MB).
@@ -255,6 +256,7 @@ fn canonical_grep_candidate_allowed(
     canonical_scope_root: &Path,
     candidate_path: &Path,
     options: WalkOptions,
+    allow_shared_ai_factory: bool,
 ) -> bool {
     let Ok(canonical_candidate) = candidate_path.canonicalize() else {
         warn!(
@@ -283,7 +285,12 @@ fn canonical_grep_candidate_allowed(
     let rel = canonical_candidate
         .strip_prefix(canonical_root)
         .unwrap_or(canonical_candidate.as_path());
-    if !path_allowed_by_options(rel, options) {
+    let path_allowed = if allow_shared_ai_factory {
+        path_allowed_for_shared_ai_factory(rel, options)
+    } else {
+        path_allowed_by_options(rel, options)
+    };
+    if !path_allowed {
         warn!(
             "grep: skipping candidate blocked by path policy: {}",
             candidate_path.display()
@@ -305,8 +312,27 @@ pub fn walk_project_tree(
     max_depth: Option<usize>,
     options: WalkOptions,
 ) -> Vec<FileEntry> {
+    walk_project_tree_with_policy(
+        root,
+        subpath,
+        max_depth,
+        options.include_hidden,
+        move |path| path_allowed_by_options(path, options),
+    )
+}
+
+pub fn walk_project_tree_with_policy<F>(
+    root: &Path,
+    subpath: Option<&str>,
+    max_depth: Option<usize>,
+    visit_hidden: bool,
+    path_allowed: F,
+) -> Vec<FileEntry>
+where
+    F: Fn(&Path) -> bool + Send + Sync + 'static,
+{
     if let Some(sub) = subpath
-        && !path_allowed_by_options(Path::new(sub), options)
+        && !path_allowed(Path::new(sub))
     {
         warn!("Walk subpath blocked by policy: {}", sub);
         return Vec::new();
@@ -330,17 +356,21 @@ pub fn walk_project_tree(
 
     let mut builder = ignore::WalkBuilder::new(&walk_root);
     builder
-        .hidden(!options.include_hidden)
+        .hidden(!visit_hidden)
         .git_ignore(true)
         .git_global(true)
         .git_exclude(true)
         .sort_by_file_name(|a, b| a.cmp(b));
 
     let policy_root = root.to_path_buf();
+    let filter_walk_root = walk_root.clone();
     builder.filter_entry(move |entry| {
         let path = entry.path();
+        if path == filter_walk_root {
+            return true;
+        }
         let rel = path.strip_prefix(&policy_root).unwrap_or(path);
-        path_allowed_by_options(rel, options)
+        path_allowed(rel)
     });
 
     if let Some(depth) = max_depth {
@@ -503,7 +533,12 @@ pub fn grep_project_paths(
             continue;
         };
 
-        if !path_allowed_by_options(&normalized, options) {
+        let scope_path_allowed = if scope.allow_shared_ai_factory {
+            path_allowed_for_shared_ai_factory(&normalized, options)
+        } else {
+            path_allowed_by_options(&normalized, options)
+        };
+        if !scope_path_allowed {
             warn!(
                 "grep_project_paths: skipping blocked scope '{}'",
                 scope.rel_path
@@ -531,7 +566,12 @@ pub fn grep_project_paths(
         let canonical_target_rel = canonical_target
             .strip_prefix(&canonical_root)
             .unwrap_or(canonical_target.as_path());
-        if !path_allowed_by_options(canonical_target_rel, options) {
+        let canonical_scope_path_allowed = if scope.allow_shared_ai_factory {
+            path_allowed_for_shared_ai_factory(canonical_target_rel, options)
+        } else {
+            path_allowed_by_options(canonical_target_rel, options)
+        };
+        if !canonical_scope_path_allowed {
             warn!(
                 "grep_project_paths: skipping blocked canonical scope '{}'",
                 scope.rel_path
@@ -572,16 +612,21 @@ pub fn grep_project_paths(
 
         let mut builder = ignore::WalkBuilder::new(&canonical_target);
         builder
-            .hidden(!options.include_hidden)
+            .hidden(!options.include_hidden && !scope.allow_shared_ai_factory)
             .git_ignore(true)
             .git_global(true)
             .git_exclude(true);
 
         let policy_root = canonical_root.clone();
+        let allow_shared_ai_factory = scope.allow_shared_ai_factory;
         builder.filter_entry(move |entry| {
             let path = entry.path();
             let rel = path.strip_prefix(&policy_root).unwrap_or(path);
-            path_allowed_by_options(rel, options)
+            if allow_shared_ai_factory {
+                path_allowed_for_shared_ai_factory(rel, options)
+            } else {
+                path_allowed_by_options(rel, options)
+            }
         });
 
         for result in builder.build() {
@@ -602,6 +647,7 @@ pub fn grep_project_paths(
                 &canonical_target,
                 entry.path(),
                 options,
+                scope.allow_shared_ai_factory,
             ) {
                 continue;
             }
@@ -682,6 +728,28 @@ mod tests {
         assert!(path_allowed_by_options(
             Path::new(".ssh/id_rsa"),
             include_both
+        ));
+    }
+
+    #[test]
+    fn shared_ai_factory_policy_is_limited_to_ai_factory_context() {
+        let options = WalkOptions::default();
+
+        assert!(path_allowed_for_shared_ai_factory(
+            Path::new(".ai-factory/DESCRIPTION.md"),
+            options
+        ));
+        assert!(!path_allowed_for_shared_ai_factory(
+            Path::new(".ai-factory/.env.md"),
+            options
+        ));
+        assert!(!path_allowed_for_shared_ai_factory(
+            Path::new(".hidden.md"),
+            options
+        ));
+        assert!(!path_allowed_for_shared_ai_factory(
+            Path::new("docs/.hidden.md"),
+            options
         ));
     }
 }

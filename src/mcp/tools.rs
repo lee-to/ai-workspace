@@ -209,7 +209,10 @@ fn subdir_intersects_shared_scope(subdir: &str, scopes: &[SharedPathScope]) -> b
     })
 }
 
-fn shared_grep_scopes(scopes: &[SharedPathScope]) -> Vec<walk::GrepScope> {
+fn shared_grep_scopes(
+    scopes: &[SharedPathScope],
+    options: walk::WalkOptions,
+) -> Vec<walk::GrepScope> {
     let mut grep_scopes = Vec::new();
     for scope in scopes {
         let kind = match scope.kind {
@@ -220,27 +223,49 @@ fn shared_grep_scopes(scopes: &[SharedPathScope]) -> Vec<walk::GrepScope> {
         grep_scopes.push(walk::GrepScope {
             kind,
             rel_path: scope.rel_path.clone(),
+            allow_shared_ai_factory: walk::path_allowed_for_shared_ai_factory(
+                Path::new(&scope.rel_path),
+                options,
+            ) && !walk::path_allowed_by_options(
+                Path::new(&scope.rel_path),
+                options,
+            ),
         });
     }
     grep_scopes.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
     grep_scopes
 }
 
-fn shared_ai_factory_options(
+fn scope_allows_shared_ai_factory(scope: &SharedPathScope, options: walk::WalkOptions) -> bool {
+    walk::path_allowed_for_shared_ai_factory(Path::new(&scope.rel_path), options)
+        && !walk::path_allowed_by_options(Path::new(&scope.rel_path), options)
+}
+
+fn rel_path_to_slash_string(path: &Path) -> String {
+    path.iter()
+        .map(|part| part.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn shared_tree_path_allowed(
+    rel_path: &Path,
     scopes: &[SharedPathScope],
     options: walk::WalkOptions,
-) -> walk::WalkOptions {
-    if scopes.iter().any(|scope| {
-        walk::path_allowed_for_shared_ai_factory(Path::new(&scope.rel_path), options)
-            && !walk::path_allowed_by_options(Path::new(&scope.rel_path), options)
-    }) {
-        walk::WalkOptions {
-            include_hidden: true,
-            include_sensitive: options.include_sensitive,
-        }
-    } else {
-        options
-    }
+) -> bool {
+    let rel_path_string = rel_path_to_slash_string(rel_path);
+    tree_path_visible(&rel_path_string, scopes)
+        && (walk::path_allowed_by_options(rel_path, options)
+            || walk::path_allowed_for_shared_ai_factory(rel_path, options))
+}
+
+fn shared_tree_needs_hidden_traversal(
+    scopes: &[SharedPathScope],
+    options: walk::WalkOptions,
+) -> bool {
+    scopes
+        .iter()
+        .any(|scope| scope_allows_shared_ai_factory(scope, options))
 }
 
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
@@ -1087,24 +1112,22 @@ fn project_tree(
         None => None,
     };
 
-    let effective_options = if project_wide {
-        options
+    let entries = if project_wide {
+        walk::walk_project_tree(
+            &canonical_root,
+            normalized_subdir.as_deref(),
+            max_depth,
+            options,
+        )
     } else {
-        shared_ai_factory_options(&scopes, options)
-    };
-    let entries = walk::walk_project_tree(
-        &canonical_root,
-        normalized_subdir.as_deref(),
-        max_depth,
-        effective_options,
-    );
-    let entries: Vec<_> = if project_wide {
-        entries
-    } else {
-        entries
-            .into_iter()
-            .filter(|entry| tree_path_visible(&entry.path, &scopes))
-            .collect()
+        let tree_scopes = scopes.clone();
+        walk::walk_project_tree_with_policy(
+            &canonical_root,
+            normalized_subdir.as_deref(),
+            max_depth,
+            options.include_hidden || shared_tree_needs_hidden_traversal(&scopes, options),
+            move |rel_path| shared_tree_path_allowed(rel_path, &tree_scopes, options),
+        )
     };
     debug!("project_tree: returning {} entries", entries.len());
 
@@ -1145,15 +1168,8 @@ fn project_grep(
             Ok(scopes) => scopes,
             Err(e) => return tool_error(id, &e),
         };
-        let grep_scopes = shared_grep_scopes(&scopes);
-        let effective_options = shared_ai_factory_options(&scopes, options);
-        walk::grep_project_paths(
-            &canonical_root,
-            &grep_scopes,
-            pattern,
-            glob,
-            effective_options,
-        )
+        let grep_scopes = shared_grep_scopes(&scopes, options);
+        walk::grep_project_paths(&canonical_root, &grep_scopes, pattern, glob, options)
     };
 
     let matches = match matches {
