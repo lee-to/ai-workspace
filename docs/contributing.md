@@ -45,6 +45,18 @@ cargo run -- serve
 - Make sure all tests pass and clippy is clean
 - Follow existing code style (run `cargo fmt`)
 
+## Releases
+
+Before pushing a release tag, update the package version first:
+
+1. Set `version = "X.Y.Z"` in `Cargo.toml`
+2. Run `cargo build` so `Cargo.lock` records the package version
+3. Verify `./target/debug/ai-workspace --version` prints `ai-workspace X.Y.Z`
+4. Commit `Cargo.toml` and `Cargo.lock`
+5. Push `main`, then push the matching tag `vX.Y.Z`
+
+The release workflow rejects tags that do not exactly match `Cargo.toml` package version, and also verifies the CLI `--version` output before publishing artifacts.
+
 ## Reporting Issues
 
 Open an issue at [github.com/lee-to/ai-workspace/issues](https://github.com/lee-to/ai-workspace/issues) with:
