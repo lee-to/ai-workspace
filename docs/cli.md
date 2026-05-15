@@ -49,7 +49,7 @@ ai-workspace init [--name <name>] [--slug <slug>] [--group <group>]
 
 If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
-If `.ai-workspace.json` exists in the current directory, `init` reads it and applies the config (groups, shares, notes) via sync. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file.
+If `.ai-workspace.json` exists in the current directory, `init` reads it and applies the config (groups, shares, notes) via sync. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. Shared paths from the config must exist, be relative paths, and resolve inside the project directory; path traversal and symlink escapes are rejected.
 
 **Auto-share:** When no `.ai-workspace.json` exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
 
@@ -66,7 +66,7 @@ ai-workspace share <path> [--label <label>]
 | `<path>` | Relative path from project root |
 | `-l, --label` | Human-readable label for the shared item |
 
-The path must exist and be within the project directory. Directories are shared as `dir` kind, files as `file` kind.
+The path must exist, be relative, and resolve within the project directory. Directories are shared as `dir` kind, files as `file` kind.
 
 If `.ai-workspace.json` exists, it is automatically updated after a successful share.
 
