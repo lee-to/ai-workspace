@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
 use rusqlite::{Connection, Row, params, types::Type};
-use std::path::Path;
+use std::path::{Component, Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -49,6 +49,68 @@ pub type SharedItemIndexedFileMeta = (String, String, i64, i64);
 
 pub struct Db {
     conn: Connection,
+}
+
+pub struct ValidatedProjectPath {
+    pub rel_path: String,
+    pub canonical_path: PathBuf,
+}
+
+pub fn validate_project_rel_path(
+    project_root: &Path,
+    rel_path: &str,
+) -> Result<ValidatedProjectPath> {
+    #[cfg(unix)]
+    if rel_path.contains('\\') {
+        anyhow::bail!(
+            "Path must use forward slashes and cannot contain backslashes: {}",
+            rel_path
+        );
+    }
+
+    let input = Path::new(rel_path);
+    let mut normalized = PathBuf::new();
+    let mut stored_parts = Vec::new();
+
+    for component in input.components() {
+        match component {
+            Component::Normal(part) => {
+                normalized.push(part);
+                stored_parts.push(part.to_string_lossy().to_string());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                anyhow::bail!("Path is outside project directory: {}", rel_path);
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                anyhow::bail!("Path must be relative to project directory: {}", rel_path);
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        anyhow::bail!("Path must name a file or directory inside project directory");
+    }
+
+    let canonical_root = project_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize project root: {}",
+            project_root.display()
+        )
+    })?;
+    let full_path = canonical_root.join(&normalized);
+    let canonical_path = full_path
+        .canonicalize()
+        .map_err(|_| anyhow::anyhow!("Path not found: {}", full_path.display()))?;
+
+    if !canonical_path.starts_with(&canonical_root) {
+        anyhow::bail!("Path is outside project directory: {}", rel_path);
+    }
+
+    Ok(ValidatedProjectPath {
+        rel_path: stored_parts.join("/"),
+        canonical_path,
+    })
 }
 
 fn parse_row_enum<T>(row: &Row<'_>, column: usize) -> rusqlite::Result<T>
@@ -2169,6 +2231,32 @@ impl Db {
             .get_project_by_id(project_id)?
             .ok_or_else(|| anyhow::anyhow!("Project {} not found", project_id))?;
         let mut report = SyncReport::default();
+        struct ValidatedConfigShare<'a> {
+            entry: &'a ShareEntry,
+            path: String,
+            kind: SharedItemKind,
+        }
+
+        let project_root = Path::new(&project.path);
+        let validated_shares = config
+            .share
+            .iter()
+            .map(|entry| {
+                let validated = validate_project_rel_path(project_root, entry.path())?;
+                let kind = entry.kind().unwrap_or_else(|| {
+                    if validated.canonical_path.is_dir() {
+                        SharedItemKind::Dir
+                    } else {
+                        SharedItemKind::File
+                    }
+                });
+                Ok(ValidatedConfigShare {
+                    entry,
+                    path: validated.rel_path,
+                    kind,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -2262,41 +2350,30 @@ impl Db {
             .map(|(_, p, _, _)| p.clone())
             .collect();
         let desired_share_paths: std::collections::HashSet<String> =
-            config.share.iter().map(|s| s.path().to_string()).collect();
+            validated_shares.iter().map(|s| s.path.clone()).collect();
 
         // Add missing shares (INSERT OR IGNORE to handle UNIQUE constraint)
-        for entry in &config.share {
-            let desired_kind = entry.kind().unwrap_or_else(|| {
-                let full_path = Path::new(&project.path).join(entry.path());
-                if full_path.is_dir() {
-                    SharedItemKind::Dir
-                } else {
-                    SharedItemKind::File
-                }
-            });
-            if !current_share_paths.contains(entry.path()) {
-                debug!(
-                    "sync: adding share '{}' kind={}",
-                    entry.path(),
-                    desired_kind
-                );
+        for share in &validated_shares {
+            let entry = share.entry;
+            if !current_share_paths.contains(&share.path) {
+                debug!("sync: adding share '{}' kind={}", share.path, share.kind);
                 tx.execute(
                     "INSERT OR IGNORE INTO shared_items (kind, path, project_id, label) VALUES (?1, ?2, ?3, ?4)",
-                    params![desired_kind.as_str(), entry.path(), project_id, entry.label()],
+                    params![share.kind.as_str(), share.path.as_str(), project_id, entry.label()],
                 )?;
                 if tx.changes() > 0 {
                     report.shares_added += 1;
                 }
             } else if let Some((id, _path, current_kind, current_label)) = current_shares
                 .iter()
-                .find(|(_, path, _, _)| path == entry.path())
-                && (*current_kind != desired_kind || current_label.as_deref() != entry.label())
+                .find(|(_, path, _, _)| path == &share.path)
+                && (*current_kind != share.kind || current_label.as_deref() != entry.label())
             {
                 debug!(
                     "sync: updating share '{}' kind {} -> {}, label {:?} -> {:?}",
-                    entry.path(),
+                    share.path,
                     current_kind,
-                    desired_kind,
+                    share.kind,
                     current_label,
                     entry.label()
                 );
@@ -2304,7 +2381,7 @@ impl Db {
                     "UPDATE shared_items
                      SET kind = ?1, label = ?2, updated_at = datetime('now')
                      WHERE id = ?3",
-                    params![desired_kind.as_str(), entry.label(), id],
+                    params![share.kind.as_str(), entry.label(), id],
                 )?;
             }
         }
@@ -2319,27 +2396,28 @@ impl Db {
         }
 
         // --- Artifact dependencies for project-owned shares ---
-        for entry in &config.share {
+        for share in &validated_shares {
+            let entry = share.entry;
             let Some(desired_dependencies) = entry.dependencies() else {
                 continue;
             };
             debug!(
                 "sync: reconciling {} dependencies for share '{}'",
                 desired_dependencies.len(),
-                entry.path()
+                share.path
             );
             let item_id: Option<i64> = tx
                 .query_row(
                     "SELECT id FROM shared_items
                      WHERE project_id = ?1 AND path = ?2 AND kind IN ('file', 'dir')",
-                    params![project_id, entry.path()],
+                    params![project_id, share.path.as_str()],
                     |row| row.get(0),
                 )
                 .ok();
             let Some(item_id) = item_id else {
                 warn!(
                     "Config dependency sync skipped for missing share '{}'",
-                    entry.path()
+                    share.path
                 );
                 continue;
             };
@@ -2777,29 +2855,46 @@ impl Db {
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
         debug!("search_files: query='{}' limit={}", query, limit);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let fetch_limit = limit.saturating_mul(4).max(limit.saturating_add(16));
         let mut stmt = self.conn.prepare(
-            "SELECT i.shared_item_id, \
+            "SELECT i.id, \
+                    i.shared_item_id, \
                     s.project_id, \
+                    s.kind, \
+                    s.path, \
+                    p.path, \
+                    i.abs_path, \
                     f.path, \
                     snippet(files_fts, 1, '[', ']', '…', 12), \
                     bm25(files_fts) \
              FROM files_fts f \
              JOIN indexed_files i ON i.id = f.rowid \
              JOIN shared_items s ON s.id = i.shared_item_id \
+             JOIN projects p ON p.id = s.project_id \
              WHERE files_fts MATCH ?1 \
              ORDER BY bm25(files_fts) \
              LIMIT ?2",
         )?;
-        let rows = stmt.query_map(params![query, limit as i64], |r| {
-            Ok(FileSearchHit {
-                shared_item_id: r.get(0)?,
-                project_id: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
-                path: r.get(2)?,
-                snippet: r.get(3)?,
-                rank: r.get(4)?,
-            })
+        let rows = stmt.query_map(params![query, fetch_limit as i64], |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                FileSearchHit {
+                    shared_item_id: r.get(1)?,
+                    project_id: r.get::<_, Option<i64>>(2)?.unwrap_or(0),
+                    path: r.get(7)?,
+                    snippet: r.get(8)?,
+                    rank: r.get(9)?,
+                },
+                r.get::<_, String>(3)?,
+                r.get::<_, String>(4)?,
+                r.get::<_, String>(5)?,
+                r.get::<_, String>(6)?,
+            ))
         })?;
-        let hits: Vec<FileSearchHit> = rows
+        let rows: Vec<(i64, FileSearchHit, String, String, String, String)> = rows
             .filter_map(|r| match r {
                 Ok(h) => Some(h),
                 Err(e) => {
@@ -2808,6 +2903,54 @@ impl Db {
                 }
             })
             .collect();
+        drop(stmt);
+
+        let mut hits = Vec::new();
+        for (indexed_file_id, hit, item_kind, item_path, project_path, abs_path) in rows {
+            let item_rel = Path::new(&item_path);
+            let hit_rel = Path::new(&hit.path);
+            let options = crate::walk::WalkOptions::default();
+            if !crate::walk::path_allowed_for_shared_ai_factory(item_rel, options)
+                || !crate::walk::path_allowed_for_shared_ai_factory(hit_rel, options)
+            {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            }
+
+            let project_root = Path::new(&project_path);
+            let Ok(validated_item) = validate_project_rel_path(project_root, &item_path) else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            let Ok(validated_hit) = validate_project_rel_path(project_root, &hit.path) else {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            };
+            let hit_in_item_scope = match item_kind.as_str() {
+                "file" => validated_hit.canonical_path == validated_item.canonical_path,
+                "dir" => validated_hit
+                    .canonical_path
+                    .starts_with(&validated_item.canonical_path),
+                _ => false,
+            };
+            if !hit_in_item_scope {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            }
+            let Ok(canonical_meta) = Path::new(&abs_path).canonicalize() else {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            };
+            if canonical_meta != validated_hit.canonical_path {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            }
+
+            hits.push(hit);
+            if hits.len() == limit {
+                break;
+            }
+        }
         debug!("search_files: {} hits", hits.len());
         Ok(hits)
     }
@@ -2821,6 +2964,15 @@ mod tests {
     fn test_db() -> Db {
         let tmp = NamedTempFile::new().unwrap();
         Db::open(tmp.path()).unwrap()
+    }
+
+    fn temp_project(db: &Db, name: &str) -> (tempfile::TempDir, i64) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap();
+        let id = db
+            .create_project(name, path.to_string_lossy().as_ref())
+            .unwrap();
+        (dir, id)
     }
 
     fn notes_fts_row_count(db: &Db) -> i64 {
@@ -4362,7 +4514,9 @@ mod tests {
     #[test]
     fn sync_adds_missing_groups_and_shares() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        std::fs::write(dir.path().join("api.json"), "{}").unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
@@ -4394,7 +4548,8 @@ mod tests {
     #[test]
     fn sync_preserves_configured_share_kind() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
@@ -4417,10 +4572,127 @@ mod tests {
     }
 
     #[test]
+    fn sync_rejects_parent_directory_share_path() {
+        let db = test_db();
+        let (_dir, pid) = temp_project(&db, "proj");
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("../secret.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_rejects_symlink_escape_share_path() {
+        use std::os::unix::fs::symlink;
+
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), dir.path().join("escape.md")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("escape.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_canonicalizes_valid_alias_share_paths() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        std::fs::write(dir.path().join("docs/guide.md"), "# Guide").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![
+                ShareEntry::PathOnly("./README.md".to_string()),
+                ShareEntry::PathOnly("docs/./guide.md".to_string()),
+            ],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 2);
+
+        let mut paths = db
+            .get_shared_items_for_project(pid)
+            .unwrap()
+            .into_iter()
+            .filter_map(|item| item.path)
+            .collect::<Vec<_>>();
+        paths.sort();
+        assert_eq!(paths, vec!["README.md", "docs/guide.md"]);
+    }
+
+    #[test]
+    fn sync_rejects_parent_component_even_when_final_path_is_inside_root() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs/../README.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sync_rejects_backslash_ambiguous_share_path() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join(r"..\outside.md"), "decoy").unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly(r"..\outside.md".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert!(err.to_string().contains("backslashes"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
     fn sync_reconciles_artifact_dependencies_from_config() {
         let db = test_db();
+        let api_dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(api_dir.path().join("docs")).unwrap();
+        std::fs::write(api_dir.path().join("docs/auth.md"), "# Auth").unwrap();
+        let api_path = api_dir.path().canonicalize().unwrap();
         let api = db
-            .create_project_with_slug("API", "/tmp/api-sync", Some("api"))
+            .create_project_with_slug("API", api_path.to_string_lossy().as_ref(), Some("api"))
             .unwrap();
         db.create_project_with_slug("Auth", "/tmp/auth-sync", Some("auth"))
             .unwrap();
@@ -4564,7 +4836,8 @@ mod tests {
     #[test]
     fn sync_duplicate_share_path_handled() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("existing.txt"), "existing").unwrap();
         db.share_file(pid, "existing.txt", None).unwrap();
 
         let config = WorkspaceConfig {
@@ -4586,7 +4859,8 @@ mod tests {
     #[test]
     fn sync_idempotent() {
         let db = test_db();
-        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("file.txt"), "file").unwrap();
 
         let config = WorkspaceConfig {
             name: "proj".to_string(),
@@ -4620,12 +4894,14 @@ mod tests {
     #[test]
     fn index_and_search_file() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("doc.md"), "hello rustaceans world").unwrap();
         let id = db.share_file(pid, "doc.md", None).unwrap();
+        let abs_path = dir.path().join("doc.md");
         db.index_file(
             id,
             "doc.md",
-            "/tmp/p/doc.md",
+            &abs_path.to_string_lossy(),
             "hello rustaceans world",
             100,
             22,
@@ -4642,11 +4918,13 @@ mod tests {
     #[test]
     fn index_file_upsert_replaces_content() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("a.md"), "bravo").unwrap();
         let id = db.share_file(pid, "a.md", None).unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "alpha", 1, 5)
+        let abs_path = dir.path().join("a.md");
+        db.index_file(id, "a.md", &abs_path.to_string_lossy(), "alpha", 1, 5)
             .unwrap();
-        db.index_file(id, "a.md", "/tmp/p/a.md", "bravo", 2, 5)
+        db.index_file(id, "a.md", &abs_path.to_string_lossy(), "bravo", 2, 5)
             .unwrap();
 
         let hits = db.search_files("bravo", 10).unwrap();
@@ -4673,12 +4951,14 @@ mod tests {
     #[test]
     fn search_cyrillic() {
         let db = test_db();
-        let pid = db.create_project("p", "/tmp/p").unwrap();
+        let (dir, pid) = temp_project(&db, "p");
+        std::fs::write(dir.path().join("ru.md"), "привет мир полнотекстовый поиск").unwrap();
         let id = db.share_file(pid, "ru.md", None).unwrap();
+        let abs_path = dir.path().join("ru.md");
         db.index_file(
             id,
             "ru.md",
-            "/tmp/p/ru.md",
+            &abs_path.to_string_lossy(),
             "привет мир полнотекстовый поиск",
             1,
             40,
@@ -4686,5 +4966,57 @@ mod tests {
         .unwrap();
         let hits = db.search_files("полнотекстовый", 10).unwrap();
         assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn search_files_returns_valid_hit_when_limited_stale_hit_is_first() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "p");
+        let stale_path = dir.path().join("stale.md");
+        let valid_path = dir.path().join("valid.md");
+        std::fs::write(&stale_path, "limit_marker").unwrap();
+        std::fs::write(&valid_path, "limit_marker filler filler filler").unwrap();
+
+        let stale_id = db.share_file(pid, "stale.md", None).unwrap();
+        let valid_id = db.share_file(pid, "valid.md", None).unwrap();
+        db.index_file(
+            stale_id,
+            "stale.md",
+            &stale_path.to_string_lossy(),
+            "limit_marker",
+            1,
+            12,
+        )
+        .unwrap();
+        db.index_file(
+            valid_id,
+            "valid.md",
+            &valid_path.to_string_lossy(),
+            "limit_marker filler filler filler",
+            1,
+            33,
+        )
+        .unwrap();
+        std::fs::remove_file(&stale_path).unwrap();
+
+        let first_raw_path: String = db
+            .conn
+            .query_row(
+                "SELECT f.path
+                 FROM files_fts f
+                 WHERE files_fts MATCH ?1
+                 ORDER BY bm25(files_fts)
+                 LIMIT 1",
+                params!["limit_marker"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_raw_path, "stale.md");
+
+        let hits = db.search_files("limit_marker", 1).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "valid.md");
+        assert!(db.get_file_index_meta(stale_id).unwrap().is_none());
+        assert!(db.get_file_index_meta(valid_id).unwrap().is_some());
     }
 }

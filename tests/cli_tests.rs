@@ -2099,6 +2099,63 @@ fn test_init_reads_json() {
 }
 
 #[test]
+fn test_init_rejects_json_share_path_traversal() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let config = r#"{
+        "name": "unsafe",
+        "share": ["../outside.md"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--group", "team-a"]);
+    assert!(
+        !success,
+        "init should reject path traversal from config\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain unsafe path\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["list"]);
+    assert!(success, "list should succeed after rejected init: {stderr}");
+    assert!(
+        !stdout.contains("unsafe") && !stdout.contains("team-a"),
+        "rejected init should not persist project or group state\nstdout:\n{stdout}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_init_rejects_json_share_symlink_escape() {
+    use std::os::unix::fs::symlink;
+
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::NamedTempFile::new().unwrap();
+    symlink(outside.path(), project_dir.path().join("escape.md")).unwrap();
+
+    let config = r#"{
+        "name": "unsafe",
+        "share": ["escape.md"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        !success,
+        "init should reject symlink escape from config\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain unsafe symlink\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
 fn test_init_syncs_config_share_kind_and_dependencies() {
     let (_db_dir, db_path) = temp_db();
     let auth_dir = tempfile::tempdir().unwrap();
@@ -2362,6 +2419,7 @@ fn test_sync_with_json() {
     let project_dir = tempfile::tempdir().unwrap();
 
     run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    fs::write(project_dir.path().join("new-file.txt"), "new").unwrap();
 
     // Write a config with shares and notes
     let config = r#"{
