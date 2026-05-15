@@ -57,6 +57,23 @@ fn reject_indexed_item(
     Ok(())
 }
 
+fn path_allowed_for_index(path: &Path) -> bool {
+    walk::path_allowed_for_shared_ai_factory(path, WalkOptions::default())
+}
+
+fn walk_options_for_shared_path(rel: &str) -> WalkOptions {
+    if path_allowed_for_index(Path::new(rel))
+        && !walk::path_allowed_by_options(Path::new(rel), WalkOptions::default())
+    {
+        WalkOptions {
+            include_hidden: true,
+            include_sensitive: false,
+        }
+    } else {
+        WalkOptions::default()
+    }
+}
+
 fn validate_indexed_item_path(
     db: &Db,
     shared_item_id: i64,
@@ -64,7 +81,7 @@ fn validate_indexed_item_path(
     rel_path: &str,
     stats: Option<&mut IndexStats>,
 ) -> Result<Option<ValidatedProjectPath>> {
-    if !walk::path_allowed_by_options(Path::new(rel_path), WalkOptions::default()) {
+    if !path_allowed_for_index(Path::new(rel_path)) {
         reject_indexed_item(
             db,
             shared_item_id,
@@ -104,7 +121,7 @@ fn canonical_meta_path_allowed(project_root: &Path, abs_path: &str) -> Result<Op
     let rel = canonical_meta
         .strip_prefix(&canonical_root)
         .unwrap_or(canonical_meta.as_path());
-    if !walk::path_allowed_by_options(rel, WalkOptions::default()) {
+    if !path_allowed_for_index(rel) {
         return Ok(None);
     }
     Ok(Some(canonical_meta))
@@ -114,7 +131,7 @@ fn validate_child_markdown_path(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<Option<ValidatedProjectPath>> {
-    if !walk::path_allowed_by_options(Path::new(rel_path), WalkOptions::default()) {
+    if !path_allowed_for_index(Path::new(rel_path)) {
         warn!("index: skipping child blocked by policy: {}", rel_path);
         return Ok(None);
     }
@@ -246,7 +263,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 &root,
                 Some(&validated.rel_path),
                 None,
-                WalkOptions::default(),
+                walk_options_for_shared_path(&validated.rel_path),
             );
             let mut seen = std::collections::HashSet::new();
             for entry in entries {
@@ -319,7 +336,7 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
                 &root,
                 Some(&validated.rel_path),
                 None,
-                WalkOptions::default(),
+                walk_options_for_shared_path(&validated.rel_path),
             );
             let mut current = std::collections::HashMap::new();
             for entry in entries {
@@ -541,7 +558,7 @@ pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
     let mut refreshed = 0usize;
 
     for hit in hits {
-        if !walk::path_allowed_by_options(Path::new(&hit.path), WalkOptions::default()) {
+        if !path_allowed_for_index(Path::new(&hit.path)) {
             db.delete_indexed_file(hit.shared_item_id, &hit.path)?;
             refreshed += 1;
             continue;

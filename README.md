@@ -130,6 +130,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | Command | What it does |
 |---------|-------------|
 | `init --slug <slug> --group <name>` | Register project, set a stable slug, join/create a group, auto-share key files |
+| `init --preset ai-factory` | Create and share baseline `.ai-factory` context files |
 | `share <path> --label <label>` | Share a file or directory |
 | `note <text> --group <name>` | Add a group-scoped note |
 | `edit <target> --content/--label/--scope` | Edit a shared item |

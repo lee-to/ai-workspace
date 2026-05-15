@@ -16,6 +16,26 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     (dir, db_path)
 }
 
+#[cfg(unix)]
+fn symlink_path(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(src, dst)
+}
+
+fn assert_shared_label(conn: &Connection, path: &str, label: &str, kind: &str) {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items
+             WHERE project_id = 1
+               AND kind = ?1
+               AND path = ?2
+               AND label = ?3",
+            params![kind, path, label],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 1, "{kind} share {path} should have label {label}");
+}
+
 fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch(
@@ -290,6 +310,307 @@ fn test_init_idempotent() {
         run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
     assert!(success, "second init should succeed");
     assert!(stdout.contains("already initialized"));
+}
+
+#[test]
+fn test_init_ai_factory_preset_creates_and_shares_baseline() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "init --preset ai-factory should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +3, shares +3"));
+
+    for path in [
+        ".ai-factory/DESCRIPTION.md",
+        ".ai-factory/ARCHITECTURE.md",
+        ".ai-factory/PLAN.md",
+    ] {
+        assert!(
+            project_dir.path().join(path).exists(),
+            "{path} should exist"
+        );
+    }
+
+    let conn = Connection::open(&db_path).unwrap();
+    assert_shared_label(
+        &conn,
+        ".ai-factory/DESCRIPTION.md",
+        "ai-factory-description",
+        "file",
+    );
+    assert_shared_label(
+        &conn,
+        ".ai-factory/ARCHITECTURE.md",
+        "ai-factory-architecture",
+        "file",
+    );
+    assert_shared_label(&conn, ".ai-factory/PLAN.md", "ai-factory-plan", "file");
+}
+
+#[test]
+fn test_init_ai_factory_preset_is_idempotent_and_preserves_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::write(
+        project_dir.path().join(".ai-factory/DESCRIPTION.md"),
+        "custom description",
+    )
+    .unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "second init --preset ai-factory should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +0, shares +0"));
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join(".ai-factory/DESCRIPTION.md")).unwrap(),
+        "custom description"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    let shared_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items
+             WHERE project_id = 1
+               AND path IN (
+                 '.ai-factory/DESCRIPTION.md',
+                 '.ai-factory/ARCHITECTURE.md',
+                 '.ai-factory/PLAN.md'
+               )",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_count, 3);
+}
+
+#[test]
+fn test_init_ai_factory_preset_shares_optional_dirs_when_present() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/references")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/patches")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/specs")).unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+    assert!(
+        success,
+        "init --preset ai-factory should share optional dirs\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +3, shares +6"));
+
+    let conn = Connection::open(&db_path).unwrap();
+    assert_shared_label(
+        &conn,
+        ".ai-factory/references",
+        "ai-factory-references",
+        "dir",
+    );
+    assert_shared_label(&conn, ".ai-factory/patches", "ai-factory-patches", "dir");
+    assert_shared_label(&conn, ".ai-factory/specs", "ai-factory-specs", "dir");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_init_ai_factory_preset_rejects_symlinked_ai_factory_dir() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    symlink_path(outside_dir.path(), &project_dir.path().join(".ai-factory")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+
+    assert!(!success, "symlinked .ai-factory should fail");
+    assert!(
+        stderr.contains("ai-factory preset parent is not a directory")
+            || stderr.contains("ai-factory preset path escapes project root"),
+        "stderr should explain preset boundary failure: {stderr}"
+    );
+    assert!(
+        !outside_dir.path().join("DESCRIPTION.md").exists(),
+        "preset must not write through .ai-factory symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_init_ai_factory_preset_rejects_symlinked_preset_file() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    symlink_path(
+        std::path::Path::new("../outside-description.md"),
+        &project_dir.path().join(".ai-factory/DESCRIPTION.md"),
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+
+    assert!(!success, "symlinked preset file should fail");
+    assert!(
+        stderr.contains("ai-factory preset file target is not a regular file"),
+        "stderr should explain regular-file requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_init_ai_factory_preset_rejects_directory_at_preset_file_path() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/DESCRIPTION.md")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+
+    assert!(!success, "directory at preset file path should fail");
+    assert!(
+        stderr.contains("ai-factory preset file target is not a regular file"),
+        "stderr should explain regular-file requirement: {stderr}"
+    );
+}
+
+#[test]
+fn test_init_ai_factory_preset_relabels_optional_dirs_on_rerun() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/references")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/patches")).unwrap();
+    fs::create_dir(project_dir.path().join(".ai-factory/specs")).unwrap();
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE shared_items SET label = 'old-references'
+         WHERE path = '.ai-factory/references'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE shared_items SET label = 'old-patches'
+         WHERE path = '.ai-factory/patches'",
+        [],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE shared_items SET label = 'old-specs'
+         WHERE path = '.ai-factory/specs'",
+        [],
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "proj", "--preset", "ai-factory"],
+    );
+
+    assert!(
+        success,
+        "rerun should relabel optional dirs\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Applied ai-factory preset: files +0, shares +0, labels ~3"));
+    assert_shared_label(
+        &conn,
+        ".ai-factory/references",
+        "ai-factory-references",
+        "dir",
+    );
+    assert_shared_label(&conn, ".ai-factory/patches", "ai-factory-patches", "dir");
+    assert_shared_label(&conn, ".ai-factory/specs", "ai-factory-specs", "dir");
+}
+
+#[test]
+fn test_init_ai_factory_preset_updates_existing_workspace_json() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::write(project_dir.path().join("readme.md"), "# Existing").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+  "name": "proj",
+  "share": [
+    { "path": "readme.md", "label": "readme", "kind": "file" }
+  ]
+}
+"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--preset", "ai-factory"],
+    );
+
+    assert!(
+        success,
+        "init should update existing config\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    let config: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(project_dir.path().join(".ai-workspace.json")).unwrap(),
+    )
+    .unwrap();
+    let shares = config["share"].as_array().unwrap();
+    assert!(shares.iter().any(|share| {
+        share["path"] == "readme.md" && share["label"] == "readme" && share["kind"] == "file"
+    }));
+    assert!(shares.iter().any(|share| {
+        share["path"] == ".ai-factory/DESCRIPTION.md"
+            && share["label"] == "ai-factory-description"
+            && share["kind"] == "file"
+    }));
+    assert!(shares.iter().any(|share| {
+        share["path"] == ".ai-factory/ARCHITECTURE.md"
+            && share["label"] == "ai-factory-architecture"
+            && share["kind"] == "file"
+    }));
+    assert!(shares.iter().any(|share| {
+        share["path"] == ".ai-factory/PLAN.md"
+            && share["label"] == "ai-factory-plan"
+            && share["kind"] == "file"
+    }));
 }
 
 #[test]

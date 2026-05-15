@@ -2910,8 +2910,8 @@ impl Db {
             let item_rel = Path::new(&item_path);
             let hit_rel = Path::new(&hit.path);
             let options = crate::walk::WalkOptions::default();
-            if !crate::walk::path_allowed_by_options(item_rel, options)
-                || !crate::walk::path_allowed_by_options(hit_rel, options)
+            if !crate::walk::path_allowed_for_shared_ai_factory(item_rel, options)
+                || !crate::walk::path_allowed_for_shared_ai_factory(hit_rel, options)
             {
                 self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;

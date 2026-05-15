@@ -378,6 +378,53 @@ fn seed_scoped_project(db_path: &PathBuf) -> tempfile::TempDir {
     project_dir
 }
 
+fn seed_ai_factory_preset_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project_dir.path().join(".ai-factory")).unwrap();
+    std::fs::create_dir(project_dir.path().join(".ai-factory/references")).unwrap();
+    std::fs::write(
+        project_dir.path().join(".ai-factory/references/context.md"),
+        "ai_factory_reference_token\n",
+    )
+    .unwrap();
+
+    let output = Command::new(binary_path())
+        .args([
+            "init",
+            "--name",
+            "ai-factory-proj",
+            "--preset",
+            "ai-factory",
+        ])
+        .current_dir(project_dir.path())
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+    assert!(
+        output.status.success(),
+        "ai-factory preset seed should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    project_dir
+}
+
+fn share_path(db_path: &PathBuf, project_dir: &Path, path: &str, label: &str) {
+    let output = Command::new(binary_path())
+        .args(["share", path, "--label", label])
+        .current_dir(project_dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("share command failed");
+    assert!(
+        output.status.success(),
+        "share should succeed for {path}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn seed_service_event_data(db_path: &PathBuf) -> (tempfile::TempDir, tempfile::TempDir) {
     let auth_dir = tempfile::tempdir().unwrap();
     let api_dir = tempfile::tempdir().unwrap();
@@ -1002,6 +1049,38 @@ fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_childre
 }
 
 #[test]
+fn test_mcp_workspace_search_fulltext_finds_ai_factory_preset_files_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_ai_factory_preset_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "\"Project Description\""
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "ai-factory context should be searchable: {content}"
+    );
+    assert_eq!(results[0]["path"], ".ai-factory/DESCRIPTION.md");
+}
+
+#[test]
 fn test_mcp_workspace_search_fulltext_revalidates_stale_directory_beyond_refresh_window() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_stale_directory_fulltext_beyond_refresh_window(&db_path);
@@ -1308,6 +1387,95 @@ fn test_mcp_project_tree_subdir_filters_to_shared_descendants_by_default() {
 }
 
 #[test]
+fn test_mcp_project_tree_lists_shared_ai_factory_dir_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_ai_factory_preset_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": {
+                    "project_id": 1,
+                    "subdir": ".ai-factory/references"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("context.md"));
+}
+
+#[test]
+fn test_mcp_project_tree_ai_factory_exception_does_not_expose_other_hidden_shared_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_ai_factory_preset_project(&db_path);
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(project_dir.path().join("docs/public.md"), "public\n").unwrap();
+    std::fs::write(project_dir.path().join("docs/.hidden.md"), "hidden_token\n").unwrap();
+    share_path(&db_path, project_dir.path(), "docs", "docs");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1 }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".ai-factory/"));
+    assert!(content.contains("context.md"));
+    assert!(content.contains("docs/"));
+    assert!(content.contains("public.md"));
+    assert!(!content.contains(".hidden.md"));
+}
+
+#[test]
+fn test_mcp_project_tree_include_hidden_reveals_other_hidden_shared_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_ai_factory_preset_project(&db_path);
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(project_dir.path().join("docs/.hidden.md"), "hidden_token\n").unwrap();
+    share_path(&db_path, project_dir.path(), "docs", "docs");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": {
+                    "project_id": 1,
+                    "include_hidden": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".hidden.md"));
+}
+
+#[test]
 fn test_mcp_project_tree_unshared_subdir_empty_by_default() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = seed_scoped_project(&db_path);
@@ -1570,6 +1738,102 @@ fn test_mcp_workspace_read_by_path_allows_file_inside_shared_dir() {
         .as_str()
         .unwrap();
     assert!(content.contains("shared_docs_token"));
+}
+
+#[test]
+fn test_mcp_workspace_read_ai_factory_preset_item_id_is_readable_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_ai_factory_preset_project(&db_path);
+    let conn = Connection::open(&db_path).unwrap();
+    let item_id: i64 = conn
+        .query_row(
+            "SELECT id FROM shared_items WHERE label = 'ai-factory-description'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": item_id }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("# Project Description"));
+}
+
+#[test]
+fn test_mcp_workspace_read_ai_factory_preset_path_is_readable_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_ai_factory_preset_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": ".ai-factory/DESCRIPTION.md"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("# Project Description"));
+}
+
+#[test]
+fn test_mcp_workspace_read_shared_ai_factory_sensitive_file_stays_blocked() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_ai_factory_preset_project(&db_path);
+    std::fs::write(project_dir.path().join(".ai-factory/.env.md"), "secret").unwrap();
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (kind, path, label, project_id)
+         VALUES ('file', '.ai-factory/.env.md', 'ai-factory-env', 1)",
+        [],
+    )
+    .unwrap();
+    let item_id = conn.last_insert_rowid();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": item_id }
+            }
+        })],
+    );
+
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    assert!(
+        result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Access denied")
+    );
 }
 
 #[test]
@@ -1923,6 +2187,102 @@ fn test_mcp_project_grep_searches_only_shared_scopes_by_default() {
     assert!(!content.contains("secret_token"));
     assert!(!content.contains("private.rs"));
     assert!(!content.contains("private_src_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_searches_shared_ai_factory_dir_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_ai_factory_preset_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "ai_factory_reference_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".ai-factory/references/context.md"));
+    assert!(content.contains("ai_factory_reference_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_ai_factory_exception_does_not_search_other_hidden_shared_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_ai_factory_preset_project(&db_path);
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(project_dir.path().join("docs/public.md"), "public_token\n").unwrap();
+    std::fs::write(project_dir.path().join("docs/.hidden.md"), "hidden_token\n").unwrap();
+    share_path(&db_path, project_dir.path(), "docs", "docs");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "ai_factory_reference_token|hidden_token|public_token"
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains(".ai-factory/references/context.md"));
+    assert!(content.contains("ai_factory_reference_token"));
+    assert!(content.contains("docs/public.md"));
+    assert!(content.contains("public_token"));
+    assert!(!content.contains("docs/.hidden.md"));
+    assert!(!content.contains("hidden_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_include_hidden_searches_other_hidden_shared_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_ai_factory_preset_project(&db_path);
+    std::fs::create_dir(project_dir.path().join("docs")).unwrap();
+    std::fs::write(project_dir.path().join("docs/.hidden.md"), "hidden_token\n").unwrap();
+    share_path(&db_path, project_dir.path(), "docs", "docs");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": {
+                    "project_id": 1,
+                    "pattern": "hidden_token",
+                    "include_hidden": true
+                }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("docs/.hidden.md"));
+    assert!(content.contains("hidden_token"));
 }
 
 #[test]

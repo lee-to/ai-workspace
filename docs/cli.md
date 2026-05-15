@@ -38,7 +38,7 @@ Commands that work from any directory (no project required):
 Initialize the current directory as a project.
 
 ```bash
-ai-workspace init [--name <name>] [--slug <slug>] [--group <group>]
+ai-workspace init [--name <name>] [--slug <slug>] [--group <group>] [--preset ai-factory]
 ```
 
 | Option | Description |
@@ -46,12 +46,15 @@ ai-workspace init [--name <name>] [--slug <slug>] [--group <group>]
 | `-n, --name` | Project name (defaults to directory name) |
 | `--slug` | Stable service slug (defaults to a normalized project name) |
 | `-g, --group` | Group to join or create |
+| `--preset ai-factory` | Create missing `.ai-factory` baseline files and share them with stable labels |
 
 If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
 If `.ai-workspace.json` exists in the current directory, `init` reads it and applies the config (groups, shares, notes) via sync. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. Shared paths from the config must exist, be relative paths, and resolve inside the project directory; path traversal and symlink escapes are rejected.
 
 **Auto-share:** When no `.ai-workspace.json` exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
+
+**AI Factory preset:** `init --preset ai-factory` creates missing `.ai-factory/DESCRIPTION.md`, `.ai-factory/ARCHITECTURE.md`, and `.ai-factory/PLAN.md` files without overwriting existing content. It shares those files with the labels `ai-factory-description`, `ai-factory-architecture`, and `ai-factory-plan`. If `.ai-factory/references`, `.ai-factory/patches`, or `.ai-factory/specs` already exist, it shares those directories as `ai-factory-references`, `ai-factory-patches`, and `ai-factory-specs`; missing optional directories are skipped. Re-running the preset is idempotent.
 
 ### `share`
 
