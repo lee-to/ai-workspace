@@ -170,6 +170,30 @@ fn run_cmd_in_dir(
     (stdout, stderr, output.status.success())
 }
 
+fn run_cmd_in_dir_with_env(
+    db_path: &PathBuf,
+    dir: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, bool) {
+    let mut command = Command::new(binary_path());
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .env("RUST_LOG", "debug");
+
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (stdout, stderr, output.status.success())
+}
+
 fn parse_id(stdout: &str) -> i64 {
     let start = stdout.find("(id=").expect("stdout should contain id") + 4;
     let tail = &stdout[start..];
@@ -2067,6 +2091,85 @@ fn test_export_creates_json() {
     assert_eq!(config["share"][0]["kind"], "file");
     assert!(config["share"][0]["dependencies"].is_null());
     assert_eq!(config["notes"][0]["content"], "important note");
+}
+
+#[test]
+fn test_export_config_flag_writes_custom_path_and_updates_it() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+    fs::write(project_dir.path().join("b.txt"), "b").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    run_cmd_in_dir(&db_path, project_dir.path(), &["share", "a.txt"]);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        success,
+        "export should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let custom_config = project_dir.path().join(".ai/ai-workspace.json");
+    assert!(
+        custom_config.exists(),
+        "export should create the custom config path"
+    );
+    assert!(
+        !project_dir.path().join(".ai-workspace.json").exists(),
+        "export with --config should not create root .ai-workspace.json"
+    );
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "share", "b.txt"],
+    );
+
+    let content = fs::read_to_string(custom_config).unwrap();
+    assert!(content.contains("a.txt"));
+    assert!(content.contains("b.txt"));
+}
+
+#[test]
+fn test_init_uses_custom_config_from_env() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("Cargo.toml"), "[package]").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
+    fs::write(
+        project_dir.path().join(".ai/ai-workspace.json"),
+        r#"{"name": "from-env", "groups": ["team"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["init"],
+        &[("AI_WORKSPACE_CONFIG", ".ai/ai-workspace.json")],
+    );
+    assert!(
+        success,
+        "init should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Auto-shared"),
+        "custom config should disable auto-share\nstdout:\n{stdout}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("from-env"));
+    assert!(stdout.contains("team"));
+    assert!(!stdout.contains("Cargo.toml"));
+    assert!(!stdout.contains("README.md"));
 }
 
 #[test]

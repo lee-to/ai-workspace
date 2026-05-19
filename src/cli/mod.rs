@@ -6,13 +6,16 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::db::{AmbiguousItemLabel, Db, ScopeChange, SharedItemUpdate, validate_project_rel_path};
 use crate::models::{
     ArtifactDependencyKind, ArtifactReaction, EventSeverity, EventStatus, ServiceLinkKind,
     SharedItem, SharedItemKind, WorkspaceEventKind,
 };
+
+const WORKSPACE_CONFIG_ENV: &str = "AI_WORKSPACE_CONFIG";
+const DEFAULT_WORKSPACE_CONFIG_FILE: &str = ".ai-workspace.json";
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum NoteScope {
@@ -366,9 +369,9 @@ pub enum Command {
     },
     /// Show project status
     Status,
-    /// Export project-scoped config to .ai-workspace.json (group notes stay local)
+    /// Export project-scoped config to workspace JSON (group notes stay local)
     Export,
-    /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile .ai-workspace.json
+    /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile workspace JSON
     Sync,
     /// Start MCP server (stdio transport)
     Serve,
@@ -415,14 +418,55 @@ fn current_project_dir() -> Result<std::path::PathBuf> {
     }
 }
 
-/// If .ai-workspace.json exists in the project root, re-export and save it.
-fn update_workspace_json_if_exists(db: &Db, project: &crate::models::Project) -> Result<()> {
-    let config_path = Path::new(&project.path).join(".ai-workspace.json");
+fn normalize_config_override(cli_config_path: Option<PathBuf>) -> Result<Option<PathBuf>> {
+    let Some(path) = cli_config_path else {
+        return Ok(env::var_os(WORKSPACE_CONFIG_ENV)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from));
+    };
+
+    if path.as_os_str().is_empty() {
+        bail!("--config must not be empty");
+    }
+
+    Ok(Some(path))
+}
+
+fn workspace_config_path(project_root: &Path, config_path_override: Option<&Path>) -> PathBuf {
+    let path = config_path_override.unwrap_or_else(|| Path::new(DEFAULT_WORKSPACE_CONFIG_FILE));
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        project_root.join(path)
+    }
+}
+
+fn save_workspace_config(
+    config: &crate::models::WorkspaceConfig,
+    config_path: &Path,
+) -> Result<()> {
+    if let Some(parent) = config_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create {}", parent.display()))?;
+    }
+
+    config.save(config_path)
+}
+
+/// If the configured workspace JSON exists, re-export and save it.
+fn update_workspace_json_if_exists(
+    db: &Db,
+    project: &crate::models::Project,
+    config_path_override: Option<&Path>,
+) -> Result<()> {
+    let config_path = workspace_config_path(Path::new(&project.path), config_path_override);
     if config_path.exists() {
-        debug!("Updating .ai-workspace.json at {}", config_path.display());
+        debug!("Updating workspace config at {}", config_path.display());
         let config = db.export_project_config(project.id)?;
-        config.save(&config_path)?;
-        info!("Updated .ai-workspace.json");
+        save_workspace_config(&config, &config_path)?;
+        info!("Updated workspace config");
     }
     Ok(())
 }
@@ -780,7 +824,7 @@ fn print_event_details(db: &Db, event_id: i64) -> Result<()> {
     Ok(())
 }
 
-/// Key files to auto-share on init (when no .ai-workspace.json exists).
+/// Key files to auto-share on init (when no configured workspace JSON exists).
 const AUTO_SHARE_FILES: &[&str] = &[
     "Cargo.toml",
     "package.json",
@@ -1077,7 +1121,9 @@ fn apply_ai_factory_preset(
     })
 }
 
-pub fn run(cmd: Command) -> Result<()> {
+pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
+    let config_path_override = normalize_config_override(config_path_override)?;
+
     match cmd {
         Command::Serve => crate::mcp::serve(),
 
@@ -1090,10 +1136,10 @@ pub fn run(cmd: Command) -> Result<()> {
             let cwd = current_project_dir()?;
             let cwd_str = cwd.to_string_lossy().to_string();
 
-            // Check for .ai-workspace.json
-            let config_path = cwd.join(".ai-workspace.json");
+            // Check for workspace config
+            let config_path = workspace_config_path(&cwd, config_path_override.as_deref());
             let mut config = if config_path.exists() {
-                info!("Found .ai-workspace.json at {}", config_path.display());
+                info!("Found workspace config at {}", config_path.display());
                 Some(crate::models::WorkspaceConfig::load(&config_path)?)
             } else {
                 None
@@ -1167,7 +1213,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 match config.as_mut() {
                     Some(cfg) if !cfg.groups.contains(&group_name) => {
                         debug!(
-                            "Adding CLI group '{}' to loaded .ai-workspace.json config",
+                            "Adding CLI group '{}' to loaded workspace config",
                             group_name
                         );
                         cfg.groups.push(group_name);
@@ -1177,7 +1223,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
             }
 
-            // Auto-share key files when NO .ai-workspace.json exists
+            // Auto-share key files when no configured workspace JSON exists
             if config.is_none() {
                 let auto_shared = auto_share_key_files(&db, project_id, &cwd)?;
                 if auto_shared > 0 {
@@ -1200,7 +1246,7 @@ pub fn run(cmd: Command) -> Result<()> {
                     + report.notes_updated;
                 if total > 0 {
                     print_success(format!(
-                        "Applied .ai-workspace.json: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
+                        "Applied workspace config: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
                         report.groups_added,
                         report.groups_removed,
                         report.shares_added,
@@ -1217,9 +1263,9 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
 
                 if config_changed_by_cli_group {
-                    cfg.save(&config_path)?;
+                    save_workspace_config(cfg, &config_path)?;
                     info!(
-                        "Updated .ai-workspace.json with CLI group at {}",
+                        "Updated workspace config with CLI group at {}",
                         config_path.display()
                     );
                 }
@@ -1232,7 +1278,11 @@ pub fn run(cmd: Command) -> Result<()> {
                     report.files_created, report.shares_added, report.labels_updated
                 ));
                 if let Some(project) = db.get_project_by_id(project_id)? {
-                    update_workspace_json_if_exists(&db, &project)?;
+                    update_workspace_json_if_exists(
+                        &db,
+                        &project,
+                        config_path_override.as_deref(),
+                    )?;
                 }
             }
 
@@ -1271,7 +1321,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 }
             }
 
-            update_workspace_json_if_exists(&db, &project)?;
+            update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
             Ok(())
         }
 
@@ -1318,7 +1368,7 @@ pub fn run(cmd: Command) -> Result<()> {
             }
             // Only project-scoped notes update .json (group notes do NOT)
             if is_project_scope {
-                update_workspace_json_if_exists(&db, &project)?;
+                update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
             }
             Ok(())
         }
@@ -1384,7 +1434,7 @@ pub fn run(cmd: Command) -> Result<()> {
 
             db.update_shared_item(item.id, project.id, &update)?;
             print_success(format!("Updated item (id={})", item.id));
-            update_workspace_json_if_exists(&db, &project)?;
+            update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
             Ok(())
         }
 
@@ -1415,7 +1465,7 @@ pub fn run(cmd: Command) -> Result<()> {
             } else {
                 print_success(format!("Removed item id={}", item.id));
             }
-            update_workspace_json_if_exists(&db, &project)?;
+            update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
             Ok(())
         }
 
@@ -1434,7 +1484,7 @@ pub fn run(cmd: Command) -> Result<()> {
                         group
                     ));
                 }
-                update_workspace_json_if_exists(&db, &project)?;
+                update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
             } else {
                 print_info(format!("Project is not a member of group '{}'", group));
             }
@@ -1972,8 +2022,9 @@ pub fn run(cmd: Command) -> Result<()> {
             let db = Db::open_default()?;
             let project = require_project(&db)?;
             let config = db.export_project_config(project.id)?;
-            let config_path = Path::new(&project.path).join(".ai-workspace.json");
-            config.save(&config_path)?;
+            let config_path =
+                workspace_config_path(Path::new(&project.path), config_path_override.as_deref());
+            save_workspace_config(&config, &config_path)?;
             print_success(format!("Exported config to {}", config_path.display()));
             Ok(())
         }
@@ -2016,13 +2067,16 @@ pub fn run(cmd: Command) -> Result<()> {
                 print_table(&["ID", "Path"], &rows);
             }
 
-            // Step 2: sync from .ai-workspace.json if present
+            // Step 2: sync from workspace config if present
             let cwd = current_project_dir()?;
             let cwd_str = cwd.to_string_lossy();
             if let Some(project) = db.find_project_by_cwd(&cwd_str)? {
-                let config_path = Path::new(&project.path).join(".ai-workspace.json");
+                let config_path = workspace_config_path(
+                    Path::new(&project.path),
+                    config_path_override.as_deref(),
+                );
                 if config_path.exists() {
-                    info!("Found .ai-workspace.json, syncing config");
+                    info!("Found workspace config, syncing config");
                     let config = crate::models::WorkspaceConfig::load(&config_path)?;
                     let report = db.sync_from_config(project.id, &config)?;
                     let total = report.groups_added

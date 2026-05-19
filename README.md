@@ -145,8 +145,8 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `event inbox` | Show open events affecting the current project |
 | `destroy [target]` | Remove current or targeted project from ai-workspace (keeps files) |
 | `status` | Show project info, groups, and items |
-| `export` | Export project config to `.ai-workspace.json` |
-| `sync` | Clean up stale files + reconcile `.ai-workspace.json` |
+| `export` | Export project config to workspace JSON |
+| `sync` | Clean up stale files + reconcile workspace JSON |
 | `search <query>` | Full-text search over shared `.md` files (FTS5, bm25-ranked) |
 | `reindex` | Rebuild the full-text index for all shared `.md` files |
 | `serve` | Start the MCP server |
@@ -174,6 +174,13 @@ ai-workspace init
 ```
 
 The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with `.ai-workspace.json` if present. Shared paths from config must exist and resolve inside the project directory. `.ai-workspace.json` exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
+
+If your repo keeps AI-related files under a dedicated directory, pass a custom config path. Relative paths are resolved from the project root:
+
+```bash
+ai-workspace --config .ai/ai-workspace.json export
+AI_WORKSPACE_CONFIG=.ai/ai-workspace.json ai-workspace init
+```
 
 ## Documentation
 
