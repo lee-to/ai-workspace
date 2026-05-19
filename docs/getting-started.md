@@ -111,7 +111,7 @@ Both projects now belong to the `backend` group.
 
 Key project files (`README*`, `Cargo.toml`, `package.json`, `go.mod`, etc.) are automatically shared on first `init` — no manual `share` needed for common files. This auto-share is skipped when the configured workspace JSON is present.
 
-If `.ai-workspace.json` exists, `init` also reads the optional project `slug`, shared entry `kind`, and shared entry `dependencies` metadata. This lets a committed config restore directory shares and artifact dependencies without exporting event history. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` if your repo keeps AI files under `.ai`. Configured shared paths must exist and resolve inside the project directory; unsafe relative paths and symlink escapes are rejected during import.
+If the configured workspace JSON exists, `init` also reads the optional project `slug`, shared entry `kind`, and shared entry `dependencies` metadata. This lets a committed config restore directory shares and artifact dependencies without exporting event history. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` if your repo keeps AI files under `.ai`. The configured JSON path and configured shared paths must resolve inside the project directory; absolute config paths, unsafe relative paths, and symlink escapes are rejected.
 
 ### 2. Share files
 

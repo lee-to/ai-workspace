@@ -2136,6 +2136,195 @@ fn test_export_config_flag_writes_custom_path_and_updates_it() {
 }
 
 #[test]
+fn test_config_flag_rejects_relative_path_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let root_dir = tempfile::tempdir().unwrap();
+    let project_path = root_dir.path().join("project");
+    fs::create_dir(&project_path).unwrap();
+    let outside_config = root_dir.path().join("outside.json");
+
+    run_cmd_in_dir(&db_path, &project_path, &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        &project_path,
+        &["--config", "../outside.json", "export"],
+    );
+    assert!(!success, "export should reject traversal path");
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain path boundary rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not create config outside project root"
+    );
+}
+
+#[test]
+fn test_config_env_rejects_relative_path_outside_project_on_init() {
+    let (_db_dir, db_path) = temp_db();
+    let root_dir = tempfile::tempdir().unwrap();
+    let project_path = root_dir.path().join("project");
+    fs::create_dir(&project_path).unwrap();
+    let outside_config = root_dir.path().join("outside.json");
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        &project_path,
+        &["init", "--group", "team"],
+        &[("AI_WORKSPACE_CONFIG", "../outside.json")],
+    );
+    assert!(!success, "init should reject traversal env config path");
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain path boundary rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "init should not create config outside project root"
+    );
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, &project_path, &["status"]);
+    assert!(
+        !success,
+        "failed init should not register the project\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_config_flag_rejects_absolute_path_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside.json");
+    let outside_config_arg = outside_config.to_string_lossy().to_string();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", &outside_config_arg, "export"],
+    );
+    assert!(!success, "export should reject absolute config path");
+    assert!(
+        stderr.contains("must be relative"),
+        "stderr should explain absolute path rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not create absolute config path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_symlinked_parent_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+
+    symlink_path(outside_dir.path(), &project_dir.path().join(".ai")).unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject config parent symlink escaping project"
+    );
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain symlink escape rejection: {stderr}"
+    );
+    assert!(
+        !outside_dir.path().join("ai-workspace.json").exists(),
+        "export should not write through parent symlink"
+    );
+}
+
+#[test]
+fn test_config_flag_takes_precedence_over_config_env() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::create_dir(project_dir.path().join(".env-ai")).unwrap();
+    fs::write(
+        project_dir.path().join(".ai/cli-workspace.json"),
+        r#"{"name": "from-cli", "groups": ["cli"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join(".env-ai/env-workspace.json"),
+        r#"{"name": "from-env", "groups": ["env"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/cli-workspace.json", "init"],
+        &[("AI_WORKSPACE_CONFIG", ".env-ai/env-workspace.json")],
+    );
+    assert!(
+        success,
+        "init should prefer CLI config over env\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("from-cli"));
+    assert!(stdout.contains("cli"));
+    assert!(!stdout.contains("from-env"));
+    assert!(!stdout.contains("env"));
+}
+
+#[test]
+fn test_sync_uses_custom_config_path() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai/ai-workspace.json"),
+        r#"{"name": "sync-proj", "groups": ["team"], "share": ["README.md"], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "init"],
+    );
+    assert!(
+        success,
+        "init should succeed with custom config\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "sync"],
+    );
+    assert!(
+        success,
+        "sync should succeed with custom config\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("sync-proj"));
+    assert!(stdout.contains("team"));
+    assert!(stdout.contains("README.md"));
+}
+
+#[test]
 fn test_init_uses_custom_config_from_env() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();

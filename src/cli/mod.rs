@@ -6,7 +6,7 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::io::IsTerminal;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use crate::db::{AmbiguousItemLabel, Db, ScopeChange, SharedItemUpdate, validate_project_rel_path};
 use crate::models::{
@@ -420,9 +420,11 @@ fn current_project_dir() -> Result<std::path::PathBuf> {
 
 fn normalize_config_override(cli_config_path: Option<PathBuf>) -> Result<Option<PathBuf>> {
     let Some(path) = cli_config_path else {
-        return Ok(env::var_os(WORKSPACE_CONFIG_ENV)
-            .filter(|value| !value.is_empty())
-            .map(PathBuf::from));
+        return match env::var_os(WORKSPACE_CONFIG_ENV) {
+            Some(value) if value.is_empty() => bail!("{WORKSPACE_CONFIG_ENV} must not be empty"),
+            Some(value) => Ok(Some(PathBuf::from(value))),
+            None => Ok(None),
+        };
     };
 
     if path.as_os_str().is_empty() {
@@ -432,13 +434,108 @@ fn normalize_config_override(cli_config_path: Option<PathBuf>) -> Result<Option<
     Ok(Some(path))
 }
 
-fn workspace_config_path(project_root: &Path, config_path_override: Option<&Path>) -> PathBuf {
+fn validate_workspace_config_path(
+    project_root: &Path,
+    config_path_override: Option<&Path>,
+) -> Result<PathBuf> {
     let path = config_path_override.unwrap_or_else(|| Path::new(DEFAULT_WORKSPACE_CONFIG_FILE));
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        project_root.join(path)
+
+    #[cfg(unix)]
+    if path.to_string_lossy().contains('\\') {
+        bail!(
+            "Workspace config path must use forward slashes and cannot contain backslashes: {}",
+            path.display()
+        );
     }
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                bail!(
+                    "Workspace config path is outside project directory: {}",
+                    path.display()
+                );
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "Workspace config path must be relative to project directory: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        bail!("Workspace config path must name a file inside project directory");
+    }
+
+    let canonical_root = project_root.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize project root: {}",
+            project_root.display()
+        )
+    })?;
+    let config_path = canonical_root.join(normalized);
+    let parent = config_path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("Workspace config path must have a parent directory"))?;
+
+    let mut existing_parent = parent;
+    while !existing_parent.exists() {
+        existing_parent = existing_parent.parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Workspace config parent is outside project directory: {}",
+                parent.display()
+            )
+        })?;
+    }
+
+    if !existing_parent.is_dir() {
+        bail!(
+            "Workspace config parent is not a directory: {}",
+            existing_parent.display()
+        );
+    }
+
+    let canonical_parent = existing_parent.canonicalize().with_context(|| {
+        format!(
+            "Failed to canonicalize workspace config parent: {}",
+            existing_parent.display()
+        )
+    })?;
+    if !canonical_parent.starts_with(&canonical_root) {
+        bail!(
+            "Workspace config path is outside project directory: {}",
+            path.display()
+        );
+    }
+
+    if config_path.exists() {
+        if config_path.is_dir() {
+            bail!(
+                "Workspace config path must be a file, not a directory: {}",
+                path.display()
+            );
+        }
+
+        let canonical_config = config_path.canonicalize().with_context(|| {
+            format!(
+                "Failed to canonicalize workspace config path: {}",
+                config_path.display()
+            )
+        })?;
+        if !canonical_config.starts_with(&canonical_root) {
+            bail!(
+                "Workspace config path is outside project directory: {}",
+                path.display()
+            );
+        }
+    }
+
+    Ok(config_path)
 }
 
 fn save_workspace_config(
@@ -461,7 +558,8 @@ fn update_workspace_json_if_exists(
     project: &crate::models::Project,
     config_path_override: Option<&Path>,
 ) -> Result<()> {
-    let config_path = workspace_config_path(Path::new(&project.path), config_path_override);
+    let config_path =
+        validate_workspace_config_path(Path::new(&project.path), config_path_override)?;
     if config_path.exists() {
         debug!("Updating workspace config at {}", config_path.display());
         let config = db.export_project_config(project.id)?;
@@ -1137,7 +1235,8 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             let cwd_str = cwd.to_string_lossy().to_string();
 
             // Check for workspace config
-            let config_path = workspace_config_path(&cwd, config_path_override.as_deref());
+            let config_path =
+                validate_workspace_config_path(&cwd, config_path_override.as_deref())?;
             let mut config = if config_path.exists() {
                 info!("Found workspace config at {}", config_path.display());
                 Some(crate::models::WorkspaceConfig::load(&config_path)?)
@@ -2022,8 +2121,10 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             let db = Db::open_default()?;
             let project = require_project(&db)?;
             let config = db.export_project_config(project.id)?;
-            let config_path =
-                workspace_config_path(Path::new(&project.path), config_path_override.as_deref());
+            let config_path = validate_workspace_config_path(
+                Path::new(&project.path),
+                config_path_override.as_deref(),
+            )?;
             save_workspace_config(&config, &config_path)?;
             print_success(format!("Exported config to {}", config_path.display()));
             Ok(())
@@ -2071,10 +2172,10 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             let cwd = current_project_dir()?;
             let cwd_str = cwd.to_string_lossy();
             if let Some(project) = db.find_project_by_cwd(&cwd_str)? {
-                let config_path = workspace_config_path(
+                let config_path = validate_workspace_config_path(
                     Path::new(&project.path),
                     config_path_override.as_deref(),
-                );
+                )?;
                 if config_path.exists() {
                     info!("Found workspace config, syncing config");
                     let config = crate::models::WorkspaceConfig::load(&config_path)?;
