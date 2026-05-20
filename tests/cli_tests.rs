@@ -36,6 +36,18 @@ fn assert_shared_label(conn: &Connection, path: &str, label: &str, kind: &str) {
     assert_eq!(count, 1, "{kind} share {path} should have label {label}");
 }
 
+fn assert_no_shared_path(db_path: &PathBuf, path: &str) {
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "{path} should not be shared");
+}
+
 fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch(
@@ -2133,6 +2145,95 @@ fn test_export_config_flag_writes_custom_path_and_updates_it() {
     let content = fs::read_to_string(custom_config).unwrap();
     assert!(content.contains("a.txt"));
     assert!(content.contains("b.txt"));
+}
+
+#[test]
+fn test_auto_update_rejects_readme_config_env_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("README.md"), "# keep me").unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let before = fs::read_to_string(project_dir.path().join("README.md")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["share", "a.txt"],
+        &[("AI_WORKSPACE_CONFIG", "README.md")],
+    );
+    assert!(!success, "share should reject README.md as config target");
+    assert!(
+        stderr.contains("Refusing to overwrite workspace config target"),
+        "stderr should explain ownership rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("README.md")).unwrap(),
+        before,
+        "README.md should not be overwritten"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
+}
+
+#[test]
+fn test_export_rejects_existing_readme_config_target() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("README.md"), "# keep me").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let before = fs::read_to_string(project_dir.path().join("README.md")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", "README.md", "export"],
+    );
+    assert!(!success, "export should reject README.md as config target");
+    assert!(
+        stderr.contains("Refusing to overwrite workspace config target"),
+        "stderr should explain ownership rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("README.md")).unwrap(),
+        before,
+        "README.md should not be overwritten"
+    );
+}
+
+#[test]
+fn test_auto_update_rejects_package_json_config_env_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let package_json = r#"{"name":"pkg","version":"1.0.0"}"#;
+    fs::write(project_dir.path().join("package.json"), package_json).unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["share", "a.txt"],
+        &[("AI_WORKSPACE_CONFIG", "package.json")],
+    );
+    assert!(
+        !success,
+        "share should reject package.json as config target"
+    );
+    assert!(
+        stderr.contains("non-workspace key 'version'"),
+        "stderr should explain package.json rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("package.json")).unwrap(),
+        package_json,
+        "package.json should not be overwritten"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
 }
 
 #[test]

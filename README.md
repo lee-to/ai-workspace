@@ -175,7 +175,7 @@ ai-workspace init
 
 The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present. Shared paths from config must exist and resolve inside the project directory. The workspace JSON exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
 
-If your repo keeps AI-related files under a dedicated directory, pass a custom config path. The path must be relative and remain inside the project root; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected:
+If your repo keeps AI-related files under a dedicated directory, pass a custom config path. The path must be relative and remain inside the project root; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected. Existing files at that path are only updated when they are already recognizable ai-workspace configs, so ordinary files such as `README.md` or `package.json` are not overwritten by a mistaken config path:
 
 ```bash
 ai-workspace --config .ai/ai-workspace.json export

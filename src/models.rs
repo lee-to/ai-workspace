@@ -3,6 +3,9 @@ use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
+pub const WORKSPACE_CONFIG_VERSION_FIELD: &str = "ai_workspace_config_version";
+pub const WORKSPACE_CONFIG_VERSION: u64 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Project {
     pub id: i64,
@@ -423,8 +426,16 @@ impl WorkspaceConfig {
     /// Save config to a JSON file (pretty-printed with trailing newline).
     pub fn save(&self, path: &Path) -> Result<()> {
         debug!("Saving workspace config to {}", path.display());
+        let mut value =
+            serde_json::to_value(self).context("Failed to serialize workspace config")?;
+        if let Some(object) = value.as_object_mut() {
+            object.insert(
+                WORKSPACE_CONFIG_VERSION_FIELD.to_string(),
+                serde_json::json!(WORKSPACE_CONFIG_VERSION),
+            );
+        }
         let json =
-            serde_json::to_string_pretty(self).context("Failed to serialize workspace config")?;
+            serde_json::to_string_pretty(&value).context("Failed to serialize workspace config")?;
         std::fs::write(path, format!("{}\n", json))
             .with_context(|| format!("Failed to write {}", path.display()))?;
         info!("Saved workspace config to {}", path.display());

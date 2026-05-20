@@ -314,14 +314,14 @@ ai-workspace status
 
 ### `export`
 
-Export the current project's config to the configured workspace JSON path. By default this is `.ai-workspace.json` in the project root. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to store it under `.ai`. The configured path must be relative and remain inside the project directory; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists.
+Export the current project's config to the configured workspace JSON path. By default this is `.ai-workspace.json` in the project root. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to store it under `.ai`. The configured path must be relative and remain inside the project directory; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists and is recognizable as an ai-workspace config. Existing ordinary files at the configured path are preserved unless they were created as workspace configs.
 
 ```bash
 ai-workspace export
 ai-workspace --config .ai/ai-workspace.json export
 ```
 
-The exported file includes the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and `dependencies` so directories sync back as directories. Group notes and workspace event history are not exported.
+The exported file includes an `ai_workspace_config_version` marker, the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and `dependencies` so directories sync back as directories. Group notes and workspace event history are not exported.
 
 Older configs remain valid: string share entries such as `"README.md"` and object entries such as `{ "path": "README.md", "label": "Readme" }` still load. To sync artifact dependencies declaratively, add a `dependencies` array to the share object:
 

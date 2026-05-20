@@ -11,7 +11,8 @@ use std::path::{Component, Path, PathBuf};
 use crate::db::{AmbiguousItemLabel, Db, ScopeChange, SharedItemUpdate, validate_project_rel_path};
 use crate::models::{
     ArtifactDependencyKind, ArtifactReaction, EventSeverity, EventStatus, ServiceLinkKind,
-    SharedItem, SharedItemKind, WorkspaceEventKind,
+    SharedItem, SharedItemKind, WORKSPACE_CONFIG_VERSION, WORKSPACE_CONFIG_VERSION_FIELD,
+    WorkspaceConfig, WorkspaceEventKind,
 };
 
 const WORKSPACE_CONFIG_ENV: &str = "AI_WORKSPACE_CONFIG";
@@ -538,10 +539,112 @@ fn validate_workspace_config_path(
     Ok(config_path)
 }
 
-fn save_workspace_config(
-    config: &crate::models::WorkspaceConfig,
-    config_path: &Path,
+fn is_managed_workspace_config_name(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some(DEFAULT_WORKSPACE_CONFIG_FILE) | Some("ai-workspace.json")
+    )
+}
+
+fn ensure_workspace_config_file_owned(config_path: &Path) -> Result<()> {
+    let content = fs::read_to_string(config_path)
+        .with_context(|| format!("Failed to read {}", config_path.display()))?;
+    let value: serde_json::Value = serde_json::from_str(&content).with_context(|| {
+        format!(
+            "Refusing to overwrite workspace config target '{}': existing file is not valid JSON",
+            config_path.display()
+        )
+    })?;
+
+    let object = value.as_object().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Refusing to overwrite workspace config target '{}': existing file is not an ai-workspace config object",
+            config_path.display()
+        )
+    })?;
+
+    let has_marker = match object.get(WORKSPACE_CONFIG_VERSION_FIELD) {
+        Some(serde_json::Value::Number(version))
+            if version.as_u64() == Some(WORKSPACE_CONFIG_VERSION) =>
+        {
+            true
+        }
+        Some(_) => {
+            bail!(
+                "Refusing to overwrite workspace config target '{}': unsupported {} marker",
+                config_path.display(),
+                WORKSPACE_CONFIG_VERSION_FIELD
+            );
+        }
+        None => false,
+    };
+
+    let allowed_key = |key: &str| {
+        matches!(key, "name" | "slug" | "groups" | "share" | "notes")
+            || key == WORKSPACE_CONFIG_VERSION_FIELD
+    };
+    if let Some(key) = object.keys().find(|key| !allowed_key(key.as_str())) {
+        bail!(
+            "Refusing to overwrite workspace config target '{}': existing file contains non-workspace key '{}'",
+            config_path.display(),
+            key
+        );
+    }
+
+    if !object.get("name").is_some_and(|value| value.is_string()) {
+        bail!(
+            "Refusing to overwrite workspace config target '{}': existing file is missing string field 'name'",
+            config_path.display()
+        );
+    }
+
+    if !has_marker {
+        let has_workspace_specific_key = object.contains_key("slug")
+            || object.contains_key("groups")
+            || object.contains_key("share")
+            || object.contains_key("notes")
+            || is_managed_workspace_config_name(config_path);
+        if !has_workspace_specific_key {
+            bail!(
+                "Refusing to overwrite workspace config target '{}': existing file has no ai-workspace marker or workspace-specific fields",
+                config_path.display()
+            );
+        }
+    }
+
+    serde_json::from_value::<WorkspaceConfig>(value).with_context(|| {
+        format!(
+            "Refusing to overwrite workspace config target '{}': existing file is not a valid ai-workspace config",
+            config_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn ensure_workspace_config_write_target(config_path: &Path) -> Result<()> {
+    if config_path.exists() {
+        ensure_workspace_config_file_owned(config_path)?;
+    }
+    Ok(())
+}
+
+fn ensure_auto_update_workspace_config_target(
+    project: &crate::models::Project,
+    config_path_override: Option<&Path>,
 ) -> Result<()> {
+    let config_path =
+        validate_workspace_config_path(Path::new(&project.path), config_path_override)?;
+    ensure_workspace_config_write_target(&config_path)
+}
+
+fn load_workspace_config(config_path: &Path) -> Result<WorkspaceConfig> {
+    ensure_workspace_config_file_owned(config_path)?;
+    WorkspaceConfig::load(config_path)
+}
+
+fn save_workspace_config(config: &WorkspaceConfig, config_path: &Path) -> Result<()> {
+    ensure_workspace_config_write_target(config_path)?;
     if let Some(parent) = config_path.parent()
         && !parent.as_os_str().is_empty()
     {
@@ -1239,7 +1342,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 validate_workspace_config_path(&cwd, config_path_override.as_deref())?;
             let mut config = if config_path.exists() {
                 info!("Found workspace config at {}", config_path.display());
-                Some(crate::models::WorkspaceConfig::load(&config_path)?)
+                Some(load_workspace_config(&config_path)?)
             } else {
                 None
             };
@@ -1394,6 +1497,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
 
             let project_root = Path::new(&project.path);
             let validated = validate_project_rel_path(project_root, &path)?;
+            ensure_auto_update_workspace_config_target(&project, config_path_override.as_deref())?;
 
             let share_id = if validated.canonical_path.is_dir() {
                 info!("Sharing directory: {}", validated.rel_path);
@@ -1434,6 +1538,12 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             let project = require_project(&db)?;
 
             let is_project_scope = matches!(scope, NoteScope::Project);
+            if is_project_scope {
+                ensure_auto_update_workspace_config_target(
+                    &project,
+                    config_path_override.as_deref(),
+                )?;
+            }
             match scope {
                 NoteScope::Project => {
                     info!("Creating project note for project_id={}", project.id);
@@ -1531,6 +1641,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 scope_change,
             };
 
+            ensure_auto_update_workspace_config_target(&project, config_path_override.as_deref())?;
             db.update_shared_item(item.id, project.id, &update)?;
             print_success(format!("Updated item (id={})", item.id));
             update_workspace_json_if_exists(&db, &project, config_path_override.as_deref())?;
@@ -1549,6 +1660,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 return Ok(());
             };
 
+            ensure_auto_update_workspace_config_target(&project, config_path_override.as_deref())?;
             let removed = db.remove_shared_item_for_project(item.id, project.id)?;
             if !removed {
                 print_info(format!("Item '{}' not found", target));
@@ -1574,6 +1686,16 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             let g = db
                 .get_group_by_name(&group)?
                 .ok_or_else(|| anyhow::anyhow!("Group '{}' not found", group))?;
+            if db
+                .get_groups_for_project(project.id)?
+                .iter()
+                .any(|project_group| project_group.id == g.id)
+            {
+                ensure_auto_update_workspace_config_target(
+                    &project,
+                    config_path_override.as_deref(),
+                )?;
+            }
             if db.remove_project_from_group(project.id, g.id)? {
                 print_success(format!("Left group '{}'", group));
                 // Check if group was auto-deleted (no members left)
@@ -2178,7 +2300,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 )?;
                 if config_path.exists() {
                     info!("Found workspace config, syncing config");
-                    let config = crate::models::WorkspaceConfig::load(&config_path)?;
+                    let config = load_workspace_config(&config_path)?;
                     let report = db.sync_from_config(project.id, &config)?;
                     let total = report.groups_added
                         + report.groups_removed
