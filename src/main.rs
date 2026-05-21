@@ -3,6 +3,7 @@ mod db;
 mod indexer;
 mod mcp;
 mod models;
+mod path;
 mod walk;
 
 use anyhow::Result;

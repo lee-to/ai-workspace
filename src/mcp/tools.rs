@@ -1,5 +1,5 @@
 use log::{debug, error, info, warn};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
 use crate::db::Db;
@@ -29,45 +29,8 @@ fn project_wide_tools_enabled() -> bool {
 }
 
 fn normalize_rel_path(input: &str) -> Result<String, String> {
-    if input.trim().is_empty() {
-        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-    }
-
-    if input.split(['/', '\\']).any(|part| part.is_empty()) {
-        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-    }
-
-    let path = Path::new(input);
-    if path.is_absolute() {
-        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-    }
-
-    let mut parts = Vec::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => {
-                let Some(part) = part.to_str() else {
-                    return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-                };
-                if part.is_empty() {
-                    return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-                }
-                parts.push(part.to_string());
-            }
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => {
-                return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-            }
-        }
-    }
-
-    if parts.is_empty() {
-        return Err(ACCESS_DENIED_INVALID_PATH.to_string());
-    }
-
-    Ok(parts.join("/"))
+    crate::path::normalize_portable_rel_path(input)
+        .map_err(|_| ACCESS_DENIED_INVALID_PATH.to_string())
 }
 
 fn rel_is_same_or_descendant(path: &str, root: &str) -> bool {
@@ -808,16 +771,20 @@ fn workspace_read(
         None => return tool_error(id, "Invalid shared item: missing project"),
     };
 
-    let rel_path = match item.path {
+    let stored_rel_path = match item.path {
         Some(p) => p,
         None => return tool_error(id, "Invalid shared item: missing path"),
+    };
+    let rel_path = match normalize_rel_path(&stored_rel_path) {
+        Ok(path) => path,
+        Err(e) => return tool_error(id, &e),
     };
     if !walk::path_allowed_for_shared_ai_factory(Path::new(&rel_path), options) {
         return tool_error(id, PATH_POLICY_DENIED);
     }
 
     let project_root = Path::new(&project.path);
-    let full_path = project_root.join(&rel_path);
+    let full_path = project_root.join(rel_path);
 
     // Path traversal protection
     let canonical = match full_path.canonicalize() {
