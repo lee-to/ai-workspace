@@ -4,6 +4,12 @@
 
 All commands are run as `ai-workspace <command>`.
 
+Global options:
+
+| Option | Description |
+|--------|-------------|
+| `--config <path>` | Use a custom project config JSON path instead of `.ai-workspace.json`. The path must be relative, stay inside the project root, and can also be set with `AI_WORKSPACE_CONFIG`. |
+
 ## Working Directory Rules
 
 Commands that operate on the "current project" must be run inside an initialized project directory (or any of its subdirectories):
@@ -50,9 +56,9 @@ ai-workspace init [--name <name>] [--slug <slug>] [--group <group>] [--preset ai
 
 If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
-If `.ai-workspace.json` exists in the current directory, `init` reads it and applies the config (groups, shares, notes) via sync. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. Shared paths from the config must exist, be relative paths, and resolve inside the project directory; path traversal and symlink escapes are rejected.
+If the configured workspace JSON exists, `init` reads it and applies the config (groups, shares, notes) via sync. By default this is `.ai-workspace.json`; use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to place it elsewhere. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. The configured workspace JSON path must be a relative path inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Shared paths from the config must also exist, be relative paths, and resolve inside the project directory.
 
-**Auto-share:** When no `.ai-workspace.json` exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
+**Auto-share:** When no configured workspace JSON exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
 
 **AI Factory preset:** `init --preset ai-factory` creates missing `.ai-factory/DESCRIPTION.md`, `.ai-factory/ARCHITECTURE.md`, and `.ai-factory/PLAN.md` files without overwriting existing content. It shares those files with the labels `ai-factory-description`, `ai-factory-architecture`, and `ai-factory-plan`. If `.ai-factory/references`, `.ai-factory/patches`, or `.ai-factory/specs` already exist, it shares those directories as `ai-factory-references`, `ai-factory-patches`, and `ai-factory-specs`; missing optional directories are skipped. Re-running the preset is idempotent.
 
@@ -71,7 +77,7 @@ ai-workspace share <path> [--label <label>]
 
 The path must exist, be relative, and resolve within the project directory. Directories are shared as `dir` kind, files as `file` kind.
 
-If `.ai-workspace.json` exists, it is automatically updated after a successful share.
+If the configured workspace JSON exists, it is automatically updated after a successful share.
 
 ### `note`
 
@@ -308,13 +314,14 @@ ai-workspace status
 
 ### `export`
 
-Export the current project's config to `.ai-workspace.json` in the project root. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists.
+Export the current project's config to the configured workspace JSON path. By default this is `.ai-workspace.json` in the project root. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to store it under `.ai`. The configured path must be relative and remain inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists and is recognizable as an ai-workspace config. Existing ordinary files at the configured path are preserved unless they were created as workspace configs.
 
 ```bash
 ai-workspace export
+ai-workspace --config .ai/ai-workspace.json export
 ```
 
-The exported file includes the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and `dependencies` so directories sync back as directories. Group notes and workspace event history are not exported.
+The exported file includes an `ai_workspace_config_version` marker, the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and `dependencies` so directories sync back as directories. Group notes and workspace event history are not exported.
 
 Older configs remain valid: string share entries such as `"README.md"` and object entries such as `{ "path": "README.md", "label": "Readme" }` still load. To sync artifact dependencies declaratively, add a `dependencies` array to the share object:
 
@@ -332,11 +339,11 @@ Older configs remain valid: string share entries such as `"README.md"` and objec
 }
 ```
 
-Commit this file to your repo so teammates can run `ai-workspace init` and get the same context automatically.
+Commit this file to your repo so teammates can run `ai-workspace init` with the same config path and get the same context automatically.
 
 ### `sync`
 
-Verify shared files/dirs still exist on disk and reconcile with `.ai-workspace.json` if present.
+Verify shared files/dirs still exist on disk and reconcile with the configured workspace JSON if present.
 
 ```bash
 ai-workspace sync
@@ -344,7 +351,7 @@ ai-workspace sync
 
 Two-step process:
 1. Remove stale file/dir entries whose paths no longer exist on disk
-2. If the current directory is inside a project and `.ai-workspace.json` exists, sync the database to match the config (add missing groups/shares/notes, remove extras, update changed notes)
+2. If the current directory is inside a project and the configured workspace JSON exists, sync the database to match the config (add missing groups/shares/notes, remove extras, update changed notes)
 
 ### `search`
 

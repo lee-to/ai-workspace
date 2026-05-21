@@ -36,6 +36,18 @@ fn assert_shared_label(conn: &Connection, path: &str, label: &str, kind: &str) {
     assert_eq!(count, 1, "{kind} share {path} should have label {label}");
 }
 
+fn assert_no_shared_path(db_path: &PathBuf, path: &str) {
+    let conn = Connection::open(db_path).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items WHERE path = ?1",
+            params![path],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "{path} should not be shared");
+}
+
 fn create_legacy_db(db_path: &PathBuf, project_path: &std::path::Path) {
     let conn = Connection::open(db_path).unwrap();
     conn.execute_batch(
@@ -164,6 +176,30 @@ fn run_cmd_in_dir(
         .env("RUST_LOG", "debug")
         .output()
         .expect("Failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (stdout, stderr, output.status.success())
+}
+
+fn run_cmd_in_dir_with_env(
+    db_path: &PathBuf,
+    dir: &std::path::Path,
+    args: &[&str],
+    envs: &[(&str, &str)],
+) -> (String, String, bool) {
+    let mut command = Command::new(binary_path());
+    command
+        .args(args)
+        .current_dir(dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .env("RUST_LOG", "debug");
+
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    let output = command.output().expect("Failed to execute command");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -2067,6 +2103,473 @@ fn test_export_creates_json() {
     assert_eq!(config["share"][0]["kind"], "file");
     assert!(config["share"][0]["dependencies"].is_null());
     assert_eq!(config["notes"][0]["content"], "important note");
+}
+
+#[test]
+fn test_export_config_flag_writes_custom_path_and_updates_it() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+    fs::write(project_dir.path().join("b.txt"), "b").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    run_cmd_in_dir(&db_path, project_dir.path(), &["share", "a.txt"]);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        success,
+        "export should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let custom_config = project_dir.path().join(".ai/ai-workspace.json");
+    assert!(
+        custom_config.exists(),
+        "export should create the custom config path"
+    );
+    assert!(
+        !project_dir.path().join(".ai-workspace.json").exists(),
+        "export with --config should not create root .ai-workspace.json"
+    );
+
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "share", "b.txt"],
+    );
+
+    let content = fs::read_to_string(custom_config).unwrap();
+    assert!(content.contains("a.txt"));
+    assert!(content.contains("b.txt"));
+}
+
+#[test]
+fn test_auto_update_rejects_readme_config_env_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("README.md"), "# keep me").unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let before = fs::read_to_string(project_dir.path().join("README.md")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["share", "a.txt"],
+        &[("AI_WORKSPACE_CONFIG", "README.md")],
+    );
+    assert!(!success, "share should reject README.md as config target");
+    assert!(
+        stderr.contains("Refusing to overwrite workspace config target"),
+        "stderr should explain ownership rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("README.md")).unwrap(),
+        before,
+        "README.md should not be overwritten"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
+}
+
+#[test]
+fn test_export_rejects_existing_readme_config_target() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::write(project_dir.path().join("README.md"), "# keep me").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+    let before = fs::read_to_string(project_dir.path().join("README.md")).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", "README.md", "export"],
+    );
+    assert!(!success, "export should reject README.md as config target");
+    assert!(
+        stderr.contains("Refusing to overwrite workspace config target"),
+        "stderr should explain ownership rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("README.md")).unwrap(),
+        before,
+        "README.md should not be overwritten"
+    );
+}
+
+#[test]
+fn test_auto_update_rejects_package_json_config_env_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    let package_json = r#"{"name":"pkg","version":"1.0.0"}"#;
+    fs::write(project_dir.path().join("package.json"), package_json).unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["share", "a.txt"],
+        &[("AI_WORKSPACE_CONFIG", "package.json")],
+    );
+    assert!(
+        !success,
+        "share should reject package.json as config target"
+    );
+    assert!(
+        stderr.contains("non-workspace key 'version'"),
+        "stderr should explain package.json rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(project_dir.path().join("package.json")).unwrap(),
+        package_json,
+        "package.json should not be overwritten"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
+}
+
+#[test]
+fn test_config_flag_rejects_relative_path_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let root_dir = tempfile::tempdir().unwrap();
+    let project_path = root_dir.path().join("project");
+    fs::create_dir(&project_path).unwrap();
+    let outside_config = root_dir.path().join("outside.json");
+
+    run_cmd_in_dir(&db_path, &project_path, &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        &project_path,
+        &["--config", "../outside.json", "export"],
+    );
+    assert!(!success, "export should reject traversal path");
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain path boundary rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not create config outside project root"
+    );
+}
+
+#[test]
+fn test_config_env_rejects_relative_path_outside_project_on_init() {
+    let (_db_dir, db_path) = temp_db();
+    let root_dir = tempfile::tempdir().unwrap();
+    let project_path = root_dir.path().join("project");
+    fs::create_dir(&project_path).unwrap();
+    let outside_config = root_dir.path().join("outside.json");
+
+    let (_stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        &project_path,
+        &["init", "--group", "team"],
+        &[("AI_WORKSPACE_CONFIG", "../outside.json")],
+    );
+    assert!(!success, "init should reject traversal env config path");
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain path boundary rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "init should not create config outside project root"
+    );
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, &project_path, &["status"]);
+    assert!(
+        !success,
+        "failed init should not register the project\nstderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_config_flag_rejects_absolute_path_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside.json");
+    let outside_config_arg = outside_config.to_string_lossy().to_string();
+
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", &outside_config_arg, "export"],
+    );
+    assert!(!success, "export should reject absolute config path");
+    assert!(
+        stderr.contains("must be relative"),
+        "stderr should explain absolute path rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not create absolute config path"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_symlinked_parent_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+
+    symlink_path(outside_dir.path(), &project_dir.path().join(".ai")).unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject config parent symlink escaping project"
+    );
+    assert!(
+        stderr.contains("outside project directory"),
+        "stderr should explain symlink escape rejection: {stderr}"
+    );
+    assert!(
+        !outside_dir.path().join("ai-workspace.json").exists(),
+        "export should not write through parent symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_dangling_final_symlink_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject dangling final config symlink"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not write through dangling final symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_auto_update_rejects_dangling_final_symlink_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "share", "a.txt"],
+    );
+    assert!(
+        !success,
+        "share should reject dangling final config symlink before mutation"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "share should not write through dangling final symlink"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_existing_final_symlink_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+    let outside_before = "keep me";
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(&outside_config, outside_before).unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject existing final config symlink"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside_config).unwrap(),
+        outside_before,
+        "export should not overwrite existing outside file through final symlink"
+    );
+}
+
+#[test]
+fn test_config_flag_takes_precedence_over_config_env() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::create_dir(project_dir.path().join(".env-ai")).unwrap();
+    fs::write(
+        project_dir.path().join(".ai/cli-workspace.json"),
+        r#"{"name": "from-cli", "groups": ["cli"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join(".env-ai/env-workspace.json"),
+        r#"{"name": "from-env", "groups": ["env"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/cli-workspace.json", "init"],
+        &[("AI_WORKSPACE_CONFIG", ".env-ai/env-workspace.json")],
+    );
+    assert!(
+        success,
+        "init should prefer CLI config over env\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("from-cli"));
+    assert!(stdout.contains("cli"));
+    assert!(!stdout.contains("from-env"));
+    assert!(!stdout.contains("env"));
+}
+
+#[test]
+fn test_sync_uses_custom_config_path() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai/ai-workspace.json"),
+        r#"{"name": "sync-proj", "groups": ["team"], "share": ["README.md"], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "init"],
+    );
+    assert!(
+        success,
+        "init should succeed with custom config\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "sync"],
+    );
+    assert!(
+        success,
+        "sync should succeed with custom config\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("sync-proj"));
+    assert!(stdout.contains("team"));
+    assert!(stdout.contains("README.md"));
+}
+
+#[test]
+fn test_init_uses_custom_config_from_env() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("Cargo.toml"), "[package]").unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Test").unwrap();
+    fs::write(
+        project_dir.path().join(".ai/ai-workspace.json"),
+        r#"{"name": "from-env", "groups": ["team"], "share": [], "notes": []}"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir_with_env(
+        &db_path,
+        project_dir.path(),
+        &["init"],
+        &[("AI_WORKSPACE_CONFIG", ".ai/ai-workspace.json")],
+    );
+    assert!(
+        success,
+        "init should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        !stdout.contains("Auto-shared"),
+        "custom config should disable auto-share\nstdout:\n{stdout}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
+    assert!(success, "status should succeed\nstderr:\n{stderr}");
+    assert!(stdout.contains("from-env"));
+    assert!(stdout.contains("team"));
+    assert!(!stdout.contains("Cargo.toml"));
+    assert!(!stdout.contains("README.md"));
 }
 
 #[test]
