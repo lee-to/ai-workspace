@@ -514,8 +514,8 @@ fn validate_workspace_config_path(
         );
     }
 
-    if config_path.exists() {
-        if config_path.is_dir() {
+    if let Some(metadata) = workspace_config_symlink_metadata(&config_path)? {
+        if metadata.is_dir() {
             bail!(
                 "Workspace config path must be a file, not a directory: {}",
                 path.display()
@@ -537,6 +537,27 @@ fn validate_workspace_config_path(
     }
 
     Ok(config_path)
+}
+
+fn workspace_config_symlink_metadata(config_path: &Path) -> Result<Option<fs::Metadata>> {
+    match fs::symlink_metadata(config_path) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() {
+                bail!(
+                    "Workspace config path must not be a symlink: {}",
+                    config_path.display()
+                );
+            }
+            Ok(Some(metadata))
+        }
+        Err(err) if err.kind() == ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "Failed to inspect workspace config path: {}",
+                config_path.display()
+            )
+        }),
+    }
 }
 
 fn is_managed_workspace_config_name(path: &Path) -> bool {
@@ -623,7 +644,7 @@ fn ensure_workspace_config_file_owned(config_path: &Path) -> Result<()> {
 }
 
 fn ensure_workspace_config_write_target(config_path: &Path) -> Result<()> {
-    if config_path.exists() {
+    if workspace_config_symlink_metadata(config_path)?.is_some() {
         ensure_workspace_config_file_owned(config_path)?;
     }
     Ok(())

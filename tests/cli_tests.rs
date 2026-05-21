@@ -2348,6 +2348,116 @@ fn test_config_flag_rejects_symlinked_parent_outside_project_on_export() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_dangling_final_symlink_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject dangling final config symlink"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "export should not write through dangling final symlink"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn test_auto_update_rejects_dangling_final_symlink_before_share() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(project_dir.path().join("a.txt"), "a").unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "share", "a.txt"],
+    );
+    assert!(
+        !success,
+        "share should reject dangling final config symlink before mutation"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert!(
+        !outside_config.exists(),
+        "share should not write through dangling final symlink"
+    );
+    assert_no_shared_path(&db_path, "a.txt");
+}
+
+#[cfg(unix)]
+#[test]
+fn test_config_flag_rejects_existing_final_symlink_outside_project_on_export() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside_config = outside_dir.path().join("outside-ai-workspace.json");
+    let outside_before = "keep me";
+
+    fs::create_dir(project_dir.path().join(".ai")).unwrap();
+    fs::write(&outside_config, outside_before).unwrap();
+    symlink_path(
+        &outside_config,
+        &project_dir.path().join(".ai/ai-workspace.json"),
+    )
+    .unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["--config", ".ai/ai-workspace.json", "export"],
+    );
+    assert!(
+        !success,
+        "export should reject existing final config symlink"
+    );
+    assert!(
+        stderr.contains("must not be a symlink"),
+        "stderr should explain final symlink rejection: {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(&outside_config).unwrap(),
+        outside_before,
+        "export should not overwrite existing outside file through final symlink"
+    );
+}
+
 #[test]
 fn test_config_flag_takes_precedence_over_config_env() {
     let (_db_dir, db_path) = temp_db();

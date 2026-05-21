@@ -56,7 +56,7 @@ ai-workspace init [--name <name>] [--slug <slug>] [--group <group>] [--preset ai
 
 If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
-If the configured workspace JSON exists, `init` reads it and applies the config (groups, shares, notes) via sync. By default this is `.ai-workspace.json`; use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to place it elsewhere. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. The configured workspace JSON path must be a relative path inside the project directory; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected. Shared paths from the config must also exist, be relative paths, and resolve inside the project directory.
+If the configured workspace JSON exists, `init` reads it and applies the config (groups, shares, notes) via sync. By default this is `.ai-workspace.json`; use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to place it elsewhere. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. The configured workspace JSON path must be a relative path inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Shared paths from the config must also exist, be relative paths, and resolve inside the project directory.
 
 **Auto-share:** When no configured workspace JSON exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
 
@@ -314,7 +314,7 @@ ai-workspace status
 
 ### `export`
 
-Export the current project's config to the configured workspace JSON path. By default this is `.ai-workspace.json` in the project root. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to store it under `.ai`. The configured path must be relative and remain inside the project directory; absolute paths, `..`, backslashes on Unix, and symlink escapes are rejected. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists and is recognizable as an ai-workspace config. Existing ordinary files at the configured path are preserved unless they were created as workspace configs.
+Export the current project's config to the configured workspace JSON path. By default this is `.ai-workspace.json` in the project root. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to store it under `.ai`. The configured path must be relative and remain inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. This is the only way to create the file — other commands (`share`, `rm`, `note`, `edit`, `leave`) update it only if it already exists and is recognizable as an ai-workspace config. Existing ordinary files at the configured path are preserved unless they were created as workspace configs.
 
 ```bash
 ai-workspace export
