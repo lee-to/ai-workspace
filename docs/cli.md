@@ -37,6 +37,8 @@ Commands that work from any directory (no project required):
 - `serve`
 - `update`
 
+`serve --scope current-project` must be started from a registered project directory so the current project can be resolved.
+
 ## Commands
 
 ### `init`
@@ -396,13 +398,16 @@ Walks every shared file and every `.md` inside every shared directory, re-reads 
 
 ### `serve`
 
-Start the MCP server on stdio.
+Start the MCP server on stdio. By default it uses global MCP scope.
 
 ```bash
 ai-workspace serve
+ai-workspace serve --scope current-project
+ai-workspace serve --group backend
+ai-workspace serve --project api
 ```
 
-See [MCP Server](mcp-server.md) for details on the available tools.
+Scope can also be configured with `AI_WORKSPACE_SCOPE`, `AI_WORKSPACE_SCOPE_GROUP`, and `AI_WORKSPACE_SCOPE_PROJECT`. CLI scope flags override env vars. See [MCP Server](mcp-server.md) for scope behavior and available tools.
 
 ### `update`
 

@@ -150,6 +150,29 @@ impl From<CliEventStatus> for EventStatus {
     }
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+pub enum CliMcpScope {
+    #[value(name = "global")]
+    Global,
+    #[value(name = "current-project")]
+    CurrentProject,
+    #[value(name = "group")]
+    Group,
+    #[value(name = "project")]
+    Project,
+}
+
+impl From<CliMcpScope> for crate::mcp::McpScopeKind {
+    fn from(scope: CliMcpScope) -> Self {
+        match scope {
+            CliMcpScope::Global => crate::mcp::McpScopeKind::Global,
+            CliMcpScope::CurrentProject => crate::mcp::McpScopeKind::CurrentProject,
+            CliMcpScope::Group => crate::mcp::McpScopeKind::Group,
+            CliMcpScope::Project => crate::mcp::McpScopeKind::Project,
+        }
+    }
+}
+
 impl From<CliArtifactReaction> for ArtifactReaction {
     fn from(reaction: CliArtifactReaction) -> Self {
         match reaction {
@@ -376,7 +399,17 @@ pub enum Command {
     /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile workspace JSON
     Sync,
     /// Start MCP server (stdio transport)
-    Serve,
+    Serve {
+        /// MCP metadata/access scope (default: global, or AI_WORKSPACE_SCOPE)
+        #[arg(long, value_enum)]
+        scope: Option<CliMcpScope>,
+        /// Group name for group-scoped MCP mode
+        #[arg(long)]
+        group: Option<String>,
+        /// Project id, slug, or registered path for project-scoped MCP mode
+        #[arg(long)]
+        project: Option<String>,
+    },
     /// Update ai-workspace to the latest version
     Update,
     /// Full-text search across indexed .md files
@@ -1349,7 +1382,22 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
     let config_path_override = normalize_config_override(config_path_override)?;
 
     match cmd {
-        Command::Serve => crate::mcp::serve(),
+        Command::Serve {
+            scope,
+            group,
+            project,
+        } => {
+            let request = crate::mcp::McpScopeRequest::from_cli_and_env(
+                scope.map(Into::into),
+                group,
+                project,
+            )
+            .map_err(anyhow::Error::msg)?;
+            let db = Db::open_default()?;
+            let resolved_scope =
+                crate::mcp::resolve_scope(&db, request).map_err(anyhow::Error::msg)?;
+            crate::mcp::serve(resolved_scope)
+        }
 
         Command::Init {
             name,
