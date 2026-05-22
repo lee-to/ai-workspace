@@ -13,7 +13,7 @@ use crate::models::{
     ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig, WorkspaceEvent,
     WorkspaceEventKind, normalize_project_slug,
 };
-use crate::path::normalize_portable_rel_path;
+use crate::path::{normalize_portable_rel_path, validate_config_share_path};
 
 pub enum ScopeChange {
     ToProject,
@@ -2231,7 +2231,8 @@ impl Db {
         let mut seen_share_paths = std::collections::HashSet::new();
         let mut validated_shares = Vec::new();
         for entry in &config.share {
-            let validated = validate_project_rel_path(project_root, entry.path())?;
+            let config_path = validate_config_share_path(entry.path())?;
+            let validated = validate_project_rel_path(project_root, &config_path)?;
             let kind = entry.kind().unwrap_or_else(|| {
                 if validated.canonical_path.is_dir() {
                     SharedItemKind::Dir
@@ -4748,6 +4749,28 @@ mod tests {
 
         let err = db.sync_from_config(pid, &config).unwrap_err();
         assert!(err.to_string().contains("outside project directory"));
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn sync_rejects_glob_like_share_path_with_clear_error() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs/**".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        );
         assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
     }
 

@@ -1,5 +1,7 @@
 use anyhow::{Result, bail};
 
+pub const CONFIG_SHARE_GLOB_ERROR: &str = "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory.";
+
 pub fn normalize_portable_rel_path(input: &str) -> Result<String> {
     let value = input.trim().replace('\\', "/");
     let value = value.trim_end_matches('/');
@@ -26,6 +28,19 @@ pub fn normalize_portable_rel_path(input: &str) -> Result<String> {
     }
 
     Ok(parts.join("/"))
+}
+
+pub fn validate_config_share_path(input: &str) -> Result<String> {
+    let normalized = normalize_portable_rel_path(input)?;
+
+    if normalized
+        .chars()
+        .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+    {
+        bail!(CONFIG_SHARE_GLOB_ERROR);
+    }
+
+    Ok(normalized)
 }
 
 #[cfg(test)]
@@ -64,6 +79,29 @@ mod tests {
                 normalize_portable_rel_path(input).is_err(),
                 "expected {input:?} to be rejected"
             );
+        }
+    }
+
+    #[test]
+    fn validate_config_share_path_accepts_concrete_directory_aliases() {
+        for input in ["docs", "docs/", r"docs\"] {
+            assert_eq!(validate_config_share_path(input).unwrap(), "docs");
+        }
+    }
+
+    #[test]
+    fn validate_config_share_path_rejects_glob_patterns() {
+        let expected = "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory.";
+
+        for input in [
+            "docs/**",
+            r"docs\**",
+            "docs/guide?.md",
+            "docs/[draft].md",
+            "docs/{api,web}.md",
+        ] {
+            let err = validate_config_share_path(input).unwrap_err();
+            assert_eq!(err.to_string(), expected);
         }
     }
 }
