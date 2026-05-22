@@ -14,6 +14,7 @@ use crate::models::{
     SharedItem, SharedItemKind, WORKSPACE_CONFIG_VERSION, WORKSPACE_CONFIG_VERSION_FIELD,
     WorkspaceConfig, WorkspaceEventKind,
 };
+use crate::path::validate_config_share_path;
 
 const WORKSPACE_CONFIG_ENV: &str = "AI_WORKSPACE_CONFIG";
 const DEFAULT_WORKSPACE_CONFIG_FILE: &str = ".ai-workspace.json";
@@ -698,7 +699,8 @@ fn validate_config_share_paths(
     config: &crate::models::WorkspaceConfig,
 ) -> Result<()> {
     for entry in &config.share {
-        validate_project_rel_path(project_dir, entry.path())?;
+        let path = validate_config_share_path(entry.path())?;
+        validate_project_rel_path(project_dir, &path)?;
     }
     Ok(())
 }

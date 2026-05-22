@@ -2768,6 +2768,70 @@ fn test_init_reads_json_backslash_and_trailing_share_paths() {
 }
 
 #[test]
+fn test_init_rejects_json_glob_share_path_with_clear_error() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    let config = r#"{
+        "name": "glob",
+        "share": ["docs/**"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        !success,
+        "init should reject glob-like config share path\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        ),
+        "stderr should explain unsupported glob syntax\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["list"]);
+    assert!(success, "list should succeed after rejected init: {stderr}");
+    assert!(
+        !stdout.contains("glob"),
+        "rejected init should not persist project state\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_sync_rejects_json_backslash_glob_share_path_with_clear_error() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "glob-sync"],
+    );
+
+    let config = r#"{
+        "name": "glob-sync",
+        "share": ["docs\\**"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["sync"]);
+    assert!(
+        !success,
+        "sync should reject backslash glob-like config share path\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        ),
+        "stderr should explain unsupported glob syntax\nstderr:\n{stderr}"
+    );
+    assert_no_shared_path(&db_path, "docs/**");
+}
+
+#[test]
 fn test_init_rejects_json_share_path_traversal() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
