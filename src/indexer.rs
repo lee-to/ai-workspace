@@ -10,6 +10,7 @@ use std::time::Instant;
 
 use crate::db::{Db, ValidatedProjectPath, validate_project_rel_path};
 use crate::models::{FileSearchHit, SharedItem, SharedItemKind};
+use crate::path::normalize_portable_rel_path;
 use crate::walk::{self, WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
@@ -79,23 +80,31 @@ fn validate_indexed_item_path(
     shared_item_id: i64,
     project_root: &Path,
     rel_path: &str,
-    stats: Option<&mut IndexStats>,
+    mut stats: Option<&mut IndexStats>,
 ) -> Result<Option<ValidatedProjectPath>> {
-    if !path_allowed_for_index(Path::new(rel_path)) {
+    let normalized_rel_path = match normalize_portable_rel_path(rel_path) {
+        Ok(path) => path,
+        Err(err) => {
+            reject_indexed_item(db, shared_item_id, rel_path, err, stats.as_deref_mut())?;
+            return Ok(None);
+        }
+    };
+
+    if !path_allowed_for_index(Path::new(&normalized_rel_path)) {
         reject_indexed_item(
             db,
             shared_item_id,
-            rel_path,
+            &normalized_rel_path,
             "path blocked by policy",
-            stats,
+            stats.as_deref_mut(),
         )?;
         return Ok(None);
     }
 
-    match validate_project_rel_path(project_root, rel_path) {
+    match validate_project_rel_path(project_root, &normalized_rel_path) {
         Ok(validated) => Ok(Some(validated)),
         Err(err) => {
-            reject_indexed_item(db, shared_item_id, rel_path, err, stats)?;
+            reject_indexed_item(db, shared_item_id, &normalized_rel_path, err, stats)?;
             Ok(None)
         }
     }
@@ -131,16 +140,29 @@ fn validate_child_markdown_path(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<Option<ValidatedProjectPath>> {
-    if !path_allowed_for_index(Path::new(rel_path)) {
-        warn!("index: skipping child blocked by policy: {}", rel_path);
+    let normalized_rel_path = match normalize_portable_rel_path(rel_path) {
+        Ok(path) => path,
+        Err(err) => {
+            warn!(
+                "index: skipping child with invalid path '{}': {}",
+                rel_path, err
+            );
+            return Ok(None);
+        }
+    };
+    if !path_allowed_for_index(Path::new(&normalized_rel_path)) {
+        warn!(
+            "index: skipping child blocked by policy: {}",
+            normalized_rel_path
+        );
         return Ok(None);
     }
-    match validate_project_rel_path(project_root, rel_path) {
+    match validate_project_rel_path(project_root, &normalized_rel_path) {
         Ok(validated) => Ok(Some(validated)),
         Err(err) => {
             warn!(
                 "index: skipping child outside project root '{}': {}",
-                rel_path, err
+                normalized_rel_path, err
             );
             Ok(None)
         }

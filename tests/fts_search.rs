@@ -89,6 +89,26 @@ fn cli_search_dir_share_indexes_children() {
 }
 
 #[test]
+fn cli_search_backslash_share_indexes_with_forward_slash_path() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proj.path().join("docs")).unwrap();
+    fs::write(
+        proj.path().join("docs").join("README.md"),
+        "portable_backslash_marker",
+    )
+    .unwrap();
+
+    run(&db, proj.path(), &["init", "--name", "p"]);
+    let (_stdout, stderr, ok) = run(&db, proj.path(), &["share", r"docs\README.md"]);
+    assert!(ok, "backslash share should succeed\nstderr:\n{stderr}");
+
+    let (stdout, _, ok) = run(&db, proj.path(), &["search", "portable_backslash_marker"]);
+    assert!(ok, "search should succeed");
+    assert_hit_path(&stdout, "docs/README.md");
+}
+
+#[test]
 fn cli_search_dir_share_refreshes_edited_child_file() {
     let (_dbdir, db) = temp_db();
     let proj = tempfile::tempdir().unwrap();

@@ -120,31 +120,9 @@ fn is_binary(path: &Path) -> bool {
 }
 
 fn normalize_rel_path(input: &str) -> Option<PathBuf> {
-    if input.trim().is_empty() || input.split(['/', '\\']).any(|part| part.is_empty()) {
-        return None;
-    }
-
-    let path = Path::new(input);
-    if path.is_absolute() {
-        return None;
-    }
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => normalized.push(part),
-            Component::CurDir
-            | Component::ParentDir
-            | Component::RootDir
-            | Component::Prefix(_) => return None,
-        }
-    }
-
-    if normalized.as_os_str().is_empty() {
-        None
-    } else {
-        Some(normalized)
-    }
+    crate::path::normalize_portable_rel_path(input)
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn path_to_slash_string(path: &Path) -> String {

@@ -685,6 +685,118 @@ fn test_share_directory() {
 }
 
 #[test]
+fn test_share_backslash_file_path_stores_forward_slashes() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    fs::write(project_dir.path().join("docs/README.md"), "# Docs").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["share", r"docs\README.md", "--label", "readme"],
+    );
+    assert!(
+        success,
+        "share should accept a Windows-style path\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    assert_shared_label(&conn, "docs/README.md", "readme", "file");
+}
+
+#[test]
+fn test_portable_path_targets_resolve_after_normalized_share() {
+    let (_db_dir, db_path) = temp_db();
+    let auth_dir = tempfile::tempdir().unwrap();
+    let api_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(api_dir.path().join("docs")).unwrap();
+    fs::write(api_dir.path().join("docs/README.md"), "# Docs").unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        auth_dir.path(),
+        &[
+            "init", "--name", "Auth", "--slug", "auth", "--group", "core",
+        ],
+    );
+    run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["init", "--name", "API", "--slug", "api", "--group", "core"],
+    );
+    run_cmd_in_dir(&db_path, api_dir.path(), &["share", r"docs\README.md"]);
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["edit", r"docs\README.md", "--label", "readme"],
+    );
+    assert!(
+        success,
+        "edit should resolve portable path target: {stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            r"docs\README.md",
+            "auth",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    assert!(
+        success,
+        "artifact depends should resolve portable path target: {stderr}"
+    );
+    assert!(stdout.contains("depending on 'auth'"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &["artifact", "deps", r"docs\README.md"],
+    );
+    assert!(
+        success,
+        "artifact deps should resolve portable path target: {stderr}"
+    );
+    assert!(stdout.contains("docs/README.md"));
+    assert!(stdout.contains("auth"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        api_dir.path(),
+        &[
+            "artifact",
+            "undepend",
+            r"docs\README.md",
+            "auth",
+            "--kind",
+            "references",
+        ],
+    );
+    assert!(
+        success,
+        "artifact undepend should resolve portable path target: {stderr}"
+    );
+    assert!(stdout.contains("Removed 1 artifact dependency"));
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, api_dir.path(), &["rm", r"docs\README.md"]);
+    assert!(success, "rm should resolve portable path target: {stderr}");
+    assert!(stdout.contains("Removed item"));
+    assert!(!stdout.contains("not found"));
+}
+
+#[test]
 fn test_share_nonexistent_file() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -2106,6 +2218,31 @@ fn test_export_creates_json() {
 }
 
 #[test]
+fn test_export_writes_forward_slashes_for_legacy_backslash_paths() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    fs::write(project_dir.path().join("docs/README.md"), "# Docs").unwrap();
+    run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "proj"]);
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "INSERT INTO shared_items (kind, path, project_id, label)
+         VALUES ('file', ?1, 1, 'readme')",
+        params![r"docs\README.md"],
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["export"]);
+    assert!(success, "export should succeed\nstderr:\n{stderr}");
+
+    let content = fs::read_to_string(project_dir.path().join(".ai-workspace.json")).unwrap();
+    let config: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(config["share"][0]["path"], "docs/README.md");
+}
+
+#[test]
 fn test_export_config_flag_writes_custom_path_and_updates_it() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -2599,6 +2736,35 @@ fn test_init_reads_json() {
     assert!(stdout.contains("from-json-slug"));
     assert!(stdout.contains("team-a"));
     assert!(stdout.contains("greeting"));
+}
+
+#[test]
+fn test_init_reads_json_backslash_and_trailing_share_paths() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("examples")).unwrap();
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    fs::write(project_dir.path().join("docs/README.md"), "# Docs").unwrap();
+
+    let config = r#"{
+        "name": "portable",
+        "share": [
+            {"path": "examples\\", "label": "examples", "kind": "dir"},
+            {"path": "docs\\README.md", "label": "readme", "kind": "file"}
+        ]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        success,
+        "init should import portable share paths\nstderr:\n{stderr}"
+    );
+
+    let conn = Connection::open(&db_path).unwrap();
+    assert_shared_label(&conn, "examples", "examples", "dir");
+    assert_shared_label(&conn, "docs/README.md", "readme", "file");
 }
 
 #[test]

@@ -1387,6 +1387,31 @@ fn test_mcp_project_tree_subdir_filters_to_shared_descendants_by_default() {
 }
 
 #[test]
+fn test_mcp_project_tree_accepts_trailing_backslash_subdir() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_tree",
+                "arguments": { "project_id": 1, "subdir": "docs\\" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("guide.md"));
+    assert!(content.contains("notes.txt"));
+}
+
+#[test]
 fn test_mcp_project_tree_lists_shared_ai_factory_dir_by_default() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_ai_factory_preset_project(&db_path);
@@ -1741,6 +1766,30 @@ fn test_mcp_workspace_read_by_path_allows_file_inside_shared_dir() {
 }
 
 #[test]
+fn test_mcp_workspace_read_accepts_backslash_rel_path() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "project_id": 1, "rel_path": "docs\\guide.md" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("shared_docs_token"));
+}
+
+#[test]
 fn test_mcp_workspace_read_ai_factory_preset_item_id_is_readable_by_default() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_ai_factory_preset_project(&db_path);
@@ -1850,6 +1899,44 @@ fn test_mcp_workspace_read_item_id_shared_dir_still_lists_children() {
             "params": {
                 "name": "workspace_read",
                 "arguments": { "item_id": 2 }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("guide.md"));
+    assert!(content.contains("notes.txt"));
+}
+
+#[test]
+fn test_mcp_workspace_read_item_id_normalizes_legacy_backslash_scope() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+    let conn = Connection::open(&db_path).unwrap();
+    let item_id: i64 = conn
+        .query_row(
+            "SELECT id FROM shared_items WHERE project_id = 1 AND path = 'docs'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "UPDATE shared_items SET path = ?1 WHERE id = ?2",
+        params![r"docs\", item_id],
+    )
+    .unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_read",
+                "arguments": { "item_id": item_id }
             }
         })],
     );
@@ -2187,6 +2274,37 @@ fn test_mcp_project_grep_searches_only_shared_scopes_by_default() {
     assert!(!content.contains("secret_token"));
     assert!(!content.contains("private.rs"));
     assert!(!content.contains("private_src_token"));
+}
+
+#[test]
+fn test_mcp_project_grep_uses_legacy_backslash_shared_scope() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_scoped_project(&db_path);
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute(
+        "UPDATE shared_items SET path = ?1 WHERE project_id = 1 AND path = 'docs'",
+        params![r"docs\"],
+    )
+    .unwrap();
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_grep",
+                "arguments": { "project_id": 1, "pattern": "shared_docs_token" }
+            }
+        })],
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("docs/guide.md"));
+    assert!(content.contains("shared_docs_token"));
 }
 
 #[test]

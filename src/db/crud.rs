@@ -1,7 +1,7 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
 use rusqlite::{Connection, Row, params, types::Type};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -13,6 +13,7 @@ use crate::models::{
     ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig, WorkspaceEvent,
     WorkspaceEventKind, normalize_project_slug,
 };
+use crate::path::normalize_portable_rel_path;
 
 pub enum ScopeChange {
     ToProject,
@@ -60,37 +61,8 @@ pub fn validate_project_rel_path(
     project_root: &Path,
     rel_path: &str,
 ) -> Result<ValidatedProjectPath> {
-    #[cfg(unix)]
-    if rel_path.contains('\\') {
-        anyhow::bail!(
-            "Path must use forward slashes and cannot contain backslashes: {}",
-            rel_path
-        );
-    }
-
-    let input = Path::new(rel_path);
-    let mut normalized = PathBuf::new();
-    let mut stored_parts = Vec::new();
-
-    for component in input.components() {
-        match component {
-            Component::Normal(part) => {
-                normalized.push(part);
-                stored_parts.push(part.to_string_lossy().to_string());
-            }
-            Component::CurDir => {}
-            Component::ParentDir => {
-                anyhow::bail!("Path is outside project directory: {}", rel_path);
-            }
-            Component::RootDir | Component::Prefix(_) => {
-                anyhow::bail!("Path must be relative to project directory: {}", rel_path);
-            }
-        }
-    }
-
-    if normalized.as_os_str().is_empty() {
-        anyhow::bail!("Path must name a file or directory inside project directory");
-    }
+    let normalized_rel_path = normalize_portable_rel_path(rel_path)?;
+    let normalized = PathBuf::from(&normalized_rel_path);
 
     let canonical_root = project_root.canonicalize().with_context(|| {
         format!(
@@ -108,7 +80,7 @@ pub fn validate_project_rel_path(
     }
 
     Ok(ValidatedProjectPath {
-        rel_path: stored_parts.join("/"),
+        rel_path: normalized_rel_path,
         canonical_path,
     })
 }
@@ -2028,34 +2000,45 @@ impl Db {
             return Ok(Some(item));
         }
 
-        // 3. Try as path
-        let item: Option<SharedItem> = self
-            .conn
-            .query_row(
+        // 3. Try as path, accepting portable aliases for normalized stored paths.
+        let find_item_by_path = |path: &str| -> Option<SharedItem> {
+            self.conn
+                .query_row(
                 "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
                  FROM shared_items
                  WHERE project_id = ?2 AND path = ?1
                  LIMIT 1",
-                params![target, project_id],
-                |row| {
-                    let kind_str: String = row.get(1)?;
-                    Ok(SharedItem {
-                        id: row.get(0)?,
-                        kind: kind_str.parse().unwrap_or(SharedItemKind::File),
-                        path: row.get(2)?,
-                        content: row.get(3)?,
-                        label: row.get(4)?,
-                        project_id: row.get(5)?,
-                        group_id: row.get(6)?,
-                        created_by_project_id: row.get(7)?,
-                        created_at: row.get(8)?,
-                        updated_at: row.get(9)?,
-                    })
-                },
-            )
-            .ok();
+                    params![path, project_id],
+                    |row| {
+                        let kind_str: String = row.get(1)?;
+                        Ok(SharedItem {
+                            id: row.get(0)?,
+                            kind: kind_str.parse().unwrap_or(SharedItemKind::File),
+                            path: row.get(2)?,
+                            content: row.get(3)?,
+                            label: row.get(4)?,
+                            project_id: row.get(5)?,
+                            group_id: row.get(6)?,
+                            created_by_project_id: row.get(7)?,
+                            created_at: row.get(8)?,
+                            updated_at: row.get(9)?,
+                        })
+                    },
+                )
+                .ok()
+        };
 
-        Ok(item)
+        if let Some(item) = find_item_by_path(target) {
+            return Ok(Some(item));
+        }
+
+        if let Ok(normalized_target) = normalize_portable_rel_path(target)
+            && normalized_target != target
+        {
+            return Ok(find_item_by_path(&normalized_target));
+        }
+
+        Ok(None)
     }
 
     /// Update a shared item's content, label, and/or scope
@@ -2165,6 +2148,13 @@ impl Db {
             match item.kind {
                 SharedItemKind::File | SharedItemKind::Dir => {
                     if let Some(ref path) = item.path {
+                        let export_path = normalize_portable_rel_path(path).unwrap_or_else(|err| {
+                            warn!(
+                                "Exporting legacy shared path '{}' without normalization: {}",
+                                path, err
+                            );
+                            path.clone()
+                        });
                         let dependencies = self
                             .list_artifact_dependencies_for_item(project_id, path)?
                             .into_iter()
@@ -2175,7 +2165,7 @@ impl Db {
                             })
                             .collect::<Vec<_>>();
                         let entry = ShareEntry::WithMetadata {
-                            path: path.clone(),
+                            path: export_path,
                             label: item.label.clone(),
                             kind: Some(item.kind),
                             dependencies: if dependencies.is_empty() {
@@ -2238,25 +2228,31 @@ impl Db {
         }
 
         let project_root = Path::new(&project.path);
-        let validated_shares = config
-            .share
-            .iter()
-            .map(|entry| {
-                let validated = validate_project_rel_path(project_root, entry.path())?;
-                let kind = entry.kind().unwrap_or_else(|| {
-                    if validated.canonical_path.is_dir() {
-                        SharedItemKind::Dir
-                    } else {
-                        SharedItemKind::File
-                    }
-                });
-                Ok(ValidatedConfigShare {
+        let mut seen_share_paths = std::collections::HashSet::new();
+        let mut validated_shares = Vec::new();
+        for entry in &config.share {
+            let validated = validate_project_rel_path(project_root, entry.path())?;
+            let kind = entry.kind().unwrap_or_else(|| {
+                if validated.canonical_path.is_dir() {
+                    SharedItemKind::Dir
+                } else {
+                    SharedItemKind::File
+                }
+            });
+            if seen_share_paths.insert(validated.rel_path.clone()) {
+                validated_shares.push(ValidatedConfigShare {
                     entry,
                     path: validated.rel_path,
                     kind,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
+                });
+            } else {
+                debug!(
+                    "sync: skipping duplicate config share alias '{}' normalized to '{}'",
+                    entry.path(),
+                    validated.rel_path
+                );
+            }
+        }
 
         let tx = self.conn.unchecked_transaction()?;
 
@@ -2906,9 +2902,17 @@ impl Db {
         drop(stmt);
 
         let mut hits = Vec::new();
-        for (indexed_file_id, hit, item_kind, item_path, project_path, abs_path) in rows {
-            let item_rel = Path::new(&item_path);
-            let hit_rel = Path::new(&hit.path);
+        for (indexed_file_id, mut hit, item_kind, item_path, project_path, abs_path) in rows {
+            let Ok(normalized_item_path) = normalize_portable_rel_path(&item_path) else {
+                self.delete_file_index(hit.shared_item_id)?;
+                continue;
+            };
+            let Ok(normalized_hit_path) = normalize_portable_rel_path(&hit.path) else {
+                self.delete_indexed_file_by_id(indexed_file_id)?;
+                continue;
+            };
+            let item_rel = Path::new(&normalized_item_path);
+            let hit_rel = Path::new(&normalized_hit_path);
             let options = crate::walk::WalkOptions::default();
             if !crate::walk::path_allowed_for_shared_ai_factory(item_rel, options)
                 || !crate::walk::path_allowed_for_shared_ai_factory(hit_rel, options)
@@ -2918,11 +2922,13 @@ impl Db {
             }
 
             let project_root = Path::new(&project_path);
-            let Ok(validated_item) = validate_project_rel_path(project_root, &item_path) else {
+            let Ok(validated_item) = validate_project_rel_path(project_root, &normalized_item_path)
+            else {
                 self.delete_file_index(hit.shared_item_id)?;
                 continue;
             };
-            let Ok(validated_hit) = validate_project_rel_path(project_root, &hit.path) else {
+            let Ok(validated_hit) = validate_project_rel_path(project_root, &normalized_hit_path)
+            else {
                 self.delete_indexed_file_by_id(indexed_file_id)?;
                 continue;
             };
@@ -2946,6 +2952,7 @@ impl Db {
                 continue;
             }
 
+            hit.path = normalized_hit_path;
             hits.push(hit);
             if hits.len() == limit {
                 break;
@@ -4468,6 +4475,24 @@ mod tests {
     }
 
     #[test]
+    fn export_project_config_normalizes_legacy_share_paths() {
+        let db = test_db();
+        let pid = db.create_project("proj", "/tmp/proj").unwrap();
+        db.share_file(pid, r"docs\README.md", Some("readme"))
+            .unwrap();
+        db.share_dir(pid, r"examples\", Some("examples")).unwrap();
+
+        let config = db.export_project_config(pid).unwrap();
+        let paths = config
+            .share
+            .iter()
+            .map(|entry| entry.path().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(paths, vec!["docs/README.md", "examples"]);
+    }
+
+    #[test]
     fn export_excludes_group_notes() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();
@@ -4645,6 +4670,48 @@ mod tests {
     }
 
     #[test]
+    fn sync_deduplicates_portable_alias_share_paths() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![
+                ShareEntry::WithMetadata {
+                    path: "docs".to_string(),
+                    label: Some("docs".to_string()),
+                    kind: Some(SharedItemKind::Dir),
+                    dependencies: None,
+                },
+                ShareEntry::WithMetadata {
+                    path: "docs/".to_string(),
+                    label: Some("trailing slash".to_string()),
+                    kind: Some(SharedItemKind::Dir),
+                    dependencies: None,
+                },
+                ShareEntry::WithMetadata {
+                    path: r"docs\".to_string(),
+                    label: Some("trailing backslash".to_string()),
+                    kind: Some(SharedItemKind::Dir),
+                    dependencies: None,
+                },
+            ],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].path.as_deref(), Some("docs"));
+        assert_eq!(items[0].label.as_deref(), Some("docs"));
+    }
+
+    #[test]
     fn sync_rejects_parent_component_even_when_final_path_is_inside_root() {
         let db = test_db();
         let (dir, pid) = temp_project(&db, "proj");
@@ -4666,7 +4733,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn sync_rejects_backslash_ambiguous_share_path() {
+    fn sync_rejects_backslash_parent_escape_share_path() {
         let db = test_db();
         let (dir, pid) = temp_project(&db, "proj");
         std::fs::write(dir.path().join(r"..\outside.md"), "decoy").unwrap();
@@ -4680,7 +4747,7 @@ mod tests {
         };
 
         let err = db.sync_from_config(pid, &config).unwrap_err();
-        assert!(err.to_string().contains("backslashes"));
+        assert!(err.to_string().contains("outside project directory"));
         assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
     }
 
