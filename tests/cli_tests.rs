@@ -3173,6 +3173,80 @@ fn test_sync_with_json() {
     assert!(stdout.contains("sync-lbl"));
 }
 
+#[test]
+fn test_init_reports_config_share_metadata_updates() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "old-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(success, "init should succeed\nstderr:\n{stderr}");
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "new-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        success,
+        "init rerun should report share metadata update\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("shares +0 -0 ~1"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("Config already in sync with database."),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_sync_reports_config_share_metadata_updates() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "old-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(success, "init should succeed\nstderr:\n{stderr}");
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "new-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["sync"]);
+    assert!(
+        success,
+        "sync should report share metadata update\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("shares +0 -0 ~1"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("Config is in sync with database."),
+        "stdout:\n{stdout}"
+    );
+}
+
 // --- Auto-share on init ---
 
 #[test]

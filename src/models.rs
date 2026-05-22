@@ -393,6 +393,7 @@ pub struct SyncReport {
     pub groups_removed: usize,
     pub shares_added: usize,
     pub shares_removed: usize,
+    pub shares_updated: usize,
     pub dependencies_added: usize,
     pub dependencies_removed: usize,
     pub dependencies_updated: usize,
