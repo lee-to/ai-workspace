@@ -781,6 +781,34 @@ fn project_id_by_slug(db_path: &PathBuf, slug: &str) -> i64 {
     .unwrap()
 }
 
+fn add_project_to_group_by_name(db_path: &PathBuf, project_slug: &str, group_name: &str) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO groups (name) VALUES (?1)",
+        params![group_name],
+    )
+    .unwrap();
+    let project_id: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE slug = ?1",
+            params![project_slug],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let group_id: i64 = conn
+        .query_row(
+            "SELECT id FROM groups WHERE name = ?1",
+            params![group_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO project_groups (project_id, group_id) VALUES (?1, ?2)",
+        params![project_id, group_id],
+    )
+    .unwrap();
+}
+
 fn event_id_by_source_slug(db_path: &PathBuf, slug: &str) -> i64 {
     let conn = Connection::open(db_path).unwrap();
     conn.query_row(
@@ -1571,6 +1599,64 @@ fn test_mcp_scope_project_is_strict_and_cli_overrides_env_group() {
     let graph: serde_json::Value = serde_json::from_str(tool_text(&responses[3])).unwrap();
     assert!(graph["links"].as_array().unwrap().is_empty());
     assert_tool_error_contains(&responses[4], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_scope_fulltext_applies_project_scope_before_limit() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "api_fulltext_marker OR worker_fulltext_marker OR web_fulltext_marker",
+                    "limit": 1
+                }
+            }
+        })],
+        &[],
+        &["--project", "web"],
+        None,
+    );
+
+    let fulltext_text = tool_text(&responses[0]);
+    assert!(fulltext_text.contains("web_fulltext_marker"));
+    assert!(!fulltext_text.contains("api_fulltext_marker"));
+    assert!(!fulltext_text.contains("worker_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_scope_group_filters_project_service_graph_scope_groups() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    add_project_to_group_by_name(&db_path, "api", "frontend");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_service_graph",
+                "arguments": { "project": "api" }
+            }
+        })],
+        &[],
+        &["--group", "backend"],
+        None,
+    );
+
+    let graph: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let groups = graph["scope"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "backend");
 }
 
 #[test]

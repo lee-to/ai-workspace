@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
 use crate::db::Db;
-use crate::models::{Group, Project, SharedItem, SharedItemKind};
+use crate::models::{FileSearchHit, Group, Project, SharedItem, SharedItemKind};
 use crate::walk;
 
 const PROJECT_WIDE_TOOLS_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS";
@@ -206,6 +206,18 @@ impl McpScope {
 
     fn allows_service_link(&self, link: &crate::models::ServiceLink) -> bool {
         self.allows_project(link.from_project_id) && self.allows_project(link.to_project_id)
+    }
+
+    fn allowed_project_ids(&self) -> Option<Vec<i64>> {
+        match self {
+            Self::Global => None,
+            Self::Group { project_ids, .. } => {
+                let mut project_ids: Vec<_> = project_ids.iter().copied().collect();
+                project_ids.sort_unstable();
+                Some(project_ids)
+            }
+            Self::Project { project_id, .. } => Some(vec![*project_id]),
+        }
     }
 }
 
@@ -1359,13 +1371,15 @@ fn workspace_search_fulltext_scoped(
         return tool_error(id, "Fulltext search refresh failed");
     }
 
-    match db.search_files(query, limit) {
+    match search_files_for_scope(db, query, limit, scope) {
         Ok(mut hits) => {
             match crate::indexer::refresh_search_hits(db, &hits) {
-                Ok(refreshed) if refreshed > 0 => match db.search_files(query, limit) {
-                    Ok(updated_hits) => hits = updated_hits,
-                    Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
-                },
+                Ok(refreshed) if refreshed > 0 => {
+                    match search_files_for_scope(db, query, limit, scope) {
+                        Ok(updated_hits) => hits = updated_hits,
+                        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     log::warn!("refresh_search_hits failed: {}", e);
@@ -1396,6 +1410,18 @@ fn workspace_search_fulltext_scoped(
             tool_result(id, text)
         }
         Err(e) => tool_error(id, &format!("Fulltext search error: {}", e)),
+    }
+}
+
+fn search_files_for_scope(
+    db: &Db,
+    query: &str,
+    limit: usize,
+    scope: &McpScope,
+) -> anyhow::Result<Vec<FileSearchHit>> {
+    match scope.allowed_project_ids() {
+        Some(project_ids) => db.search_files_for_projects(query, limit, &project_ids),
+        None => db.search_files(query, limit),
     }
 }
 
@@ -1779,7 +1805,7 @@ fn workspace_service_graph_scoped(
                     );
                     return tool_error(id, ACCESS_DENIED_SCOPE);
                 }
-                match service_graph_for_project(db, &project) {
+                match service_graph_for_project(db, &project, scope_filter) {
                     Ok(graph) => graph,
                     Err(e) => {
                         return tool_error(id, &format!("Failed to list service graph: {}", e));
@@ -1805,7 +1831,7 @@ fn workspace_service_graph_scoped(
                     );
                     return tool_error(id, ACCESS_DENIED_SCOPE);
                 }
-                match service_graph_for_project(db, &project) {
+                match service_graph_for_project(db, &project, scope_filter) {
                     Ok(graph) => graph,
                     Err(e) => {
                         return tool_error(id, &format!("Failed to list service graph: {}", e));
@@ -1845,6 +1871,7 @@ fn workspace_service_graph_scoped(
 fn service_graph_for_project(
     db: &Db,
     project: &crate::models::Project,
+    scope_filter: &McpScope,
 ) -> anyhow::Result<(serde_json::Value, Vec<crate::models::ServiceLink>)> {
     debug!(
         "workspace_service_graph: listing graph for project id={} slug='{}'",
@@ -1874,10 +1901,12 @@ fn service_graph_for_project(
     let mut links: Vec<crate::models::ServiceLink> = Vec::new();
     let mut scope_groups = Vec::new();
     for group in groups {
-        scope_groups.push(serde_json::json!({
-            "id": group.id,
-            "name": group.name
-        }));
+        if scope_filter.allows_group(group.id) {
+            scope_groups.push(serde_json::json!({
+                "id": group.id,
+                "name": group.name
+            }));
+        }
         for link in db.list_group_service_links(group.id)? {
             if !links.iter().any(|existing| existing.id == link.id) {
                 links.push(link);
