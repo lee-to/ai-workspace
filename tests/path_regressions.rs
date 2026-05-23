@@ -91,6 +91,45 @@ fn share_paths(config: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+fn assert_empty_table_if_exists(conn: &Connection, table: &str) {
+    let exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if exists == 0 {
+        return;
+    }
+
+    let count: i64 = conn
+        .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(count, 0, "{table} should not contain persisted rows");
+}
+
+fn assert_no_persisted_projects_or_shares(db_path: &Path) {
+    if !db_path.exists() {
+        return;
+    }
+
+    let conn = Connection::open(db_path).unwrap();
+    assert_empty_table_if_exists(&conn, "projects");
+    assert_empty_table_if_exists(&conn, "shared_items");
+}
+
+#[test]
+fn non_persistence_assertion_accepts_missing_or_uninitialized_database() {
+    let (_db_dir, db_path) = temp_db();
+
+    assert_no_persisted_projects_or_shares(&db_path);
+    drop(Connection::open(&db_path).unwrap());
+    assert_no_persisted_projects_or_shares(&db_path);
+}
+
 #[test]
 fn cli_config_backslash_import_export_and_sync_roundtrip_are_stable() {
     let (_db_dir, db_path) = temp_db();
@@ -188,15 +227,7 @@ fn config_import_rejects_symlink_escape_without_persisting_state() {
         "stderr should explain unsafe symlink\nstderr:\n{stderr}"
     );
 
-    let conn = Connection::open(&db_path).unwrap();
-    let project_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM projects", [], |row| row.get(0))
-        .unwrap();
-    let shared_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM shared_items", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(project_count, 0, "rejected init should not persist project");
-    assert_eq!(shared_count, 0, "rejected init should not persist shares");
+    assert_no_persisted_projects_or_shares(&db_path);
 }
 
 #[test]
