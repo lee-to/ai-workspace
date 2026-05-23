@@ -1063,6 +1063,25 @@ fn test_mcp_tools_list() {
             "{name} should expose include_sensitive"
         );
     }
+
+    let fulltext = tools
+        .iter()
+        .find(|tool| tool["name"] == "workspace_search_fulltext")
+        .expect("workspace_search_fulltext tool should be present");
+    let fulltext_schema = &fulltext["inputSchema"];
+    let fulltext_properties = &fulltext_schema["properties"];
+    assert!(
+        fulltext_properties["include_hidden"].is_null(),
+        "workspace_search_fulltext should not expose include_hidden"
+    );
+    assert!(
+        fulltext_properties["include_sensitive"].is_null(),
+        "workspace_search_fulltext should not expose include_sensitive"
+    );
+    assert_eq!(
+        fulltext_schema["additionalProperties"], false,
+        "workspace_search_fulltext should reject undocumented schema properties"
+    );
 }
 
 #[test]
@@ -1872,6 +1891,44 @@ fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_childre
         "only public directory markdown should match: {content}"
     );
     assert_eq!(results[0]["path"], "docs/public.md");
+    assert!(!content.contains("directory_sensitive_fulltext_marker"));
+    assert!(!content.contains("directory_hidden_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_ignores_hidden_sensitive_opt_in_arguments() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "hidden_sensitive_fulltext_marker OR directory_visible_fulltext_marker OR directory_sensitive_fulltext_marker OR directory_hidden_fulltext_marker",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "manual opt-in arguments must not reveal hidden/sensitive markdown: {content}"
+    );
+    assert_eq!(results[0]["path"], "docs/public.md");
+    assert!(!content.contains("hidden_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_hidden_fulltext_marker"));
 }
