@@ -5023,6 +5023,90 @@ mod tests {
     }
 
     #[test]
+    fn sync_preserves_artifact_dependencies_when_dependencies_omitted() {
+        let db = test_db();
+        let (api_dir, api) = temp_project(&db, "API");
+        std::fs::write(api_dir.path().join("README.md"), "# API").unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-omitted", Some("auth"))
+            .unwrap();
+        db.share_file(api, "README.md", Some("api docs")).unwrap();
+        db.add_artifact_dependency(
+            api,
+            "README.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("api docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.dependencies_added, 0);
+        assert_eq!(report.dependencies_removed, 0);
+        assert_eq!(report.dependencies_updated, 0);
+
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_project_slug_snapshot, "auth");
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+    }
+
+    #[test]
+    fn sync_removes_artifact_dependencies_when_dependencies_empty() {
+        let db = test_db();
+        let (api_dir, api) = temp_project(&db, "API");
+        std::fs::write(api_dir.path().join("README.md"), "# API").unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-empty", Some("auth"))
+            .unwrap();
+        db.share_file(api, "README.md", Some("api docs")).unwrap();
+        db.add_artifact_dependency(
+            api,
+            "README.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("api docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: Some(vec![]),
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.dependencies_added, 0);
+        assert_eq!(report.dependencies_removed, 1);
+        assert_eq!(report.dependencies_updated, 0);
+
+        assert!(
+            db.list_artifact_dependencies_for_project(api)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn sync_removes_extra_groups_and_shares() {
         let db = test_db();
         let pid = db.create_project("proj", "/tmp/proj").unwrap();

@@ -323,7 +323,7 @@ ai-workspace export
 ai-workspace --config .ai/ai-workspace.json export
 ```
 
-The exported file includes an `ai_workspace_config_version` marker, the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and `dependencies` so directories sync back as directories. Group notes and workspace event history are not exported.
+The exported file includes an `ai_workspace_config_version` marker, the project name, stable slug, groups, shared files/dirs, project-scoped notes, and artifact dependency metadata for shared files/directories. Shared entries are exported in object form with `path`, `kind`, optional `label`, and optional `dependencies` so directories sync back as directories. When a shared entry has no dependencies, export omits the `dependencies` field. Group notes and workspace event history are not exported.
 
 Older configs remain valid: string share entries such as `"README.md"` and object entries such as `{ "path": "README.md", "label": "Readme" }` still load. To sync artifact dependencies declaratively, add a `dependencies` array to the share object:
 
@@ -338,6 +338,16 @@ Older configs remain valid: string share entries such as `"README.md"` and objec
       "reaction": "update"
     }
   ]
+}
+```
+
+Dependency sync is partial when the field is missing. If a share object omits `dependencies`, `init` and `sync` leave existing database dependencies for that share unchanged. If a share object includes `"dependencies": []`, `init` and `sync` remove all existing dependencies for that share:
+
+```json
+{
+  "path": "docs/auth.md",
+  "kind": "file",
+  "dependencies": []
 }
 ```
 

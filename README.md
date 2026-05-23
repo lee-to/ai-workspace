@@ -183,7 +183,17 @@ ai-workspace init
 # → picks up name, slug, groups, shares, notes, and dependencies from the configured workspace JSON
 ```
 
-The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present. Shared paths from config must exist and resolve inside the project directory. They are literal file or directory paths, not glob patterns; use `"docs"` rather than `"docs/**"` to share a directory. The workspace JSON exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
+The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present. Shared paths from config must exist and resolve inside the project directory. They are literal file or directory paths, not glob patterns; use `"docs"` rather than `"docs/**"` to share a directory. Artifact dependency sync is partial: if a share object omits `dependencies`, existing dependency rows for that share are left unchanged. To manage dependencies declaratively, include `dependencies`; an explicit empty array removes all dependencies for that share:
+
+```json
+{
+  "path": "docs/auth.md",
+  "kind": "file",
+  "dependencies": []
+}
+```
+
+The workspace JSON exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
 
 If your repo keeps AI-related files under a dedicated directory, pass a custom config path. The path must be relative and remain inside the project root; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Existing files at that path are only updated when they are already recognizable ai-workspace configs, so ordinary files such as `README.md` or `package.json` are not overwritten by a mistaken config path:
 
