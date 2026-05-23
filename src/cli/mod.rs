@@ -1030,6 +1030,17 @@ fn print_event_details(db: &Db, event_id: i64) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Event id={} not found", event_id))?;
     println!("Event: {} (id={})", event.title, event.id);
     println!("Source: {}", event.source_project_slug);
+    let group_ids = db.list_event_group_ids(event_id)?;
+    if !group_ids.is_empty() {
+        let groups = group_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Groups: {}", groups);
+    } else if let Some(group_id) = event.group_id {
+        println!("Group: {}", group_id);
+    }
     println!("Kind: {}", event.kind);
     println!("Severity: {}", event.severity);
     println!("Status: {}", event.status);

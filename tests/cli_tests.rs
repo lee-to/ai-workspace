@@ -239,7 +239,15 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
+    let event_group_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event_groups'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_group_table_count, 1);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();

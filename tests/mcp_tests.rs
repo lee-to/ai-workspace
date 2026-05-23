@@ -102,6 +102,23 @@ fn temp_db() -> (tempfile::TempDir, PathBuf) {
     (dir, db_path)
 }
 
+fn run_cli_in_dir(db_path: &PathBuf, dir: &Path, args: &[&str]) -> std::process::Output {
+    let output = Command::new(binary_path())
+        .args(args)
+        .current_dir(dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("CLI command failed to start");
+    assert!(
+        output.status.success(),
+        "CLI command failed: {:?}\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
+}
+
 #[cfg(unix)]
 fn symlink_file(src: &Path, dst: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(src, dst)
@@ -313,7 +330,15 @@ fn test_mcp_migrates_legacy_database_and_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
+    let event_group_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event_groups'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_group_table_count, 1);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
@@ -776,6 +801,16 @@ fn project_id_by_slug(db_path: &PathBuf, slug: &str) -> i64 {
     conn.query_row(
         "SELECT id FROM projects WHERE slug = ?1",
         params![slug],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn group_id_by_name(db_path: &PathBuf, name: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT id FROM groups WHERE name = ?1",
+        params![name],
         |row| row.get(0),
     )
     .unwrap()
@@ -1460,6 +1495,93 @@ fn test_mcp_scope_group_filters_context_search_graph_events_and_direct_tools() {
     assert_tool_error_contains(&responses[7], "outside MCP scope");
     assert_tool_error_contains(&responses[8], "outside MCP scope");
     assert_tool_error_contains(&responses[9], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_group_scope_sees_destroy_event_for_each_source_group() {
+    let (_db_dir, db_path) = temp_db();
+    let source_dir = tempfile::tempdir().unwrap();
+    let observer_dir = tempfile::tempdir().unwrap();
+
+    run_cli_in_dir(
+        &db_path,
+        source_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Shared Auth",
+            "--slug",
+            "shared-auth",
+            "--group",
+            "alpha",
+        ],
+    );
+    run_cli_in_dir(&db_path, source_dir.path(), &["init", "--group", "beta"]);
+    run_cli_in_dir(
+        &db_path,
+        observer_dir.path(),
+        &[
+            "init", "--name", "Observer", "--slug", "observer", "--group", "gamma",
+        ],
+    );
+    run_cli_in_dir(&db_path, observer_dir.path(), &["destroy", "shared-auth"]);
+
+    let alpha = group_id_by_name(&db_path, "alpha");
+    let beta = group_id_by_name(&db_path, "beta");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "workspace_events", "arguments": {} }
+    });
+
+    let alpha_response = mcp_request_with_options(
+        &db_path,
+        &[request.clone()],
+        &[],
+        &["--group", "alpha"],
+        None,
+    );
+    let alpha_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&alpha_response[0])).unwrap();
+    let alpha_event = alpha_events
+        .iter()
+        .find(|event| event["source_project_slug"] == "shared-auth")
+        .expect("alpha scope should see shared-auth delete event");
+    let alpha_group_ids: Vec<i64> = alpha_event["group_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group_id| group_id.as_i64().unwrap())
+        .collect();
+    assert_eq!(alpha_group_ids, vec![alpha, beta]);
+
+    let beta_response = mcp_request_with_options(
+        &db_path,
+        &[request.clone()],
+        &[],
+        &["--group", "beta"],
+        None,
+    );
+    let beta_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&beta_response[0])).unwrap();
+    assert!(
+        beta_events
+            .iter()
+            .any(|event| event["source_project_slug"] == "shared-auth"),
+        "beta scope should see shared-auth delete event"
+    );
+
+    let gamma_response =
+        mcp_request_with_options(&db_path, &[request], &[], &["--group", "gamma"], None);
+    let gamma_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&gamma_response[0])).unwrap();
+    assert!(
+        gamma_events
+            .iter()
+            .all(|event| event["source_project_slug"] != "shared-auth"),
+        "unrelated gamma scope should not see shared-auth delete event"
+    );
 }
 
 #[test]
