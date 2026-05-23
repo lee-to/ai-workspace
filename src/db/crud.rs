@@ -2233,13 +2233,24 @@ impl Db {
         for entry in &config.share {
             let config_path = validate_config_share_path(entry.path())?;
             let validated = validate_project_rel_path(project_root, &config_path)?;
-            let kind = entry.kind().unwrap_or_else(|| {
-                if validated.canonical_path.is_dir() {
-                    SharedItemKind::Dir
-                } else {
-                    SharedItemKind::File
+            let actual_kind = if validated.canonical_path.is_dir() {
+                SharedItemKind::Dir
+            } else {
+                SharedItemKind::File
+            };
+            let kind = if let Some(config_kind) = entry.kind() {
+                if config_kind != actual_kind {
+                    anyhow::bail!(
+                        "share '{}' declares kind '{}' but filesystem object is '{}'",
+                        entry.path(),
+                        config_kind,
+                        actual_kind
+                    );
                 }
-            });
+                config_kind
+            } else {
+                actual_kind
+            };
             if seen_share_paths.insert(validated.rel_path.clone()) {
                 validated_shares.push(ValidatedConfigShare {
                     entry,
@@ -4657,6 +4668,66 @@ mod tests {
         let items = db.get_shared_items_for_project(pid).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, SharedItemKind::Dir);
+    }
+
+    #[test]
+    fn sync_rejects_configured_share_kind_mismatches() {
+        let cases = [
+            ("README.md", SharedItemKind::Dir, "file"),
+            ("docs", SharedItemKind::File, "dir"),
+            ("README.md", SharedItemKind::Note, "file"),
+        ];
+
+        for (path, declared_kind, actual_kind) in cases {
+            let db = test_db();
+            let (dir, pid) = temp_project(&db, "proj");
+            std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+            std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+            let config = WorkspaceConfig {
+                name: "proj".to_string(),
+                slug: None,
+                groups: vec![],
+                share: vec![ShareEntry::WithMetadata {
+                    path: path.to_string(),
+                    label: None,
+                    kind: Some(declared_kind),
+                    dependencies: None,
+                }],
+                notes: vec![],
+            };
+
+            let err = db.sync_from_config(pid, &config).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "share '{path}' declares kind '{declared_kind}' but filesystem object is '{actual_kind}'"
+                )
+            );
+            assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn sync_infers_missing_kind_for_directory_share() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs".to_string())],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+        assert_eq!(items[0].path.as_deref(), Some("docs"));
     }
 
     #[test]
