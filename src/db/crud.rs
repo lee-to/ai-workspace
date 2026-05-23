@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
-use rusqlite::{Connection, Row, params, types::Type};
+use rusqlite::{Connection, Row, ToSql, params, types::Type};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -2864,12 +2864,37 @@ impl Db {
 
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
-        debug!("search_files: query='{}' limit={}", query, limit);
+        self.search_files_scoped(query, limit, None)
+    }
+
+    /// Full-text search limited to the given project IDs before ranking/limit.
+    pub fn search_files_for_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_ids: &[i64],
+    ) -> Result<Vec<FileSearchHit>> {
+        self.search_files_scoped(query, limit, Some(project_ids))
+    }
+
+    fn search_files_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        project_ids: Option<&[i64]>,
+    ) -> Result<Vec<FileSearchHit>> {
+        debug!(
+            "search_files: query='{}' limit={} project_ids={:?}",
+            query, limit, project_ids
+        );
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if project_ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         let fetch_limit = limit.saturating_mul(4).max(limit.saturating_add(16));
-        let mut stmt = self.conn.prepare(
+        let mut sql = String::from(
             "SELECT i.id, \
                     i.shared_item_id, \
                     s.project_id, \
@@ -2884,11 +2909,38 @@ impl Db {
              JOIN indexed_files i ON i.id = f.rowid \
              JOIN shared_items s ON s.id = i.shared_item_id \
              JOIN projects p ON p.id = s.project_id \
-             WHERE files_fts MATCH ?1 \
-             ORDER BY bm25(files_fts) \
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, fetch_limit as i64], |r| {
+             WHERE files_fts MATCH ?1",
+        );
+
+        let mut param_index = 2;
+        if let Some(project_ids) = project_ids {
+            let placeholders: Vec<_> = project_ids
+                .iter()
+                .map(|_| {
+                    let placeholder = format!("?{param_index}");
+                    param_index += 1;
+                    placeholder
+                })
+                .collect();
+            sql.push_str(" AND s.project_id IN (");
+            sql.push_str(&placeholders.join(", "));
+            sql.push(')');
+        }
+        let limit_param = param_index;
+        sql.push_str(&format!(" ORDER BY bm25(files_fts) LIMIT ?{limit_param}"));
+
+        let fetch_limit_i64 = fetch_limit as i64;
+        let mut bind_params: Vec<&dyn ToSql> = Vec::new();
+        bind_params.push(&query);
+        if let Some(project_ids) = project_ids {
+            for project_id in project_ids {
+                bind_params.push(project_id);
+            }
+        }
+        bind_params.push(&fetch_limit_i64);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_params), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 FileSearchHit {

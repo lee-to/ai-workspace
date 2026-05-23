@@ -1,14 +1,346 @@
 use log::{debug, error, info, warn};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
 use crate::db::Db;
-use crate::models::SharedItemKind;
+use crate::models::{FileSearchHit, Group, Project, SharedItem, SharedItemKind};
 use crate::walk;
 
 const PROJECT_WIDE_TOOLS_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS";
+const MCP_SCOPE_ENV: &str = "AI_WORKSPACE_SCOPE";
+const MCP_SCOPE_GROUP_ENV: &str = "AI_WORKSPACE_SCOPE_GROUP";
+const MCP_SCOPE_PROJECT_ENV: &str = "AI_WORKSPACE_SCOPE_PROJECT";
 const ACCESS_DENIED_NOT_SHARED: &str = "Access denied: path is not shared";
 const ACCESS_DENIED_INVALID_PATH: &str = "Access denied: invalid path";
+const ACCESS_DENIED_SCOPE: &str = "Access denied: outside MCP scope";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpScopeKind {
+    Global,
+    CurrentProject,
+    Group,
+    Project,
+}
+
+impl McpScopeKind {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "global" => Ok(Self::Global),
+            "current-project" => Ok(Self::CurrentProject),
+            "group" => Ok(Self::Group),
+            "project" => Ok(Self::Project),
+            _ => Err(format!(
+                "Invalid MCP scope '{value}'. Expected one of: global, current-project, group, project"
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::CurrentProject => "current-project",
+            Self::Group => "group",
+            Self::Project => "project",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct McpScopeRequest {
+    kind: McpScopeKind,
+    group: Option<String>,
+    project: Option<String>,
+}
+
+impl McpScopeRequest {
+    pub fn from_cli_and_env(
+        cli_scope: Option<McpScopeKind>,
+        cli_group: Option<String>,
+        cli_project: Option<String>,
+    ) -> Result<Self, String> {
+        if cli_group.is_some() && cli_project.is_some() {
+            return Err("MCP scope cannot combine --group and --project".to_string());
+        }
+        if matches!(
+            cli_scope,
+            Some(McpScopeKind::Global | McpScopeKind::CurrentProject)
+        ) && (cli_group.is_some() || cli_project.is_some())
+        {
+            return Err(format!(
+                "MCP scope '{}' cannot be combined with --group or --project",
+                cli_scope.unwrap().as_str()
+            ));
+        }
+        if matches!(cli_scope, Some(McpScopeKind::Group)) && cli_project.is_some() {
+            return Err("MCP scope 'group' cannot be combined with --project".to_string());
+        }
+        if matches!(cli_scope, Some(McpScopeKind::Project)) && cli_group.is_some() {
+            return Err("MCP scope 'project' cannot be combined with --group".to_string());
+        }
+
+        let cli_group_set = cli_group.is_some();
+        let cli_project_set = cli_project.is_some();
+
+        let env_scope = match std::env::var(MCP_SCOPE_ENV) {
+            Ok(value) if value.trim().is_empty() => {
+                return Err(format!("{MCP_SCOPE_ENV} must not be empty"));
+            }
+            Ok(value) => Some(McpScopeKind::parse(&value)?),
+            Err(_) => None,
+        };
+        let env_group = env_var_non_empty(MCP_SCOPE_GROUP_ENV)?;
+        let env_project = env_var_non_empty(MCP_SCOPE_PROJECT_ENV)?;
+
+        let explicit_cli_scope = cli_scope.is_some();
+        let kind = if cli_group.is_some() {
+            McpScopeKind::Group
+        } else if cli_project.is_some() {
+            McpScopeKind::Project
+        } else if let Some(scope) = cli_scope {
+            scope
+        } else if env_group.is_some() && env_project.is_some() {
+            return Err(format!(
+                "{MCP_SCOPE_GROUP_ENV} and {MCP_SCOPE_PROJECT_ENV} cannot both be set"
+            ));
+        } else if let Some(scope) = env_scope {
+            scope
+        } else if env_group.is_some() {
+            McpScopeKind::Group
+        } else if env_project.is_some() {
+            McpScopeKind::Project
+        } else {
+            McpScopeKind::Global
+        };
+
+        let group = match (cli_group, explicit_cli_scope, kind) {
+            (Some(group), _, _) => Some(group),
+            (None, _, _) if cli_project_set => None,
+            (None, true, McpScopeKind::Group) => env_group,
+            (None, true, _) => None,
+            (None, false, _) => env_group,
+        };
+        let project = match (cli_project, explicit_cli_scope, kind) {
+            (Some(project), _, _) => Some(project),
+            (None, _, _) if cli_group_set => None,
+            (None, true, McpScopeKind::Project) => env_project,
+            (None, true, _) => None,
+            (None, false, _) => env_project,
+        };
+
+        validate_scope_request(kind, group.as_deref(), project.as_deref())?;
+
+        Ok(Self {
+            kind,
+            group,
+            project,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum McpScope {
+    Global,
+    Group {
+        group_id: i64,
+        project_ids: HashSet<i64>,
+    },
+    Project {
+        project_id: i64,
+        group_ids: HashSet<i64>,
+    },
+}
+
+impl McpScope {
+    #[cfg(test)]
+    pub fn global() -> Self {
+        Self::Global
+    }
+
+    fn allows_project(&self, project_id: i64) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Group { project_ids, .. } => project_ids.contains(&project_id),
+            Self::Project { project_id: id, .. } => *id == project_id,
+        }
+    }
+
+    fn allows_optional_project(&self, project_id: Option<i64>) -> bool {
+        match self {
+            Self::Global => true,
+            _ => project_id.is_some_and(|project_id| self.allows_project(project_id)),
+        }
+    }
+
+    fn allows_group(&self, group_id: i64) -> bool {
+        match self {
+            Self::Global => true,
+            Self::Group { group_id: id, .. } => *id == group_id,
+            Self::Project { group_ids, .. } => group_ids.contains(&group_id),
+        }
+    }
+
+    fn allows_item(&self, item: &SharedItem) -> bool {
+        if let Some(project_id) = item.project_id {
+            return self.allows_project(project_id);
+        }
+        if let Some(group_id) = item.group_id {
+            return self.allows_group(group_id);
+        }
+        false
+    }
+
+    fn filter_projects(&self, projects: Vec<Project>) -> Vec<Project> {
+        projects
+            .into_iter()
+            .filter(|project| self.allows_project(project.id))
+            .collect()
+    }
+
+    fn filter_groups(&self, groups: Vec<Group>) -> Vec<Group> {
+        groups
+            .into_iter()
+            .filter(|group| self.allows_group(group.id))
+            .collect()
+    }
+
+    fn allows_service_link(&self, link: &crate::models::ServiceLink) -> bool {
+        self.allows_project(link.from_project_id) && self.allows_project(link.to_project_id)
+    }
+
+    fn allowed_project_ids(&self) -> Option<Vec<i64>> {
+        match self {
+            Self::Global => None,
+            Self::Group { project_ids, .. } => {
+                let mut project_ids: Vec<_> = project_ids.iter().copied().collect();
+                project_ids.sort_unstable();
+                Some(project_ids)
+            }
+            Self::Project { project_id, .. } => Some(vec![*project_id]),
+        }
+    }
+}
+
+fn env_var_non_empty(name: &str) -> Result<Option<String>, String> {
+    match std::env::var(name) {
+        Ok(value) if value.trim().is_empty() => Err(format!("{name} must not be empty")),
+        Ok(value) => Ok(Some(value)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn validate_scope_request(
+    kind: McpScopeKind,
+    group: Option<&str>,
+    project: Option<&str>,
+) -> Result<(), String> {
+    match kind {
+        McpScopeKind::Global => {
+            if group.is_some() || project.is_some() {
+                return Err(
+                    "MCP scope 'global' cannot be combined with group or project selectors"
+                        .to_string(),
+                );
+            }
+        }
+        McpScopeKind::CurrentProject => {
+            if group.is_some() || project.is_some() {
+                return Err(
+                    "MCP scope 'current-project' cannot be combined with group or project selectors"
+                        .to_string(),
+                );
+            }
+        }
+        McpScopeKind::Group => {
+            if project.is_some() {
+                return Err(
+                    "MCP scope 'group' cannot be combined with a project selector".to_string(),
+                );
+            }
+            if group.is_none() {
+                return Err(
+                    "MCP scope 'group' requires --group or AI_WORKSPACE_SCOPE_GROUP".to_string(),
+                );
+            }
+        }
+        McpScopeKind::Project => {
+            if group.is_some() {
+                return Err(
+                    "MCP scope 'project' cannot be combined with a group selector".to_string(),
+                );
+            }
+            if project.is_none() {
+                return Err(
+                    "MCP scope 'project' requires --project or AI_WORKSPACE_SCOPE_PROJECT"
+                        .to_string(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_scope(db: &Db, request: McpScopeRequest) -> Result<McpScope, String> {
+    match request.kind {
+        McpScopeKind::Global => Ok(McpScope::Global),
+        McpScopeKind::CurrentProject => {
+            let cwd = std::env::current_dir()
+                .map_err(|e| format!("Failed to resolve current directory: {e}"))?;
+            let cwd = cwd
+                .canonicalize()
+                .unwrap_or_else(|_| cwd.clone())
+                .to_string_lossy()
+                .to_string();
+            let project = db
+                .find_project_by_cwd(&cwd)
+                .map_err(|e| format!("Failed to resolve current project: {e}"))?
+                .ok_or_else(|| {
+                    "No project found for current directory while resolving MCP scope".to_string()
+                })?;
+            project_scope(db, project.id)
+        }
+        McpScopeKind::Group => {
+            let group_name = request
+                .group
+                .as_deref()
+                .ok_or_else(|| "MCP scope 'group' requires a group selector".to_string())?;
+            let group = db
+                .get_group_by_name(group_name)
+                .map_err(|e| format!("Failed to resolve MCP scope group '{group_name}': {e}"))?
+                .ok_or_else(|| format!("MCP scope group '{group_name}' not found"))?;
+            let projects = db
+                .get_projects_for_group(group.id)
+                .map_err(|e| format!("Failed to list projects for MCP scope group: {e}"))?;
+            Ok(McpScope::Group {
+                group_id: group.id,
+                project_ids: projects.into_iter().map(|project| project.id).collect(),
+            })
+        }
+        McpScopeKind::Project => {
+            let project_target = request
+                .project
+                .as_deref()
+                .ok_or_else(|| "MCP scope 'project' requires a project selector".to_string())?;
+            let project = db
+                .resolve_project_target(project_target)
+                .map_err(|e| {
+                    format!("Failed to resolve MCP scope project '{project_target}': {e}")
+                })?
+                .ok_or_else(|| format!("MCP scope project '{project_target}' not found"))?;
+            project_scope(db, project.id)
+        }
+    }
+}
+
+fn project_scope(db: &Db, project_id: i64) -> Result<McpScope, String> {
+    let groups = db
+        .get_groups_for_project(project_id)
+        .map_err(|e| format!("Failed to list groups for MCP scope project: {e}"))?;
+    Ok(McpScope::Project {
+        project_id,
+        group_ids: groups.into_iter().map(|group| group.id).collect(),
+    })
+}
 
 #[derive(Debug, Clone)]
 struct SharedPathScope {
@@ -231,7 +563,16 @@ fn shared_tree_needs_hidden_traversal(
         .any(|scope| scope_allows_shared_ai_factory(scope, options))
 }
 
+#[cfg(test)]
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
+    handle_tool_call_scoped(id, params, &McpScope::global())
+}
+
+pub fn handle_tool_call_scoped(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = params
         .get("arguments")
@@ -247,7 +588,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_context(id, &db)
+            workspace_context_scoped(id, &db, scope)
         }
         "workspace_read" => {
             let options = walk_options_from_args(&arguments);
@@ -293,9 +634,9 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
             };
 
             if let Some(iid) = item_id {
-                workspace_read(id, iid, &db, options)
+                workspace_read_scoped(id, iid, &db, options, scope)
             } else if let (Some(pid), Some(p)) = (project_id, path) {
-                workspace_read_by_path(id, pid, &p, &db, options)
+                workspace_read_by_path_scoped(id, pid, &p, &db, options, scope)
             } else {
                 unreachable!("workspace_read parameters are validated before DB access")
             }
@@ -314,21 +655,21 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_search(id, &query, &db)
+            workspace_search_scoped(id, &query, &db, scope)
         }
         "list_groups" => {
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            list_groups(id, &db)
+            list_groups_scoped(id, &db, scope)
         }
         "list_projects" => {
             let db = match open_db() {
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            list_projects(id, &db)
+            list_projects_scoped(id, &db, scope)
         }
         "project_tree" => {
             let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
@@ -353,7 +694,15 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            project_tree(id, project_id, path.as_deref(), max_depth, &db, options)
+            project_tree_scoped(
+                id,
+                project_id,
+                path.as_deref(),
+                max_depth,
+                &db,
+                options,
+                scope,
+            )
         }
         "project_grep" => {
             let project_id = match arguments.get("project_id").and_then(|v| v.as_i64()) {
@@ -383,7 +732,15 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            project_grep(id, project_id, &pattern, glob.as_deref(), &db, options)
+            project_grep_scoped(
+                id,
+                project_id,
+                &pattern,
+                glob.as_deref(),
+                &db,
+                options,
+                scope,
+            )
         }
         "workspace_search_fulltext" => {
             let query = match arguments.get("query").and_then(|v| v.as_str()) {
@@ -404,7 +761,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_search_fulltext(id, &query, limit, &db)
+            workspace_search_fulltext_scoped(id, &query, limit, &db, scope)
         }
         "workspace_service_graph" => {
             let project = arguments
@@ -417,7 +774,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_service_graph(id, project.as_deref(), project_id, group_id, &db)
+            workspace_service_graph_scoped(id, project.as_deref(), project_id, group_id, &db, scope)
         }
         "workspace_events" => {
             let project = arguments
@@ -447,13 +804,14 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_events(
+            workspace_events_scoped(
                 id,
                 project.as_deref(),
                 project_id,
                 source.as_deref(),
                 status,
                 &db,
+                scope,
             )
         }
         "workspace_event_details" => {
@@ -470,7 +828,7 @@ pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> Jso
                 Ok(db) => db,
                 Err(e) => return tool_error(id, &e),
             };
-            workspace_event_details(id, event_id, &db)
+            workspace_event_details_scoped(id, event_id, &db, scope)
         }
         _ => {
             error!("Unknown tool: {}", tool_name);
@@ -528,17 +886,23 @@ fn walk_options_from_args(arguments: &serde_json::Value) -> walk::WalkOptions {
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
+    workspace_context_scoped(id, db, &McpScope::global())
+}
+
+fn workspace_context_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) -> JsonRpcResponse {
     info!("workspace_context: gathering metadata");
     let include_project_paths = project_wide_tools_enabled();
 
     let projects = match db.list_projects() {
-        Ok(p) => p,
+        Ok(projects) => scope.filter_projects(projects),
         Err(e) => return tool_error(id, &format!("Failed to list projects: {}", e)),
     };
 
     let groups = match db.list_groups() {
-        Ok(g) => g,
+        Ok(groups) => scope.filter_groups(groups),
         Err(e) => return tool_error(id, &format!("Failed to list groups: {}", e)),
     };
 
@@ -550,7 +914,7 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     let projects_arr = context["projects"].as_array_mut().unwrap();
     for p in &projects {
         let project_groups = match db.get_groups_for_project(p.id) {
-            Ok(groups) => groups,
+            Ok(groups) => scope.filter_groups(groups),
             Err(e) => {
                 return tool_error(
                     id,
@@ -559,7 +923,10 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
             }
         };
         let items = match db.get_shared_items_for_project(p.id) {
-            Ok(items) => items,
+            Ok(items) => items
+                .into_iter()
+                .filter(|item| scope.allows_item(item))
+                .collect::<Vec<_>>(),
             Err(e) => {
                 return tool_error(
                     id,
@@ -611,7 +978,7 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
     let groups_arr = context["groups"].as_array_mut().unwrap();
     for g in &groups {
         let group_projects = match db.get_projects_for_group(g.id) {
-            Ok(projects) => projects,
+            Ok(projects) => scope.filter_projects(projects),
             Err(e) => {
                 return tool_error(
                     id,
@@ -620,7 +987,10 @@ fn workspace_context(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
             }
         };
         let notes = match db.get_all_items_for_group(g.id) {
-            Ok(notes) => notes,
+            Ok(notes) => notes
+                .into_iter()
+                .filter(|item| scope.allows_item(item))
+                .collect::<Vec<_>>(),
             Err(e) => {
                 return tool_error(
                     id,
@@ -745,11 +1115,23 @@ fn read_visible_path(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_read(
     id: serde_json::Value,
     item_id: i64,
     db: &Db,
     options: walk::WalkOptions,
+) -> JsonRpcResponse {
+    workspace_read_scoped(id, item_id, db, options, &McpScope::global())
+}
+
+fn workspace_read_scoped(
+    id: serde_json::Value,
+    item_id: i64,
+    db: &Db,
+    options: walk::WalkOptions,
+    scope: &McpScope,
 ) -> JsonRpcResponse {
     info!("workspace_read: item_id={}", item_id);
 
@@ -758,6 +1140,11 @@ fn workspace_read(
         Ok(None) => return tool_error(id, &format!("Item {} not found", item_id)),
         Err(e) => return tool_error(id, &format!("Query error: {}", e)),
     };
+
+    if !scope.allows_item(&item) {
+        warn!("workspace_read denied out-of-scope item_id={}", item_id);
+        return tool_error(id, ACCESS_DENIED_SCOPE);
+    }
 
     if item.kind == crate::models::SharedItemKind::Note {
         return tool_result(id, item.content.unwrap_or_default());
@@ -812,6 +1199,8 @@ fn workspace_read(
     read_visible_path(id, &canonical_root, &canonical, options, true)
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_read_by_path(
     id: serde_json::Value,
     project_id: i64,
@@ -819,10 +1208,29 @@ fn workspace_read_by_path(
     db: &Db,
     options: walk::WalkOptions,
 ) -> JsonRpcResponse {
+    workspace_read_by_path_scoped(id, project_id, path, db, options, &McpScope::global())
+}
+
+fn workspace_read_by_path_scoped(
+    id: serde_json::Value,
+    project_id: i64,
+    path: &str,
+    db: &Db,
+    options: walk::WalkOptions,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     info!(
         "workspace_read_by_path: project_id={}, path={}",
         project_id, path
     );
+
+    if !scope.allows_project(project_id) {
+        warn!(
+            "workspace_read_by_path denied out-of-scope project_id={}",
+            project_id
+        );
+        return tool_error(id, ACCESS_DENIED_SCOPE);
+    }
 
     let project_wide = project_wide_tools_enabled();
     let (root, canonical_root, normalized, matched_scope) = if project_wide {
@@ -896,13 +1304,25 @@ fn workspace_read_by_path(
     )
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcResponse {
+    workspace_search_scoped(id, query, db, &McpScope::global())
+}
+
+fn workspace_search_scoped(
+    id: serde_json::Value,
+    query: &str,
+    db: &Db,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     info!("workspace_search: query={}", query);
 
     match db.search_items(query) {
         Ok(items) => {
             let results: Vec<_> = items
                 .iter()
+                .filter(|item| scope.allows_item(item))
                 .map(|i| {
                     serde_json::json!({
                         "id": i.id,
@@ -921,11 +1341,23 @@ fn workspace_search(id: serde_json::Value, query: &str, db: &Db) -> JsonRpcRespo
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_search_fulltext(
     id: serde_json::Value,
     query: &str,
     limit: usize,
     db: &Db,
+) -> JsonRpcResponse {
+    workspace_search_fulltext_scoped(id, query, limit, db, &McpScope::global())
+}
+
+fn workspace_search_fulltext_scoped(
+    id: serde_json::Value,
+    query: &str,
+    limit: usize,
+    db: &Db,
+    scope: &McpScope,
 ) -> JsonRpcResponse {
     info!(
         "workspace_search_fulltext: query='{}' limit={}",
@@ -939,13 +1371,15 @@ fn workspace_search_fulltext(
         return tool_error(id, "Fulltext search refresh failed");
     }
 
-    match db.search_files(query, limit) {
+    match search_files_for_scope(db, query, limit, scope) {
         Ok(mut hits) => {
             match crate::indexer::refresh_search_hits(db, &hits) {
-                Ok(refreshed) if refreshed > 0 => match db.search_files(query, limit) {
-                    Ok(updated_hits) => hits = updated_hits,
-                    Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
-                },
+                Ok(refreshed) if refreshed > 0 => {
+                    match search_files_for_scope(db, query, limit, scope) {
+                        Ok(updated_hits) => hits = updated_hits,
+                        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+                    }
+                }
                 Ok(_) => {}
                 Err(e) => {
                     log::warn!("refresh_search_hits failed: {}", e);
@@ -955,6 +1389,7 @@ fn workspace_search_fulltext(
 
             let results: Vec<_> = hits
                 .iter()
+                .filter(|h| scope.allows_project(h.project_id))
                 .filter(|h| {
                     walk::path_allowed_for_shared_ai_factory(
                         Path::new(&h.path),
@@ -978,19 +1413,38 @@ fn workspace_search_fulltext(
     }
 }
 
+fn search_files_for_scope(
+    db: &Db,
+    query: &str,
+    limit: usize,
+    scope: &McpScope,
+) -> anyhow::Result<Vec<FileSearchHit>> {
+    match scope.allowed_project_ids() {
+        Some(project_ids) => db.search_files_for_projects(query, limit, &project_ids),
+        None => db.search_files(query, limit),
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn list_groups(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
+    list_groups_scoped(id, db, &McpScope::global())
+}
+
+fn list_groups_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) -> JsonRpcResponse {
     info!("list_groups");
     let include_project_paths = project_wide_tools_enabled();
 
     let groups = match db.list_groups() {
-        Ok(g) => g,
+        Ok(groups) => scope.filter_groups(groups),
         Err(e) => return tool_error(id, &format!("Failed to list groups: {}", e)),
     };
 
     let result: Vec<_> = groups
         .iter()
         .map(|g| {
-            let projects = db.get_projects_for_group(g.id).unwrap_or_default();
+            let projects =
+                scope.filter_projects(db.get_projects_for_group(g.id).unwrap_or_default());
             let project_values: Vec<_> = projects
                 .iter()
                 .map(|p| {
@@ -1042,6 +1496,8 @@ fn resolve_project_path(
     Ok((canonical_root, target))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn project_tree(
     id: serde_json::Value,
     project_id: i64,
@@ -1050,10 +1506,35 @@ fn project_tree(
     db: &Db,
     options: walk::WalkOptions,
 ) -> JsonRpcResponse {
+    project_tree_scoped(
+        id,
+        project_id,
+        path,
+        max_depth,
+        db,
+        options,
+        &McpScope::global(),
+    )
+}
+
+fn project_tree_scoped(
+    id: serde_json::Value,
+    project_id: i64,
+    path: Option<&str>,
+    max_depth: Option<usize>,
+    db: &Db,
+    options: walk::WalkOptions,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     info!(
         "project_tree: project_id={}, path={:?}, max_depth={:?}",
         project_id, path, max_depth
     );
+
+    if !scope.allows_project(project_id) {
+        warn!("project_tree denied out-of-scope project_id={}", project_id);
+        return tool_error(id, ACCESS_DENIED_SCOPE);
+    }
 
     let (canonical_root, _) = match resolve_project_path(project_id, None, db) {
         Ok(v) => v,
@@ -1118,6 +1599,8 @@ fn project_tree(
     tool_result(id, lines.join("\n"))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn project_grep(
     id: serde_json::Value,
     project_id: i64,
@@ -1126,10 +1609,35 @@ fn project_grep(
     db: &Db,
     options: walk::WalkOptions,
 ) -> JsonRpcResponse {
+    project_grep_scoped(
+        id,
+        project_id,
+        pattern,
+        glob,
+        db,
+        options,
+        &McpScope::global(),
+    )
+}
+
+fn project_grep_scoped(
+    id: serde_json::Value,
+    project_id: i64,
+    pattern: &str,
+    glob: Option<&str>,
+    db: &Db,
+    options: walk::WalkOptions,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     info!(
         "project_grep: project_id={}, pattern={}, glob={:?}",
         project_id, pattern, glob
     );
+
+    if !scope.allows_project(project_id) {
+        warn!("project_grep denied out-of-scope project_id={}", project_id);
+        return tool_error(id, ACCESS_DENIED_SCOPE);
+    }
 
     let (canonical_root, _) = match resolve_project_path(project_id, None, db) {
         Ok(v) => v,
@@ -1172,19 +1680,25 @@ fn project_grep(
     tool_result(id, lines.join("\n"))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn list_projects(id: serde_json::Value, db: &Db) -> JsonRpcResponse {
+    list_projects_scoped(id, db, &McpScope::global())
+}
+
+fn list_projects_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) -> JsonRpcResponse {
     info!("list_projects");
     let include_project_paths = project_wide_tools_enabled();
 
     let projects = match db.list_projects() {
-        Ok(p) => p,
+        Ok(projects) => scope.filter_projects(projects),
         Err(e) => return tool_error(id, &format!("Failed to list projects: {}", e)),
     };
 
     let result: Vec<_> = projects
         .iter()
         .map(|p| {
-            let groups = db.get_groups_for_project(p.id).unwrap_or_default();
+            let groups = scope.filter_groups(db.get_groups_for_project(p.id).unwrap_or_default());
             let mut project = serde_json::json!({
                 "id": p.id,
                 "name": p.name,
@@ -1227,12 +1741,25 @@ fn service_link_json(db: &Db, link: &crate::models::ServiceLink) -> serde_json::
     })
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_service_graph(
     id: serde_json::Value,
     project: Option<&str>,
     project_id: Option<i64>,
     group_id: Option<i64>,
     db: &Db,
+) -> JsonRpcResponse {
+    workspace_service_graph_scoped(id, project, project_id, group_id, db, &McpScope::global())
+}
+
+fn workspace_service_graph_scoped(
+    id: serde_json::Value,
+    project: Option<&str>,
+    project_id: Option<i64>,
+    group_id: Option<i64>,
+    db: &Db,
+    scope_filter: &McpScope,
 ) -> JsonRpcResponse {
     info!(
         "workspace_service_graph: project={:?}, project_id={:?}, group_id={:?}",
@@ -1253,6 +1780,13 @@ fn workspace_service_graph(
     }
 
     let (scope, links) = if let Some(group_id) = group_id {
+        if !scope_filter.allows_group(group_id) {
+            warn!(
+                "workspace_service_graph denied out-of-scope group_id={}",
+                group_id
+            );
+            return tool_error(id, ACCESS_DENIED_SCOPE);
+        }
         debug!(
             "workspace_service_graph: listing group graph group_id={}",
             group_id
@@ -1263,10 +1797,21 @@ fn workspace_service_graph(
         }
     } else if let Some(project_id) = project_id {
         match db.get_project_by_id(project_id) {
-            Ok(Some(project)) => match service_graph_for_project(db, &project) {
-                Ok(graph) => graph,
-                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
-            },
+            Ok(Some(project)) => {
+                if !scope_filter.allows_project(project.id) {
+                    warn!(
+                        "workspace_service_graph denied out-of-scope project_id={}",
+                        project.id
+                    );
+                    return tool_error(id, ACCESS_DENIED_SCOPE);
+                }
+                match service_graph_for_project(db, &project, scope_filter) {
+                    Ok(graph) => graph,
+                    Err(e) => {
+                        return tool_error(id, &format!("Failed to list service graph: {}", e));
+                    }
+                }
+            }
             Ok(None) => {
                 warn!(
                     "workspace_service_graph: project_id={} not found",
@@ -1278,10 +1823,21 @@ fn workspace_service_graph(
         }
     } else if let Some(project) = project {
         match db.resolve_project_target(project) {
-            Ok(Some(project)) => match service_graph_for_project(db, &project) {
-                Ok(graph) => graph,
-                Err(e) => return tool_error(id, &format!("Failed to list service graph: {}", e)),
-            },
+            Ok(Some(project)) => {
+                if !scope_filter.allows_project(project.id) {
+                    warn!(
+                        "workspace_service_graph denied out-of-scope project='{}'",
+                        project.slug
+                    );
+                    return tool_error(id, ACCESS_DENIED_SCOPE);
+                }
+                match service_graph_for_project(db, &project, scope_filter) {
+                    Ok(graph) => graph,
+                    Err(e) => {
+                        return tool_error(id, &format!("Failed to list service graph: {}", e));
+                    }
+                }
+            }
             Ok(None) => {
                 warn!("workspace_service_graph: project='{}' not found", project);
                 return tool_error(id, &format!("Project '{}' not found", project));
@@ -1300,6 +1856,10 @@ fn workspace_service_graph(
         "workspace_service_graph: returning {} service links",
         links.len()
     );
+    let links: Vec<_> = links
+        .into_iter()
+        .filter(|link| scope_filter.allows_service_link(link))
+        .collect();
     let result = serde_json::json!({
         "scope": scope,
         "links": links.iter().map(|link| service_link_json(db, link)).collect::<Vec<_>>()
@@ -1311,6 +1871,7 @@ fn workspace_service_graph(
 fn service_graph_for_project(
     db: &Db,
     project: &crate::models::Project,
+    scope_filter: &McpScope,
 ) -> anyhow::Result<(serde_json::Value, Vec<crate::models::ServiceLink>)> {
     debug!(
         "workspace_service_graph: listing graph for project id={} slug='{}'",
@@ -1340,10 +1901,12 @@ fn service_graph_for_project(
     let mut links: Vec<crate::models::ServiceLink> = Vec::new();
     let mut scope_groups = Vec::new();
     for group in groups {
-        scope_groups.push(serde_json::json!({
-            "id": group.id,
-            "name": group.name
-        }));
+        if scope_filter.allows_group(group.id) {
+            scope_groups.push(serde_json::json!({
+                "id": group.id,
+                "name": group.name
+            }));
+        }
         for link in db.list_group_service_links(group.id)? {
             if !links.iter().any(|existing| existing.id == link.id) {
                 links.push(link);
@@ -1361,6 +1924,8 @@ fn service_graph_for_project(
     ))
 }
 
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_events(
     id: serde_json::Value,
     project: Option<&str>,
@@ -1368,6 +1933,26 @@ fn workspace_events(
     source: Option<&str>,
     status: Option<crate::models::EventStatus>,
     db: &Db,
+) -> JsonRpcResponse {
+    workspace_events_scoped(
+        id,
+        project,
+        project_id,
+        source,
+        status,
+        db,
+        &McpScope::global(),
+    )
+}
+
+fn workspace_events_scoped(
+    id: serde_json::Value,
+    project: Option<&str>,
+    project_id: Option<i64>,
+    source: Option<&str>,
+    status: Option<crate::models::EventStatus>,
+    db: &Db,
+    scope: &McpScope,
 ) -> JsonRpcResponse {
     info!(
         "workspace_events: project={:?}, project_id={:?}, source={:?}, status={:?}",
@@ -1390,10 +1975,19 @@ fn workspace_events(
 
     let events = if let Some(project_id) = project_id {
         match db.get_project_by_id(project_id) {
-            Ok(Some(_)) => match db.list_workspace_event_inbox(project_id) {
-                Ok(events) => events,
-                Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
-            },
+            Ok(Some(_)) => {
+                if !scope.allows_project(project_id) {
+                    warn!(
+                        "workspace_events denied out-of-scope project_id={}",
+                        project_id
+                    );
+                    return tool_error(id, ACCESS_DENIED_SCOPE);
+                }
+                match db.list_workspace_event_inbox(project_id) {
+                    Ok(events) => events,
+                    Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
+                }
+            }
             Ok(None) => {
                 warn!("workspace_events: project_id={} not found", project_id);
                 return tool_error(id, &format!("Project {} not found", project_id));
@@ -1402,10 +1996,19 @@ fn workspace_events(
         }
     } else if let Some(project) = project {
         match db.resolve_project_target(project) {
-            Ok(Some(project)) => match db.list_workspace_event_inbox(project.id) {
-                Ok(events) => events,
-                Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
-            },
+            Ok(Some(project)) => {
+                if !scope.allows_project(project.id) {
+                    warn!(
+                        "workspace_events denied out-of-scope project='{}'",
+                        project.slug
+                    );
+                    return tool_error(id, ACCESS_DENIED_SCOPE);
+                }
+                match db.list_workspace_event_inbox(project.id) {
+                    Ok(events) => events,
+                    Err(e) => return tool_error(id, &format!("Failed to list event inbox: {}", e)),
+                }
+            }
             Ok(None) => {
                 warn!("workspace_events: project='{}' not found", project);
                 return tool_error(id, &format!("Project '{}' not found", project));
@@ -1414,7 +2017,10 @@ fn workspace_events(
         }
     } else {
         match db.list_workspace_events(source, status) {
-            Ok(events) => events,
+            Ok(events) => events
+                .into_iter()
+                .filter(|event| workspace_event_visible(db, scope, event))
+                .collect(),
             Err(e) => return tool_error(id, &format!("Failed to list workspace events: {}", e)),
         }
     };
@@ -1425,7 +2031,83 @@ fn workspace_events(
     tool_result(id, text)
 }
 
+fn workspace_event_visible(
+    db: &Db,
+    scope: &McpScope,
+    event: &crate::models::WorkspaceEvent,
+) -> bool {
+    if matches!(scope, McpScope::Global) {
+        return true;
+    }
+
+    let targets = match db.list_event_targets(event.id) {
+        Ok(targets) => targets,
+        Err(e) => {
+            warn!(
+                "Failed to list event targets while applying MCP scope event_id={}: {}",
+                event.id, e
+            );
+            Vec::new()
+        }
+    };
+    let artifacts = match db.list_event_artifacts(event.id) {
+        Ok(artifacts) => artifacts,
+        Err(e) => {
+            warn!(
+                "Failed to list event artifacts while applying MCP scope event_id={}: {}",
+                event.id, e
+            );
+            Vec::new()
+        }
+    };
+
+    workspace_event_visible_with_impacts(scope, event, &targets, &artifacts)
+}
+
+fn workspace_event_visible_with_impacts(
+    scope: &McpScope,
+    event: &crate::models::WorkspaceEvent,
+    targets: &[crate::models::EventTarget],
+    artifacts: &[crate::models::EventArtifact],
+) -> bool {
+    match scope {
+        McpScope::Global => true,
+        McpScope::Group { group_id, .. } => {
+            event.group_id == Some(*group_id)
+                || event
+                    .source_project_id
+                    .is_some_and(|project_id| scope.allows_project(project_id))
+                || targets
+                    .iter()
+                    .any(|target| scope.allows_optional_project(target.affected_project_id))
+                || artifacts
+                    .iter()
+                    .any(|artifact| scope.allows_optional_project(artifact.affected_project_id))
+        }
+        McpScope::Project { project_id, .. } => {
+            event.source_project_id == Some(*project_id)
+                || targets
+                    .iter()
+                    .any(|target| target.affected_project_id == Some(*project_id))
+                || artifacts
+                    .iter()
+                    .any(|artifact| artifact.affected_project_id == Some(*project_id))
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
 fn workspace_event_details(id: serde_json::Value, event_id: i64, db: &Db) -> JsonRpcResponse {
+    workspace_event_details_scoped(id, event_id, db, &McpScope::global())
+}
+
+fn workspace_event_details_scoped(
+    id: serde_json::Value,
+    event_id: i64,
+    db: &Db,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     info!("workspace_event_details: event_id={}", event_id);
 
     let event = match db.get_workspace_event(event_id) {
@@ -1444,6 +2126,23 @@ fn workspace_event_details(id: serde_json::Value, event_id: i64, db: &Db) -> Jso
         Ok(artifacts) => artifacts,
         Err(e) => return tool_error(id, &format!("Failed to list event artifacts: {}", e)),
     };
+
+    if !workspace_event_visible_with_impacts(scope, &event, &targets, &artifacts) {
+        warn!(
+            "workspace_event_details denied out-of-scope event_id={}",
+            event_id
+        );
+        return tool_error(id, ACCESS_DENIED_SCOPE);
+    }
+
+    let targets: Vec<_> = targets
+        .into_iter()
+        .filter(|target| scope.allows_optional_project(target.affected_project_id))
+        .collect();
+    let artifacts: Vec<_> = artifacts
+        .into_iter()
+        .filter(|artifact| scope.allows_optional_project(artifact.affected_project_id))
+        .collect();
 
     info!(
         "workspace_event_details: returning event_id={} targets={} artifacts={}",

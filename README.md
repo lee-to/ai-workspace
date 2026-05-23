@@ -93,6 +93,16 @@ By default, project navigation, full-text file search, and direct path reads hid
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
 
+You can also restrict the MCP server to part of the local workspace:
+
+```bash
+ai-workspace serve --scope current-project
+ai-workspace serve --group backend
+ai-workspace serve --project api
+```
+
+The same modes are available through `AI_WORKSPACE_SCOPE=global|current-project|group|project`, `AI_WORKSPACE_SCOPE_GROUP`, and `AI_WORKSPACE_SCOPE_PROJECT`. CLI flags override env vars. Scoping filters metadata, search, service graphs, events, reads, tree, and grep; `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` only broadens filesystem access inside the configured MCP scope.
+
 ## Example Prompts
 
 Once connected, you can talk to your AI agent naturally. Here are some examples:
@@ -149,7 +159,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `sync` | Clean up stale files + reconcile workspace JSON |
 | `search <query>` | Full-text search over shared `.md` files (FTS5, bm25-ranked) |
 | `reindex` | Rebuild the full-text index for all shared `.md` files |
-| `serve` | Start the MCP server |
+| `serve [--scope ...] [--group ...] [--project ...]` | Start the MCP server, optionally scoped to a project or group |
 | `update` | Update to the latest version |
 
 ## Team Sharing

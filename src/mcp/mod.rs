@@ -7,7 +7,9 @@ use std::io::{self, BufRead, Write};
 
 use protocol::{JsonRpcRequest, JsonRpcResponse, McpError};
 
-pub fn serve() -> Result<()> {
+pub use tools::{McpScope, McpScopeKind, McpScopeRequest, resolve_scope};
+
+pub fn serve(scope: McpScope) -> Result<()> {
     info!("MCP server starting (stdio transport)");
 
     let stdin = io::stdin();
@@ -22,7 +24,7 @@ pub fn serve() -> Result<()> {
         debug!("Received: {}", line);
 
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
-            Ok(req) => handle_request(req),
+            Ok(req) => handle_request_with_scope(req, &scope),
             Err(e) => {
                 error!("Failed to parse request: {}", e);
                 Some(JsonRpcResponse::error(
@@ -44,13 +46,18 @@ pub fn serve() -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
+    handle_request_with_scope(req, &McpScope::global())
+}
+
+fn handle_request_with_scope(req: JsonRpcRequest, scope: &McpScope) -> Option<JsonRpcResponse> {
     debug!("Handling method: {}", req.method);
 
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(req.id)),
         "tools/list" => Some(handle_tools_list(req.id)),
-        "tools/call" => Some(tools::handle_tool_call(req.id, req.params)),
+        "tools/call" => Some(tools::handle_tool_call_scoped(req.id, req.params, scope)),
         _ if req.method.starts_with("notifications/") => {
             debug!("Ignoring notification: {}", req.method);
             None
@@ -90,7 +97,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
             "tools": [
                 {
                     "name": "workspace_context",
-                    "description": "Get workspace metadata: projects, groups, shared items list (no file content)",
+                    "description": "Get workspace metadata within the configured MCP server scope: projects, groups, shared items list (no file content)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -100,7 +107,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_read",
-                    "description": "Read a shared item by item_id, or read a project path only when it is inside shared scopes. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to allow project-wide path reads.",
+                    "description": "Read an in-scope shared item by item_id, or read an in-scope project path only when it is inside shared scopes. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to allow project-wide path reads inside the MCP scope.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -133,7 +140,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_search",
-                    "description": "Full-text search over shared notes",
+                    "description": "Full-text search over shared notes within the configured MCP server scope",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -147,7 +154,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "list_groups",
-                    "description": "List all groups with their member projects. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
+                    "description": "List groups and member projects visible within the configured MCP server scope. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -156,7 +163,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "list_projects",
-                    "description": "List all projects with their groups. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
+                    "description": "List projects visible within the configured MCP server scope. Project paths are omitted unless AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -165,7 +172,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "project_tree",
-                    "description": "List the shared file tree of a project by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project tree access.",
+                    "description": "List the shared file tree of an in-scope project by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project tree access inside the MCP scope.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -199,7 +206,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "project_grep",
-                    "description": "Search shared project files for a regex pattern by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project search.",
+                    "description": "Search shared files in an in-scope project for a regex pattern by default, respecting .gitignore. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 for full project search inside the MCP scope.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -229,7 +236,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_search_fulltext",
-                    "description": "Full-text search over indexed shared .md files (SQLite FTS5, bm25-ranked, unicode61 tokenizer)",
+                    "description": "Full-text search over indexed shared .md files within the configured MCP server scope (SQLite FTS5, bm25-ranked, unicode61 tokenizer)",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -247,7 +254,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_service_graph",
-                    "description": "Inspect directional service links for all projects, one group, or a project's group graph",
+                    "description": "Inspect directional service links visible within the configured MCP server scope",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -272,7 +279,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_events",
-                    "description": "List workspace events or a project's open event inbox",
+                    "description": "List workspace events visible within the configured MCP server scope or an in-scope project's open event inbox",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -302,7 +309,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_event_details",
-                    "description": "Get an event with affected services and affected artifacts",
+                    "description": "Get an in-scope event with affected services and affected artifacts filtered to the configured MCP server scope",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
