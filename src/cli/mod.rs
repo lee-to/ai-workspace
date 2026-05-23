@@ -1463,6 +1463,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                     + report.groups_removed
                     + report.shares_added
                     + report.shares_removed
+                    + report.shares_updated
                     + report.dependencies_added
                     + report.dependencies_removed
                     + report.dependencies_updated
@@ -1471,11 +1472,12 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                     + report.notes_updated;
                 if total > 0 {
                     print_success(format!(
-                        "Applied workspace config: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
+                        "Applied workspace config: groups +{} -{}, shares +{} -{} ~{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
                         report.groups_added,
                         report.groups_removed,
                         report.shares_added,
                         report.shares_removed,
+                        report.shares_updated,
                         report.dependencies_added,
                         report.dependencies_removed,
                         report.dependencies_updated,
@@ -2329,6 +2331,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         + report.groups_removed
                         + report.shares_added
                         + report.shares_removed
+                        + report.shares_updated
                         + report.dependencies_added
                         + report.dependencies_removed
                         + report.dependencies_updated
@@ -2337,11 +2340,12 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         + report.notes_updated;
                     if total > 0 {
                         print_success(format!(
-                            "Config sync: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
+                            "Config sync: groups +{} -{}, shares +{} -{} ~{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
                             report.groups_added,
                             report.groups_removed,
                             report.shares_added,
                             report.shares_removed,
+                            report.shares_updated,
                             report.dependencies_added,
                             report.dependencies_removed,
                             report.dependencies_updated,
