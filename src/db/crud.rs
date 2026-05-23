@@ -2385,12 +2385,13 @@ impl Db {
                     current_label,
                     entry.label()
                 );
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE shared_items
                      SET kind = ?1, label = ?2, updated_at = datetime('now')
                      WHERE id = ?3",
                     params![share.kind.as_str(), entry.label(), id],
                 )?;
+                report.shares_updated += changed;
             }
         }
 
@@ -2620,11 +2621,12 @@ impl Db {
 
         tx.commit()?;
         info!(
-            "Sync complete: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
+            "Sync complete: groups +{} -{}, shares +{} -{} ~{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
             report.groups_added,
             report.groups_removed,
             report.shares_added,
             report.shares_removed,
+            report.shares_updated,
             report.dependencies_added,
             report.dependencies_removed,
             report.dependencies_updated,
@@ -4609,6 +4611,66 @@ mod tests {
     }
 
     #[test]
+    fn sync_counts_share_label_updates() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        db.share_file(pid, "README.md", Some("old label")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("new label".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 0);
+        assert_eq!(report.shares_removed, 0);
+        assert_eq!(report.shares_updated, 1);
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label.as_deref(), Some("new label"));
+    }
+
+    #[test]
+    fn sync_counts_share_kind_updates() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        db.share_file(pid, "docs", None).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs".to_string(),
+                label: None,
+                kind: Some(SharedItemKind::Dir),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 0);
+        assert_eq!(report.shares_removed, 0);
+        assert_eq!(report.shares_updated, 1);
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+    }
+
+    #[test]
     fn sync_rejects_configured_share_kind_mismatches() {
         let cases = [
             ("README.md", SharedItemKind::Dir, "file"),
@@ -5045,6 +5107,7 @@ mod tests {
         assert_eq!(r2.groups_removed, 0);
         assert_eq!(r2.shares_added, 0);
         assert_eq!(r2.shares_removed, 0);
+        assert_eq!(r2.shares_updated, 0);
         assert_eq!(r2.notes_added, 0);
         assert_eq!(r2.notes_removed, 0);
         assert_eq!(r2.notes_updated, 0);
