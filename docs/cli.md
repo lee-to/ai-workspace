@@ -58,7 +58,7 @@ ai-workspace init [--name <name>] [--slug <slug>] [--group <group>] [--preset ai
 
 If the directory is already initialized, running `init` again is safe — the existing name is preserved unless `--name` is explicitly provided. Adding `--group` joins the project to that group.
 
-If the configured workspace JSON exists, `init` reads it and applies the config (groups, shares, notes) via sync. By default this is `.ai-workspace.json`; use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to place it elsewhere. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. The configured workspace JSON path must be a relative path inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Shared paths from the config must also exist, be relative paths, and resolve inside the project directory. Config share entries are literal paths, not globs: `*`, `?`, `[`, `]`, `{`, and `}` are rejected. Use `"docs"` rather than `"docs/**"` to share a directory.
+If the configured workspace JSON exists, `init` reads it and applies the config (groups, shares, notes) via sync. Configured Markdown file shares and Markdown files inside configured shared directories are indexed for search immediately after sync. By default this is `.ai-workspace.json`; use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` to place it elsewhere. The `--name` flag overrides the name from the JSON file; `--group` is additive to the groups listed in the file. The configured workspace JSON path must be a relative path inside the project directory; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Shared paths from the config must also exist, be relative paths, and resolve inside the project directory. Config share entries are literal paths, not globs: `*`, `?`, `[`, `]`, `{`, and `}` are rejected. Use `"docs"` rather than `"docs/**"` to share a directory.
 
 **Auto-share:** When no configured workspace JSON exists, `init` automatically detects and shares key project files: `README*`, `Cargo.toml`, `package.json`, `go.mod`, `pyproject.toml`, `composer.json`, `Makefile`, `Taskfile.yml`, `Justfile`. Already-shared files are skipped, so re-running `init` does not create duplicates.
 
@@ -353,7 +353,7 @@ ai-workspace sync
 
 Two-step process:
 1. Remove stale file/dir entries whose paths no longer exist on disk
-2. If the current directory is inside a project and the configured workspace JSON exists, sync the database to match the config (add missing groups/shares/notes, remove extras, update changed notes)
+2. If the current directory is inside a project and the configured workspace JSON exists, sync the database to match the config (add missing groups/shares/notes, remove extras, update changed notes), then index configured Markdown file/dir shares for search
 
 ### `search`
 
@@ -379,7 +379,7 @@ ai-workspace search <query> [--limit <n>]
 **Index coverage:**
 - Only `.md` files are indexed.
 - Files larger than 1 MB or with invalid UTF-8 are skipped.
-- Indexing happens automatically on `share` and when `init` auto-shares files.
+- Indexing happens automatically on `share`, when `init` auto-shares files, and after `init` or `sync` applies configured workspace JSON shares.
 - Before each search, files whose mtime has changed on disk are lazily refreshed with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
 - Deleted indexed child `.md` files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `reindex`.
 - Russian/English text is supported at the normalization level, but there is no stemming.
