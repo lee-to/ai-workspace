@@ -2,6 +2,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+use rusqlite::{Connection, params};
+
 fn binary_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/debug/ai-workspace");
@@ -36,6 +38,98 @@ fn assert_hit_path(stdout: &str, path: &str) {
             .any(|line| line.starts_with(path) && line.contains("  [id=")),
         "expected hit path {path}: {stdout}"
     );
+}
+
+fn raw_fts_hit_count(db: &PathBuf, query: &str) -> i64 {
+    let conn = Connection::open(db).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM files_fts
+         WHERE files_fts MATCH ?1",
+        params![query],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn cli_init_config_md_share_indexes_before_search() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::write(proj.path().join("README.md"), "init_config_marker").unwrap();
+    fs::write(
+        proj.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "p",
+            "share": ["README.md"]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, ok) = run(&db, proj.path(), &["init"]);
+    assert!(
+        ok,
+        "init should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Indexed 1 .md file(s) for search"),
+        "init should report immediate indexing\nstdout:\n{stdout}"
+    );
+    assert_eq!(raw_fts_hit_count(&db, "init_config_marker"), 1);
+}
+
+#[test]
+fn cli_sync_config_dir_share_indexes_children_before_search() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::create_dir_all(proj.path().join("docs")).unwrap();
+    fs::write(proj.path().join("docs/a.md"), "sync_config_dir_marker").unwrap();
+    fs::write(proj.path().join("docs/skip.txt"), "not markdown").unwrap();
+
+    assert!(run(&db, proj.path(), &["init", "--name", "p"]).2);
+    fs::write(
+        proj.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "p",
+            "share": ["docs"]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, ok) = run(&db, proj.path(), &["sync"]);
+    assert!(
+        ok,
+        "sync should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("Indexed 1 .md file(s) for search"),
+        "sync should report immediate indexing\nstdout:\n{stdout}"
+    );
+    assert_eq!(raw_fts_hit_count(&db, "sync_config_dir_marker"), 1);
+}
+
+#[test]
+fn cli_sync_config_removed_share_removes_raw_fts_rows() {
+    let (_dbdir, db) = temp_db();
+    let proj = tempfile::tempdir().unwrap();
+    fs::write(proj.path().join("old.md"), "removed_config_marker").unwrap();
+
+    assert!(run(&db, proj.path(), &["init", "--name", "p"]).2);
+    assert!(run(&db, proj.path(), &["share", "old.md"]).2);
+    assert_eq!(raw_fts_hit_count(&db, "removed_config_marker"), 1);
+
+    fs::write(
+        proj.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "p",
+            "share": []
+        }"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, ok) = run(&db, proj.path(), &["sync"]);
+    assert!(ok, "sync should succeed\nstderr:\n{stderr}");
+    assert_eq!(raw_fts_hit_count(&db, "removed_config_marker"), 0);
 }
 
 #[test]

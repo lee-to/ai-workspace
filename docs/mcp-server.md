@@ -154,6 +154,8 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 | `query` | string | yes | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
 | `limit` | integer | no | Maximum number of results (default: 20) |
 
+`workspace_search_fulltext` does not support `include_hidden` or `include_sensitive`. Hidden/dotfile and credential-like `.md` paths are always excluded from full-text search results, even when those paths are explicitly shared.
+
 **Returns:** JSON array of hits, each with:
 
 | Field | Type | Description |
@@ -168,7 +170,7 @@ Use `workspace_read` with `project_id` and `rel_path` set to the returned `path`
 
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
-- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
+- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories. Use `workspace_read`, `project_tree`, or `project_grep` with explicit opt-in flags when you need to inspect those paths.
 - Files are indexed automatically when shared. Each `.md` file inside a shared directory is indexed as its own search document, so hits point at the exact child path.
 - Files whose mtime has changed on disk are lazily refreshed before each search with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
 - Deleted indexed child files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `ai-workspace reindex`.
@@ -207,7 +209,7 @@ List workspace events visible inside the configured MCP scope or show an in-scop
 
 Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists scoped events and applies the optional filters.
 
-**Returns:** JSON array of events with source snapshots, kind, title, body, severity, status, and timestamps.
+**Returns:** JSON array of events with source snapshots, legacy `group_id`, source group snapshot `group_ids`, kind, title, body, severity, status, and timestamps.
 
 ### `workspace_event_details`
 

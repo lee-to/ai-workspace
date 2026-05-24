@@ -727,6 +727,41 @@ fn update_workspace_json_if_exists(
     Ok(())
 }
 
+fn index_project_search_shares(
+    db: &Db,
+    project: &crate::models::Project,
+) -> Result<crate::indexer::IndexStats> {
+    let mut stats = crate::indexer::IndexStats::default();
+    let project_root = Path::new(&project.path);
+
+    for item in db.get_shared_items_for_project(project.id)? {
+        match item.kind {
+            SharedItemKind::File | SharedItemKind::Dir => {
+                match crate::indexer::index_shared_item(db, &item, project_root) {
+                    Ok(item_stats) => {
+                        stats.indexed += item_stats.indexed;
+                        stats.skipped_size += item_stats.skipped_size;
+                        stats.skipped_non_utf8 += item_stats.skipped_non_utf8;
+                        stats.skipped_missing += item_stats.skipped_missing;
+                    }
+                    Err(err) => {
+                        warn!("FTS indexing failed for id={}: {}", item.id, err);
+                    }
+                }
+            }
+            SharedItemKind::Note => {}
+        }
+    }
+
+    Ok(stats)
+}
+
+fn print_search_index_info(stats: crate::indexer::IndexStats) {
+    if stats.indexed > 0 {
+        print_info(format!("Indexed {} .md file(s) for search", stats.indexed));
+    }
+}
+
 fn validate_config_share_paths(
     project_dir: &Path,
     config: &crate::models::WorkspaceConfig,
@@ -1030,6 +1065,17 @@ fn print_event_details(db: &Db, event_id: i64) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Event id={} not found", event_id))?;
     println!("Event: {} (id={})", event.title, event.id);
     println!("Source: {}", event.source_project_slug);
+    let group_ids = db.list_event_group_ids(event_id)?;
+    if !group_ids.is_empty() {
+        let groups = group_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Groups: {}", groups);
+    } else if let Some(group_id) = event.group_id {
+        println!("Group: {}", group_id);
+    }
     println!("Kind: {}", event.kind);
     println!("Severity: {}", event.severity);
     println!("Status: {}", event.status);
@@ -1507,6 +1553,10 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             // Sync from config if present
             if let Some(ref cfg) = config {
                 let report = db.sync_from_config(project_id, cfg)?;
+                let synced_project = db.get_project_by_id(project_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("Project {} not found after config sync", project_id)
+                })?;
+                let index_stats = index_project_search_shares(&db, &synced_project)?;
                 let total = report.groups_added
                     + report.groups_removed
                     + report.shares_added
@@ -1536,6 +1586,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 } else {
                     print_info("Config already in sync with database.");
                 }
+                print_search_index_info(index_stats);
 
                 if config_changed_by_cli_group {
                     save_workspace_config(cfg, &config_path)?;
@@ -2375,6 +2426,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                     info!("Found workspace config, syncing config");
                     let config = load_workspace_config(&config_path)?;
                     let report = db.sync_from_config(project.id, &config)?;
+                    let index_stats = index_project_search_shares(&db, &project)?;
                     let total = report.groups_added
                         + report.groups_removed
                         + report.shares_added
@@ -2404,6 +2456,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                     } else {
                         print_success("Config is in sync with database.");
                     }
+                    print_search_index_info(index_stats);
                 }
             }
 

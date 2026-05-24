@@ -288,17 +288,9 @@ impl Db {
                 },
             )
             .with_context(|| format!("Failed to load project id={project_id} for destroy"))?;
-        let group_id: Option<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
-            )?;
-            let mut rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
-            match rows.next() {
-                Some(row) => Some(row?),
-                None => None,
-            }
-        };
-        if group_id.is_none() {
+        let group_ids = Self::group_ids_for_project_conn(&tx, source.id)?;
+        let group_id = group_ids.first().copied();
+        if group_ids.is_empty() {
             warn!(
                 "Destroy event source slug='{}' has no group; impact may be limited",
                 source.slug
@@ -334,6 +326,7 @@ impl Db {
             )
         })?;
         let event_id = tx.last_insert_rowid();
+        Self::insert_event_groups(&tx, event_id, &group_ids)?;
 
         let linked_count = {
             let mut stmt = tx.prepare(
@@ -1357,8 +1350,9 @@ impl Db {
             source_target,
             &format!("creating workspace event kind={}", kind),
         )?;
-        let group_id = self.first_group_id_for_project(source.id)?;
-        if group_id.is_none() {
+        let group_ids = Self::group_ids_for_project_conn(&self.conn, source.id)?;
+        let group_id = group_ids.first().copied();
+        if group_ids.is_empty() {
             warn!(
                 "Event source slug='{}' has no group; impact may be limited",
                 source.slug
@@ -1396,6 +1390,7 @@ impl Db {
                 )
             })?;
         let event_id = self.conn.last_insert_rowid();
+        Self::insert_event_groups(&self.conn, event_id, &group_ids)?;
         let linked_count = self.insert_linked_service_event_targets(event_id, source.id)?;
         let artifact_count = self.insert_artifact_event_impacts(event_id, &source.slug)?;
         if linked_count == 0 && artifact_count == 0 {
@@ -1571,15 +1566,52 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    fn first_group_id_for_project(&self, project_id: i64) -> Result<Option<i64>> {
+    pub fn list_event_group_ids(&self, event_id: i64) -> Result<Vec<i64>> {
+        debug!("Listing event groups with event_id={}", event_id);
         let mut stmt = self.conn.prepare(
-            "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
+            "SELECT group_id
+             FROM event_groups
+             WHERE event_id = ?1 AND group_id IS NOT NULL
+             ORDER BY group_id",
         )?;
-        let mut rows = stmt.query_map(params![project_id], |row| row.get(0))?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
+        let rows = stmt.query_map(params![event_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn workspace_event_has_group(&self, event_id: i64, group_id: i64) -> Result<bool> {
+        debug!(
+            "Checking event group membership with event_id={} group_id={}",
+            event_id, group_id
+        );
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM event_groups
+                 WHERE event_id = ?1 AND group_id = ?2
+             )",
+            params![event_id, group_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    fn group_ids_for_project_conn(conn: &Connection, project_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn insert_event_groups(conn: &Connection, event_id: i64, group_ids: &[i64]) -> Result<()> {
+        for group_id in group_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO event_groups (event_id, group_id) VALUES (?1, ?2)",
+                params![event_id, group_id],
+            )?;
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -3954,6 +3986,32 @@ mod tests {
         assert!(db.remove_workspace_event(event_id).unwrap());
         assert!(db.get_workspace_event(event_id).unwrap().is_none());
         assert!(db.list_event_targets(event_id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn destroy_project_snapshots_all_source_groups_for_event() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth-multi-group", Some("auth"))
+            .unwrap();
+        let alpha = db.get_or_create_group("alpha").unwrap();
+        let beta = db.get_or_create_group("beta").unwrap();
+        db.add_project_to_group(auth, beta).unwrap();
+        db.add_project_to_group(auth, alpha).unwrap();
+
+        let event_id = db.destroy_project_with_service_deleted_event(auth).unwrap();
+        let event = db.get_workspace_event(event_id).unwrap().unwrap();
+        assert_eq!(event.group_id, Some(alpha));
+
+        let group_ids = db
+            .conn
+            .prepare("SELECT group_id FROM event_groups WHERE event_id = ?1 ORDER BY group_id")
+            .unwrap()
+            .query_map(params![event_id], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(group_ids, vec![alpha, beta]);
     }
 
     // --- Shared Items: Files & Dirs ---

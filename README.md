@@ -89,7 +89,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 ```
 
 That's it. The agent now has access to 11 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
-By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
+By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`. `workspace_read`, `project_tree`, and `project_grep` support explicit opt-in flags; `workspace_search_fulltext` is stricter and never returns hidden or credential-like `.md` paths.
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
 
@@ -183,7 +183,36 @@ ai-workspace init
 # → picks up name, slug, groups, shares, notes, and dependencies from the configured workspace JSON
 ```
 
-The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present. Shared paths from config must exist and resolve inside the project directory. They are literal file or directory paths, not glob patterns; use `"docs"` rather than `"docs/**"` to share a directory. Artifact dependency sync is partial: if a share object omits `dependencies`, existing dependency rows for that share are left unchanged. To manage dependencies declaratively, include `dependencies`; an explicit empty array removes all dependencies for that share:
+The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present.
+
+### `.ai-workspace.json` path style
+
+Use forward slashes in committed `.ai-workspace.json` share paths, even on Windows. Shared paths from config must exist, stay inside the project directory, and be project-relative literal file or directory paths:
+
+```json
+{
+  "share": [
+    "examples",
+    "docs",
+    "docs/README.md"
+  ]
+}
+```
+
+Do not use glob patterns or Windows separator/trailing-slash style in committed configs:
+
+```json
+{
+  "share": [
+    "docs/**",
+    "examples\\"
+  ]
+}
+```
+
+To share everything under `docs`, share the directory with `"docs"` instead of `"docs/**"`. Backslash or trailing-slash entries may be normalized for compatibility when imported, but they are not the canonical style for committed config. `ai-workspace export` writes normalized `/` paths without trailing directory slashes, such as `"docs/README.md"` and `"examples"`.
+
+Artifact dependency sync is partial: if a share object omits `dependencies`, existing dependency rows for that share are left unchanged. To manage dependencies declaratively, include `dependencies`; an explicit empty array removes all dependencies for that share:
 
 ```json
 {
