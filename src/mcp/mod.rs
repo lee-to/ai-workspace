@@ -236,7 +236,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "workspace_search_fulltext",
-                    "description": "Full-text search over indexed shared .md files within the configured MCP server scope (SQLite FTS5, bm25-ranked, unicode61 tokenizer)",
+                    "description": "Full-text search over indexed shared .md files within the configured MCP server scope (SQLite FTS5, bm25-ranked, unicode61 tokenizer). Hidden/dotfile and credential-like .md paths are always excluded; this tool has no include_hidden/include_sensitive opt-in.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -249,7 +249,8 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                                 "description": "Max number of results (default: 20)"
                             }
                         },
-                        "required": ["query"]
+                        "required": ["query"],
+                        "additionalProperties": false
                     }
                 },
                 {
