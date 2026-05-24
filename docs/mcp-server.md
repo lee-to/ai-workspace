@@ -207,7 +207,7 @@ List workspace events visible inside the configured MCP scope or show an in-scop
 
 Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists scoped events and applies the optional filters.
 
-**Returns:** JSON array of events with source snapshots, kind, title, body, severity, status, and timestamps.
+**Returns:** JSON array of events with source snapshots, legacy `group_id`, source group snapshot `group_ids`, kind, title, body, severity, status, and timestamps.
 
 ### `workspace_event_details`
 

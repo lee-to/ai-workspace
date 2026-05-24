@@ -2026,7 +2026,7 @@ fn workspace_events_scoped(
     };
 
     info!("workspace_events: returning {} events", events.len());
-    let result: Vec<_> = events.iter().map(event_json).collect();
+    let result: Vec<_> = events.iter().map(|event| event_json(db, event)).collect();
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     tool_result(id, text)
 }
@@ -2060,8 +2060,18 @@ fn workspace_event_visible(
             Vec::new()
         }
     };
+    let group_ids = match db.list_event_group_ids(event.id) {
+        Ok(group_ids) => group_ids,
+        Err(e) => {
+            warn!(
+                "Failed to list event groups while applying MCP scope event_id={}: {}",
+                event.id, e
+            );
+            Vec::new()
+        }
+    };
 
-    workspace_event_visible_with_impacts(scope, event, &targets, &artifacts)
+    workspace_event_visible_with_impacts(scope, event, &targets, &artifacts, &group_ids)
 }
 
 fn workspace_event_visible_with_impacts(
@@ -2069,11 +2079,13 @@ fn workspace_event_visible_with_impacts(
     event: &crate::models::WorkspaceEvent,
     targets: &[crate::models::EventTarget],
     artifacts: &[crate::models::EventArtifact],
+    event_group_ids: &[i64],
 ) -> bool {
     match scope {
         McpScope::Global => true,
         McpScope::Group { group_id, .. } => {
             event.group_id == Some(*group_id)
+                || event_group_ids.contains(group_id)
                 || event
                     .source_project_id
                     .is_some_and(|project_id| scope.allows_project(project_id))
@@ -2126,8 +2138,12 @@ fn workspace_event_details_scoped(
         Ok(artifacts) => artifacts,
         Err(e) => return tool_error(id, &format!("Failed to list event artifacts: {}", e)),
     };
+    let group_ids = match db.list_event_group_ids(event_id) {
+        Ok(group_ids) => group_ids,
+        Err(e) => return tool_error(id, &format!("Failed to list event groups: {}", e)),
+    };
 
-    if !workspace_event_visible_with_impacts(scope, &event, &targets, &artifacts) {
+    if !workspace_event_visible_with_impacts(scope, &event, &targets, &artifacts, &group_ids) {
         warn!(
             "workspace_event_details denied out-of-scope event_id={}",
             event_id
@@ -2151,7 +2167,7 @@ fn workspace_event_details_scoped(
         artifacts.len()
     );
     let result = serde_json::json!({
-        "event": event_json(&event),
+        "event": event_json(db, &event),
         "affected_services": targets.iter().map(|target| serde_json::json!({
             "id": target.id,
             "event_id": target.event_id,
@@ -2180,13 +2196,24 @@ fn workspace_event_details_scoped(
     tool_result(id, text)
 }
 
-fn event_json(event: &crate::models::WorkspaceEvent) -> serde_json::Value {
+fn event_json(db: &Db, event: &crate::models::WorkspaceEvent) -> serde_json::Value {
+    let group_ids = match db.list_event_group_ids(event.id) {
+        Ok(group_ids) => group_ids,
+        Err(e) => {
+            warn!(
+                "Failed to list event groups while rendering event_id={}: {}",
+                event.id, e
+            );
+            Vec::new()
+        }
+    };
     serde_json::json!({
         "id": event.id,
         "source_project_id": event.source_project_id,
         "source_project_slug": event.source_project_slug,
         "source_project_name": event.source_project_name,
         "group_id": event.group_id,
+        "group_ids": group_ids,
         "kind": event.kind.as_str(),
         "title": event.title,
         "body": event.body,
