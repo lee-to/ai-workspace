@@ -1,17 +1,18 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
-use rusqlite::{Connection, Row, params, types::Type};
+use rusqlite::{Connection, Row, params, params_from_iter, types::Type};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
 use crate::models::{
-    ArtifactDependency, ArtifactDependencyKind, ArtifactReaction, DependencyEntry, EventArtifact,
-    EventArtifactStatus, EventSeverity, EventStatus, EventTarget, EventTargetRelationKind,
-    EventTargetStatus, FileSearchHit, Group, NoteEntry, Project, ServiceLink, ServiceLinkKind,
-    ShareEntry, SharedItem, SharedItemKind, SyncReport, WorkspaceConfig, WorkspaceEvent,
-    WorkspaceEventKind, normalize_project_slug,
+    ArtifactDependency, ArtifactDependencyKind, ArtifactReaction, CodeEdge, CodeEdgeKind, CodeFile,
+    CodeGraphSearchHit, CodeGraphStats, CodeNode, CodeNodeSearch, CodeUnresolvedRef,
+    DependencyEntry, EventArtifact, EventArtifactStatus, EventSeverity, EventStatus, EventTarget,
+    EventTargetRelationKind, EventTargetStatus, FileSearchHit, Group, NoteEntry, Project,
+    ServiceLink, ServiceLinkKind, ShareEntry, SharedItem, SharedItemKind, SyncReport,
+    WorkspaceConfig, WorkspaceEvent, WorkspaceEventKind, normalize_project_slug,
 };
 use crate::path::normalize_portable_rel_path;
 
@@ -25,6 +26,12 @@ pub struct SharedItemUpdate {
     /// None = don't change, Some(None) = clear, Some(Some(x)) = set
     pub label: Option<Option<String>>,
     pub scope_change: Option<ScopeChange>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodeGraphEdgeDirection {
+    Incoming,
+    Outgoing,
 }
 
 #[derive(Debug, Clone)]
@@ -2846,6 +2853,611 @@ impl Db {
         })?;
         let out = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(out)
+    }
+
+    // --- CodeGraph index ---
+
+    pub fn replace_code_graph_file(
+        &self,
+        file: &CodeFile,
+        nodes: &[CodeNode],
+        edges: &[CodeEdge],
+        unresolved_refs: &[CodeUnresolvedRef],
+    ) -> Result<()> {
+        debug!(
+            "codegraph replace start: project_id={} path={} nodes={} edges={} unresolved={}",
+            file.project_id,
+            file.path,
+            nodes.len(),
+            edges.len(),
+            unresolved_refs.len()
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        Self::delete_code_graph_file_in_tx(&tx, file.project_id, &file.path)?;
+
+        tx.execute(
+            "INSERT INTO code_files (
+                 project_id,
+                 path,
+                 language,
+                 content_hash,
+                 size,
+                 mtime,
+                 indexed_at,
+                 node_count,
+                 errors_json
+             )
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, datetime('now'), ?7, ?8)",
+            params![
+                file.project_id,
+                file.path.as_str(),
+                file.language.as_str(),
+                file.content_hash.as_str(),
+                file.size,
+                file.mtime,
+                nodes.len() as i64,
+                file.errors_json.as_deref()
+            ],
+        )
+        .with_context(|| {
+            format!(
+                "SQL failure during codegraph replace_file project_id={} path='{}'",
+                file.project_id, file.path
+            )
+        })?;
+
+        for node in nodes {
+            tx.execute(
+                "INSERT INTO code_nodes (
+                     stable_id,
+                     project_id,
+                     kind,
+                     name,
+                     qualified_name,
+                     file_path,
+                     language,
+                     start_line,
+                     start_column,
+                     end_line,
+                     end_column,
+                     docstring,
+                     signature,
+                     visibility,
+                     flags_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+                params![
+                    node.stable_id.as_str(),
+                    node.project_id,
+                    node.kind.as_str(),
+                    node.name.as_str(),
+                    node.qualified_name.as_str(),
+                    node.file_path.as_str(),
+                    node.language.as_str(),
+                    node.start_line,
+                    node.start_column,
+                    node.end_line,
+                    node.end_column,
+                    node.docstring.as_deref(),
+                    node.signature.as_deref(),
+                    node.visibility.as_deref(),
+                    node.flags_json.as_deref()
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "SQL failure inserting codegraph node project_id={} node_id='{}'",
+                    node.project_id, node.stable_id
+                )
+            })?;
+            tx.execute(
+                "INSERT INTO code_nodes_fts (
+                     stable_id,
+                     name,
+                     qualified_name,
+                     docstring,
+                     signature
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    node.stable_id.as_str(),
+                    node.name.as_str(),
+                    node.qualified_name.as_str(),
+                    node.docstring.as_deref().unwrap_or(""),
+                    node.signature.as_deref().unwrap_or("")
+                ],
+            )?;
+        }
+
+        for edge in edges {
+            tx.execute(
+                "INSERT INTO code_edges (
+                     project_id,
+                     source_node_id,
+                     target_node_id,
+                     kind,
+                     line,
+                     column,
+                     metadata_json,
+                     provenance
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    edge.project_id,
+                    edge.source_node_id.as_str(),
+                    edge.target_node_id.as_str(),
+                    edge.kind.as_str(),
+                    edge.line,
+                    edge.column,
+                    edge.metadata_json.as_deref(),
+                    edge.provenance.as_str()
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "SQL failure inserting codegraph edge project_id={} source='{}' target='{}'",
+                    edge.project_id, edge.source_node_id, edge.target_node_id
+                )
+            })?;
+        }
+
+        for unresolved in unresolved_refs {
+            tx.execute(
+                "INSERT INTO code_unresolved_refs (
+                     project_id,
+                     source_node_id,
+                     file_path,
+                     ref_name,
+                     kind,
+                     line,
+                     column,
+                     metadata_json
+                 )
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    unresolved.project_id,
+                    unresolved.source_node_id.as_str(),
+                    unresolved.file_path.as_str(),
+                    unresolved.ref_name.as_str(),
+                    unresolved.kind.as_str(),
+                    unresolved.line,
+                    unresolved.column,
+                    unresolved.metadata_json.as_deref()
+                ],
+            )
+            .with_context(|| {
+                format!(
+                    "SQL failure inserting codegraph unresolved ref project_id={} file='{}'",
+                    unresolved.project_id, unresolved.file_path
+                )
+            })?;
+        }
+
+        tx.commit()?;
+        info!(
+            "codegraph replace complete: project_id={} path={} nodes={} edges={} unresolved={}",
+            file.project_id,
+            file.path,
+            nodes.len(),
+            edges.len(),
+            unresolved_refs.len()
+        );
+        Ok(())
+    }
+
+    pub fn clear_code_graph_project(&self, project_id: i64) -> Result<()> {
+        info!("codegraph clear project_id={}", project_id);
+        let tx = self.conn.unchecked_transaction()?;
+        let files = tx.execute(
+            "DELETE FROM code_files WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let edges = tx.execute(
+            "DELETE FROM code_edges WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let unresolved = tx.execute(
+            "DELETE FROM code_unresolved_refs WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        let nodes = tx.execute(
+            "DELETE FROM code_nodes WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.commit()?;
+        info!(
+            "codegraph clear complete: project_id={} files={} nodes={} edges={} unresolved={}",
+            project_id, files, nodes, edges, unresolved
+        );
+        Ok(())
+    }
+
+    pub fn delete_code_graph_file(&self, project_id: i64, file_path: &str) -> Result<()> {
+        debug!(
+            "codegraph delete file: project_id={} path={}",
+            project_id, file_path
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        Self::delete_code_graph_file_in_tx(&tx, project_id, file_path)?;
+        tx.commit()?;
+        info!(
+            "codegraph file deleted: project_id={} path={}",
+            project_id, file_path
+        );
+        Ok(())
+    }
+
+    fn delete_code_graph_file_in_tx(
+        tx: &rusqlite::Transaction<'_>,
+        project_id: i64,
+        file_path: &str,
+    ) -> Result<()> {
+        let mut stmt = tx
+            .prepare("SELECT stable_id FROM code_nodes WHERE project_id = ?1 AND file_path = ?2")?;
+        let node_ids = stmt
+            .query_map(params![project_id, file_path], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        drop(stmt);
+
+        for node_id in &node_ids {
+            tx.execute(
+                "DELETE FROM code_edges
+                 WHERE project_id = ?1
+                   AND (source_node_id = ?2 OR target_node_id = ?2)",
+                params![project_id, node_id],
+            )?;
+            tx.execute(
+                "DELETE FROM code_unresolved_refs
+                 WHERE project_id = ?1 AND source_node_id = ?2",
+                params![project_id, node_id],
+            )?;
+        }
+
+        tx.execute(
+            "DELETE FROM code_nodes WHERE project_id = ?1 AND file_path = ?2",
+            params![project_id, file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM code_files WHERE project_id = ?1 AND path = ?2",
+            params![project_id, file_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_code_file_meta(
+        &self,
+        project_id: i64,
+        file_path: &str,
+    ) -> Result<Option<(String, i64, i64)>> {
+        debug!(
+            "codegraph meta lookup: project_id={} path={}",
+            project_id, file_path
+        );
+        let row = self
+            .conn
+            .query_row(
+                "SELECT content_hash, size, mtime
+                 FROM code_files
+                 WHERE project_id = ?1 AND path = ?2",
+                params![project_id, file_path],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .ok();
+        Ok(row)
+    }
+
+    pub fn list_code_file_paths(&self, project_id: i64) -> Result<Vec<String>> {
+        debug!("codegraph list files: project_id={}", project_id);
+        let mut stmt = self
+            .conn
+            .prepare("SELECT path FROM code_files WHERE project_id = ?1 ORDER BY path")?;
+        let rows = stmt.query_map(params![project_id], |row| row.get::<_, String>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn code_graph_stats(&self, project_id: i64) -> Result<CodeGraphStats> {
+        debug!("codegraph stats: project_id={}", project_id);
+        let file_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM code_files WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let node_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM code_nodes WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let edge_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM code_edges WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let unresolved_ref_count = self.conn.query_row(
+            "SELECT COUNT(*) FROM code_unresolved_refs WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        let last_indexed_at = self.conn.query_row(
+            "SELECT MAX(indexed_at) FROM code_files WHERE project_id = ?1",
+            params![project_id],
+            |row| row.get(0),
+        )?;
+        Ok(CodeGraphStats {
+            project_id,
+            file_count,
+            node_count,
+            edge_count,
+            unresolved_ref_count,
+            last_indexed_at,
+        })
+    }
+
+    pub fn search_code_nodes(
+        &self,
+        project_id: i64,
+        search: &CodeNodeSearch,
+    ) -> Result<Vec<CodeGraphSearchHit>> {
+        debug!(
+            "codegraph search: project_id={} query={:?} kind={:?} language={:?} file_path={:?} limit={}",
+            project_id, search.query, search.kind, search.language, search.file_path, search.limit
+        );
+        let limit = if search.limit == 0 {
+            20
+        } else {
+            search.limit.min(200)
+        };
+
+        if let Some(query) = search
+            .query
+            .as_deref()
+            .filter(|query| !query.trim().is_empty())
+        {
+            let mut conditions = vec![
+                "n.project_id = ?".to_string(),
+                "code_nodes_fts MATCH ?".to_string(),
+            ];
+            let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![
+                Box::new(project_id),
+                Box::new(Self::sanitize_fts_query(query)),
+            ];
+            if let Some(kind) = search.kind {
+                conditions.push("n.kind = ?".to_string());
+                values.push(Box::new(kind.as_str().to_string()));
+            }
+            if let Some(language) = search.language.as_deref() {
+                conditions.push("n.language = ?".to_string());
+                values.push(Box::new(language.to_string()));
+            }
+            if let Some(file_path) = search.file_path.as_deref() {
+                conditions.push("n.file_path = ?".to_string());
+                values.push(Box::new(file_path.to_string()));
+            }
+            values.push(Box::new(limit as i64));
+
+            let sql = format!(
+                "SELECT n.stable_id, n.project_id, n.kind, n.name, n.qualified_name,
+                        n.file_path, n.language, n.start_line, n.start_column, n.end_line,
+                        n.end_column, n.docstring, n.signature, n.visibility, n.flags_json,
+                        bm25(code_nodes_fts)
+                 FROM code_nodes_fts f
+                 JOIN code_nodes n ON n.stable_id = f.stable_id
+                 WHERE {}
+                 ORDER BY bm25(code_nodes_fts), n.qualified_name
+                 LIMIT ?",
+                conditions.join(" AND ")
+            );
+            let mut stmt = self.conn.prepare(&sql)?;
+            let rows = stmt.query_map(
+                params_from_iter(values.iter().map(|value| value.as_ref())),
+                |row| {
+                    Ok(CodeGraphSearchHit {
+                        node: Self::map_code_node_from_columns(row)?,
+                        rank: row.get(15)?,
+                    })
+                },
+            )?;
+            return Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?);
+        }
+
+        let mut conditions = vec!["project_id = ?".to_string()];
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id)];
+        if let Some(kind) = search.kind {
+            conditions.push("kind = ?".to_string());
+            values.push(Box::new(kind.as_str().to_string()));
+        }
+        if let Some(language) = search.language.as_deref() {
+            conditions.push("language = ?".to_string());
+            values.push(Box::new(language.to_string()));
+        }
+        if let Some(file_path) = search.file_path.as_deref() {
+            conditions.push("file_path = ?".to_string());
+            values.push(Box::new(file_path.to_string()));
+        }
+        values.push(Box::new(limit as i64));
+        let sql = format!(
+            "SELECT stable_id, project_id, kind, name, qualified_name,
+                    file_path, language, start_line, start_column, end_line,
+                    end_column, docstring, signature, visibility, flags_json
+             FROM code_nodes
+             WHERE {}
+             ORDER BY qualified_name
+             LIMIT ?",
+            conditions.join(" AND ")
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            |row| {
+                Ok(CodeGraphSearchHit {
+                    node: Self::map_code_node_from_columns(row)?,
+                    rank: None,
+                })
+            },
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn get_code_node(&self, project_id: i64, stable_id: &str) -> Result<Option<CodeNode>> {
+        debug!(
+            "codegraph node lookup: project_id={} stable_id={}",
+            project_id, stable_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT stable_id, project_id, kind, name, qualified_name,
+                    file_path, language, start_line, start_column, end_line,
+                    end_column, docstring, signature, visibility, flags_json
+             FROM code_nodes
+             WHERE project_id = ?1 AND stable_id = ?2",
+        )?;
+        let mut rows = stmt.query_map(params![project_id, stable_id], |row| {
+            Self::map_code_node_from_columns(row)
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn find_code_nodes_by_name(
+        &self,
+        project_id: i64,
+        name_or_qualified_name: &str,
+        limit: usize,
+    ) -> Result<Vec<CodeNode>> {
+        debug!(
+            "codegraph exact lookup: project_id={} name={}",
+            project_id, name_or_qualified_name
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT stable_id, project_id, kind, name, qualified_name,
+                    file_path, language, start_line, start_column, end_line,
+                    end_column, docstring, signature, visibility, flags_json
+             FROM code_nodes
+             WHERE project_id = ?1 AND (name = ?2 OR qualified_name = ?2)
+             ORDER BY qualified_name
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![project_id, name_or_qualified_name, limit.min(200) as i64],
+            Self::map_code_node_from_columns,
+        )?;
+        let nodes = rows.collect::<std::result::Result<Vec<_>, _>>()?;
+        if nodes.len() > 1 {
+            warn!(
+                "codegraph exact lookup returned {} matches for project_id={} name={}",
+                nodes.len(),
+                project_id,
+                name_or_qualified_name
+            );
+        }
+        Ok(nodes)
+    }
+
+    pub fn list_code_nodes_for_project(&self, project_id: i64) -> Result<Vec<CodeNode>> {
+        debug!("codegraph list nodes: project_id={}", project_id);
+        let mut stmt = self.conn.prepare(
+            "SELECT stable_id, project_id, kind, name, qualified_name,
+                    file_path, language, start_line, start_column, end_line,
+                    end_column, docstring, signature, visibility, flags_json
+             FROM code_nodes
+             WHERE project_id = ?1
+             ORDER BY qualified_name",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Self::map_code_node_from_columns(row)
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_code_edges(
+        &self,
+        project_id: i64,
+        node_id: &str,
+        direction: CodeGraphEdgeDirection,
+        kind: Option<CodeEdgeKind>,
+        limit: usize,
+    ) -> Result<Vec<CodeEdge>> {
+        debug!(
+            "codegraph edge query: project_id={} node_id={} direction={:?} kind={:?} limit={}",
+            project_id, node_id, direction, kind, limit
+        );
+        let id_column = match direction {
+            CodeGraphEdgeDirection::Outgoing => "source_node_id",
+            CodeGraphEdgeDirection::Incoming => "target_node_id",
+        };
+        let mut values: Vec<Box<dyn rusqlite::ToSql>> =
+            vec![Box::new(project_id), Box::new(node_id.to_string())];
+        let kind_clause = if let Some(kind) = kind {
+            values.push(Box::new(kind.as_str().to_string()));
+            " AND kind = ?"
+        } else {
+            ""
+        };
+        values.push(Box::new(limit.min(200) as i64));
+        let sql = format!(
+            "SELECT id, project_id, source_node_id, target_node_id, kind,
+                    line, column, metadata_json, provenance
+             FROM code_edges
+             WHERE project_id = ? AND {id_column} = ?{kind_clause}
+             ORDER BY kind, id
+             LIMIT ?"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(
+            params_from_iter(values.iter().map(|value| value.as_ref())),
+            Self::map_code_edge,
+        )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn sanitize_fts_query(query: &str) -> String {
+        query
+            .split_whitespace()
+            .map(|term| format!("\"{}\"", term.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn map_code_node_from_columns(row: &Row<'_>) -> rusqlite::Result<CodeNode> {
+        Ok(CodeNode {
+            stable_id: row.get(0)?,
+            project_id: row.get(1)?,
+            kind: parse_row_enum(row, 2)?,
+            name: row.get(3)?,
+            qualified_name: row.get(4)?,
+            file_path: row.get(5)?,
+            language: row.get(6)?,
+            start_line: row.get(7)?,
+            start_column: row.get(8)?,
+            end_line: row.get(9)?,
+            end_column: row.get(10)?,
+            docstring: row.get(11)?,
+            signature: row.get(12)?,
+            visibility: row.get(13)?,
+            flags_json: row.get(14)?,
+        })
+    }
+
+    fn map_code_edge(row: &Row<'_>) -> rusqlite::Result<CodeEdge> {
+        Ok(CodeEdge {
+            id: row.get(0)?,
+            project_id: row.get(1)?,
+            source_node_id: row.get(2)?,
+            target_node_id: row.get(3)?,
+            kind: parse_row_enum(row, 4)?,
+            line: row.get(5)?,
+            column: row.get(6)?,
+            metadata_json: row.get(7)?,
+            provenance: row.get(8)?,
+        })
     }
 
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).

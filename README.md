@@ -6,6 +6,8 @@ AI coding agents (Claude Code, Cursor, Windsurf, etc.) are powerful — but they
 
 AI Workspace fixes that. It's a lightweight CLI + [MCP server](https://modelcontextprotocol.io) that lets you share files, directories, and notes across related projects. Your agents get cross-project context automatically — no copy-pasting, no symlinks, no custom prompts.
 
+It also includes a local Rust-only CodeGraph MVP: registered projects can index shared Rust source scopes into SQLite as files, symbols, and call relationships, then expose that structure to agents through CLI and MCP tools.
+
 ## How it works
 
 ```
@@ -88,7 +90,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 11 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`.
+That's it. The agent now has access to 17 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
 By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
@@ -117,6 +119,11 @@ Once connected, you can talk to your AI agent naturally. Here are some examples:
 - *"List the files under the shared src/ directory in project 2"*
 - *"Search the api project's shared files for any function that mentions 'auth'"*
 - *"Grep the web project's shared files for TODO comments"*
+
+**Use Rust CodeGraph:**
+- *"Use CodeGraph to find callers of the auth token parser"*
+- *"Get compact code context for changing the workspace search flow"*
+- *"Search indexed Rust symbols named `sync_project` before grepping files"*
 
 **Cross-project tasks:**
 - *"I'm building a new endpoint — check the shared API schema and follow the same patterns"*
@@ -149,6 +156,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `sync` | Clean up stale files + reconcile workspace JSON |
 | `search <query>` | Full-text search over shared `.md` files (FTS5, bm25-ranked) |
 | `reindex` | Rebuild the full-text index for all shared `.md` files |
+| `codegraph reindex/sync/status/search` | Build and inspect a local Rust-only code graph |
 | `serve` | Start the MCP server |
 | `update` | Update to the latest version |
 

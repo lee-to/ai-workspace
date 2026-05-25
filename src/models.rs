@@ -201,6 +201,39 @@ string_enum! {
     }
 }
 
+string_enum! {
+    pub enum CodeNodeKind {
+        File => "file",
+        Module => "module",
+        Struct => "struct",
+        Enum => "enum",
+        Trait => "trait",
+        Impl => "impl",
+        Function => "function",
+        Method => "method",
+        Const => "const",
+        TypeAlias => "type_alias",
+        Import => "import",
+    }
+}
+
+string_enum! {
+    pub enum CodeEdgeKind {
+        Contains => "contains",
+        Calls => "calls",
+        Imports => "imports",
+        References => "references",
+    }
+}
+
+string_enum! {
+    pub enum CodeReferenceKind {
+        Calls => "calls",
+        Imports => "imports",
+        References => "references",
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[allow(dead_code)]
 pub struct ServiceLink {
@@ -299,6 +332,89 @@ pub struct FileSearchHit {
     pub snippet: String,
     /// bm25 score — lower is better (SQLite FTS5 convention).
     pub rank: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeFile {
+    pub project_id: i64,
+    pub path: String,
+    pub language: String,
+    pub content_hash: String,
+    pub size: i64,
+    pub mtime: i64,
+    pub indexed_at: String,
+    pub node_count: i64,
+    pub errors_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeNode {
+    pub stable_id: String,
+    pub project_id: i64,
+    pub kind: CodeNodeKind,
+    pub name: String,
+    pub qualified_name: String,
+    pub file_path: String,
+    pub language: String,
+    pub start_line: i64,
+    pub start_column: i64,
+    pub end_line: i64,
+    pub end_column: i64,
+    pub docstring: Option<String>,
+    pub signature: Option<String>,
+    pub visibility: Option<String>,
+    pub flags_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeEdge {
+    pub id: Option<i64>,
+    pub project_id: i64,
+    pub source_node_id: String,
+    pub target_node_id: String,
+    pub kind: CodeEdgeKind,
+    pub line: Option<i64>,
+    pub column: Option<i64>,
+    pub metadata_json: Option<String>,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeUnresolvedRef {
+    pub id: Option<i64>,
+    pub project_id: i64,
+    pub source_node_id: String,
+    pub file_path: String,
+    pub ref_name: String,
+    pub kind: CodeReferenceKind,
+    pub line: i64,
+    pub column: i64,
+    pub metadata_json: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CodeGraphStats {
+    pub project_id: i64,
+    pub file_count: i64,
+    pub node_count: i64,
+    pub edge_count: i64,
+    pub unresolved_ref_count: i64,
+    pub last_indexed_at: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CodeGraphSearchHit {
+    pub node: CodeNode,
+    pub rank: Option<f64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct CodeNodeSearch {
+    pub query: Option<String>,
+    pub kind: Option<CodeNodeKind>,
+    pub language: Option<String>,
+    pub file_path: Option<String>,
+    pub limit: usize,
 }
 
 // --- Workspace Config (for .ai-workspace.json) ---

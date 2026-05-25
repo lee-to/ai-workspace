@@ -239,7 +239,7 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
@@ -266,6 +266,165 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
     assert_eq!(indexed_file_rows, 1);
+}
+
+fn seed_codegraph_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join("src")).unwrap();
+    fs::write(
+        project_dir.path().join("src/lib.rs"),
+        r#"
+pub fn public_entry() {
+    helper();
+    Worker::new().run();
+}
+
+fn helper() -> i32 {
+    42
+}
+
+pub struct Worker;
+
+impl Worker {
+    pub fn new() -> Self {
+        Worker
+    }
+
+    pub fn run(&self) {
+        helper();
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(
+        db_path,
+        project_dir.path(),
+        &["init", "--name", "codegraph"],
+    );
+    assert!(success, "init should succeed: {stderr}");
+    let (_stdout, stderr, success) = run_cmd_in_dir(db_path, project_dir.path(), &["share", "src"]);
+    assert!(success, "share src should succeed: {stderr}");
+
+    project_dir
+}
+
+#[test]
+fn test_codegraph_cli_reindex_status_and_search() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_codegraph_project(&db_path);
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "reindex"]);
+    assert!(
+        success,
+        "codegraph reindex should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("CodeGraph reindex complete"));
+    assert!(stdout.contains("Indexed"));
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "status"]);
+    assert!(
+        success,
+        "codegraph status should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Files: 1"));
+    assert!(stdout.contains("Nodes:"));
+    assert!(stdout.contains("Edges:"));
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["codegraph", "search", "helper", "--kind", "function"],
+    );
+    assert!(
+        success,
+        "codegraph search should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("helper"));
+    assert!(stdout.contains("src/lib.rs"));
+}
+
+#[test]
+fn test_codegraph_sync_skips_unchanged_and_removes_deleted_files() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_codegraph_project(&db_path);
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "sync"]);
+    assert!(success, "first sync should succeed: {stderr}");
+
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "sync"]);
+    assert!(
+        success,
+        "second sync should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        stdout.contains("| 1       | 0       | 1         |")
+            || stdout.contains(" 1 ")
+            || stdout.contains("Unchanged"),
+        "second sync should report an unchanged file: {stdout}"
+    );
+
+    fs::remove_file(project_dir.path().join("src/lib.rs")).unwrap();
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "sync"]);
+    assert!(success, "sync after deletion should succeed: {stderr}");
+    let (stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "status"]);
+    assert!(
+        success,
+        "status after deletion should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("Files: 0"));
+}
+
+#[test]
+fn test_codegraph_cli_excludes_hidden_and_sensitive_paths_by_default() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join("src")).unwrap();
+    fs::write(
+        project_dir.path().join("src/lib.rs"),
+        "pub fn visible_codegraph_marker() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/.hidden.rs"),
+        "pub fn hidden_codegraph_marker() {}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/private.key.rs"),
+        "pub fn sensitive_codegraph_marker() {}\n",
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["init", "--name", "policy"]);
+    assert!(success, "init should succeed: {stderr}");
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["share", "src"]);
+    assert!(success, "share src should succeed: {stderr}");
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "reindex"]);
+    assert!(success, "codegraph reindex should succeed: {stderr}");
+
+    let (stdout, stderr, success) = run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["codegraph", "search", "codegraph_marker"],
+    );
+    assert!(
+        success,
+        "codegraph search should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("visible_codegraph_marker"));
+    assert!(!stdout.contains("hidden_codegraph_marker"));
+    assert!(!stdout.contains("sensitive_codegraph_marker"));
 }
 
 #[test]

@@ -22,6 +22,7 @@ Commands that operate on the "current project" must be run inside an initialized
 - `destroy` without a target
 - `status`
 - `export`
+- `codegraph reindex/sync/status/search` when `--project` is not provided
 
 If no project matches the current directory, these commands fail with:
 `No project found for current directory. Run ai-workspace init first.`
@@ -34,6 +35,7 @@ Commands that work from any directory (no project required):
 - `sync`
 - `search`
 - `reindex`
+- `codegraph reindex/sync/status/search --project <id-or-slug>`
 - `serve`
 - `update`
 
@@ -276,6 +278,41 @@ Accepted status filters:
 - `closed`
 
 `event inbox` must run inside a project and shows open events affecting that project.
+
+### `codegraph`
+
+Index and inspect a local Rust-only semantic code graph for a registered project.
+
+```bash
+ai-workspace codegraph reindex [--project <id-or-slug>] [--full-project]
+ai-workspace codegraph sync [--project <id-or-slug>] [--full-project]
+ai-workspace codegraph status [--project <id-or-slug>]
+ai-workspace codegraph search <query> [--project <id-or-slug>] [--kind <kind>] [--limit <n>]
+```
+
+| Command | Description |
+|---------|-------------|
+| `codegraph reindex` | Clear and rebuild the Rust graph for the selected project |
+| `codegraph sync` | Incrementally refresh changed Rust files and remove deleted files |
+| `codegraph status` | Show indexed file, node, edge, unresolved-reference counts |
+| `codegraph search` | Search indexed symbols by name, qualified name, docstring, or signature |
+
+By default, CodeGraph indexes Rust files only from explicitly shared file and directory scopes. Use `--full-project` to index all visible, non-sensitive Rust files in the project. Hidden/dotfile paths and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` remain excluded by default.
+
+Accepted `--kind` values:
+- `file`
+- `module`
+- `struct`
+- `enum`
+- `trait`
+- `impl`
+- `function`
+- `method`
+- `const`
+- `type_alias`
+- `import`
+
+The MVP uses a conservative Rust parser fallback, not full compiler-grade name resolution. It detects modules, imports, structs, enums, traits, impl blocks, functions, methods, constants, type aliases, containment edges, and simple call references. Known limitations: no file watcher, no multi-language indexing, no framework route detection, and limited Rust reference resolution.
 
 ### `rm`
 

@@ -199,6 +199,76 @@ Get one event with affected services and affected artifacts.
 
 **Returns:** JSON object with `event`, `affected_services`, and `affected_artifacts`. Artifact entries include path snapshots and recommended reactions.
 
+### CodeGraph tools
+
+The `codegraph_*` tools expose a local Rust-only code graph built by `ai-workspace codegraph reindex` or `ai-workspace codegraph sync`. Prefer these tools before `project_tree`/`project_grep` when the graph is populated and the question is about symbols, callers, callees, or compact task context.
+
+CodeGraph indexing is local SQLite metadata. By default, the CLI indexes only explicitly shared Rust files and directories. Full-project indexing requires `ai-workspace codegraph reindex --full-project` or `sync --full-project`; hidden/dotfile and credential-like paths are still excluded by default.
+
+Known MVP limitations: Rust only, conservative parser fallback instead of compiler-grade parsing, limited reference resolution, no watcher, no framework route detection, and no multi-language indexing.
+
+#### `codegraph_status`
+
+Return graph health and counts for one project.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | no | Project ID |
+| `project` | string | no | Project id, slug, or registered path |
+
+Provide either `project_id` or `project`.
+
+#### `codegraph_search`
+
+Search indexed Rust symbols by text, kind, language, and file path.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | no | Project ID |
+| `project` | string | no | Project id, slug, or registered path |
+| `query` | string | no | Text query over name, qualified name, docstring, and signature |
+| `kind` | string | no | One of `file`, `module`, `struct`, `enum`, `trait`, `impl`, `function`, `method`, `const`, `type_alias`, `import` |
+| `language` | string | no | Language filter; MVP indexes `rust` |
+| `file_path` | string | no | Project-relative path filter |
+| `limit` | integer | no | Maximum results, default 20 |
+
+Returns bounded JSON entries with `node_id`, kind, name, qualified name, file path, line span, signature, and rank.
+
+#### `codegraph_node`
+
+Return one symbol's metadata by stable `node_id`. If a name or qualified name is passed and it resolves to exactly one node, it is accepted as a convenience.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | no | Project ID |
+| `project` | string | no | Project id, slug, or registered path |
+| `node_id` | string | yes | Stable node id from `codegraph_search`, or an unambiguous symbol name |
+| `include_source` | boolean | no | Include a bounded source snippet around the symbol |
+
+#### `codegraph_callers` and `codegraph_callees`
+
+Return incoming or outgoing `calls` edges for a symbol.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | no | Project ID |
+| `project` | string | no | Project id, slug, or registered path |
+| `node_id` | string | yes | Stable node id |
+| `limit` | integer | no | Maximum edges, default 20 |
+
+Each edge includes source/target node IDs, call location, and compact related-node metadata.
+
+#### `codegraph_context`
+
+Return compact task context from indexed symbols. The tool searches the task description, falls back to meaningful individual terms when the full phrase has no match, and returns entry symbols with small snippets plus caller/callee counts.
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | no | Project ID |
+| `project` | string | no | Project id, slug, or registered path |
+| `task` | string | yes | Task or question to search code context for |
+| `limit` | integer | no | Maximum entries, default 8 |
+
 ### `project_tree`
 
 List the shared file tree of a project, respecting `.gitignore` rules. By default this only returns explicitly shared files, explicitly shared directories, and visible ancestors needed to display them. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to list the full project tree.

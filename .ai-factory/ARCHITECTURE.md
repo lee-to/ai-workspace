@@ -1,7 +1,7 @@
 # Architecture: Layered Architecture
 
 ## Overview
-This project uses a layered architecture where each layer has a clear responsibility and depends only on the layers below it. The binary (`ai-workspace`) has two entry points — a CLI interface and an MCP stdio server — both of which delegate to a shared database layer backed by SQLite.
+This project uses a layered architecture where each layer has a clear responsibility and depends only on the layers below it. The binary (`ai-workspace`) has two entry points — a CLI interface and an MCP stdio server — both of which delegate to shared service modules and a database layer backed by SQLite.
 
 This pattern was chosen because the project is a single-binary CLI/MCP tool with an embedded database and low domain complexity. Layered architecture keeps the code simple, navigable, and easy to extend without the ceremony of dependency inversion or bounded contexts.
 
@@ -15,6 +15,9 @@ This pattern was chosen because the project is a single-binary CLI/MCP tool with
 src/
 ├── main.rs             # Entry point: parses CLI args, dispatches to cli or mcp
 ├── models.rs           # Shared data types (Project, Group, SharedItem, SharedItemKind)
+├── codegraph.rs        # Rust CodeGraph extraction/sync service
+├── indexer.rs          # Markdown FTS indexing service
+├── walk.rs             # Shared file walking and grep policy
 ├── cli/
 │   └── mod.rs          # Presentation layer: CLI subcommands and handlers
 ├── db/
@@ -34,19 +37,26 @@ src/
   │   CLI    │     │   MCP    │    ← Presentation layer
   └────┬─────┘     └────┬─────┘
        │                │
-       └───────┬────────┘
-               ▼
+       ├───────┬────────┤
+       ▼       ▼        ▼
+  ┌────────┐ ┌───────────┐
+  │Indexer │ │ CodeGraph │        ← Shared service modules
+  └────┬───┘ └─────┬─────┘
+       └──────┬────┘
+              ▼
         ┌──────────┐
-        │    Db    │               ← Data layer
+        │    Db    │             ← Data layer
         └────┬─────┘
              ▼
         ┌──────────┐
-        │  Models  │               ← Shared types
+        │  Models  │             ← Shared types
         └──────────┘
 ```
 
 - ✅ `cli` → `db`, `models` (CLI handlers call Db methods, use model types)
 - ✅ `mcp` → `db`, `models` (MCP tools call Db methods, serialize model types)
+- ✅ `cli`/`mcp` → `codegraph`, `indexer`, `walk` (presentation layers may call shared service modules)
+- ✅ `codegraph`/`indexer` → `db`, `models`, `walk` (services enforce file policy and use Db APIs)
 - ✅ `db` → `models` (CRUD returns model structs)
 - ❌ `db` → `cli` or `mcp` (data layer must not know about presentation)
 - ❌ `cli` → `mcp` or `mcp` → `cli` (presentation layers are independent)
@@ -55,6 +65,7 @@ src/
 ## Layer/Module Communication
 - **CLI → Db**: CLI handlers create a `Db` instance and call methods directly (`db.add_project()`, `db.share_file()`)
 - **MCP → Db**: MCP tool handlers create a `Db` instance and call the same methods, serializing results as JSON-RPC responses
+- **CLI/MCP → CodeGraph**: CLI runs indexing/sync orchestration; MCP reads graph query APIs and can request bounded source snippets through `codegraph.rs`
 - **Models as shared language**: Both layers use the same `Project`, `Group`, `SharedItem` types — no DTOs needed at this scale
 
 ## Key Principles

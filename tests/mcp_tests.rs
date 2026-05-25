@@ -268,7 +268,7 @@ fn test_mcp_migrates_legacy_database_and_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 4);
+    assert_eq!(version, 5);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
@@ -423,6 +423,61 @@ fn share_path(db_path: &PathBuf, project_dir: &Path, path: &str, label: &str) {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn run_cli_for_mcp_seed(db_path: &PathBuf, project_dir: &Path, args: &[&str]) {
+    let output = Command::new(binary_path())
+        .args(args)
+        .current_dir(project_dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("seed command failed");
+    assert!(
+        output.status.success(),
+        "seed command failed: {:?}\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn seed_codegraph_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(project_dir.path().join("src")).unwrap();
+    std::fs::write(
+        project_dir.path().join("src/lib.rs"),
+        r#"
+pub fn public_entry() {
+    helper();
+    Worker::new().run();
+}
+
+fn helper() -> i32 {
+    42
+}
+
+pub struct Worker;
+
+impl Worker {
+    pub fn new() -> Self {
+        Worker
+    }
+
+    pub fn run(&self) {
+        helper();
+    }
+}
+"#,
+    )
+    .unwrap();
+    run_cli_for_mcp_seed(
+        db_path,
+        project_dir.path(),
+        &["init", "--name", "codegraph"],
+    );
+    run_cli_for_mcp_seed(db_path, project_dir.path(), &["share", "src"]);
+    run_cli_for_mcp_seed(db_path, project_dir.path(), &["codegraph", "reindex"]);
+    project_dir
 }
 
 fn seed_service_event_data(db_path: &PathBuf) -> (tempfile::TempDir, tempfile::TempDir) {
@@ -723,6 +778,12 @@ fn test_mcp_tools_list() {
     assert!(tool_names.contains(&"workspace_service_graph"));
     assert!(tool_names.contains(&"workspace_events"));
     assert!(tool_names.contains(&"workspace_event_details"));
+    assert!(tool_names.contains(&"codegraph_status"));
+    assert!(tool_names.contains(&"codegraph_search"));
+    assert!(tool_names.contains(&"codegraph_node"));
+    assert!(tool_names.contains(&"codegraph_callers"));
+    assert!(tool_names.contains(&"codegraph_callees"));
+    assert!(tool_names.contains(&"codegraph_context"));
 
     for name in ["workspace_read", "project_tree", "project_grep"] {
         let tool = tools
@@ -739,6 +800,162 @@ fn test_mcp_tools_list() {
             "{name} should expose include_sensitive"
         );
     }
+}
+
+#[test]
+fn test_mcp_codegraph_search_node_and_edges() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_codegraph_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": {
+                    "project_id": 1,
+                    "query": "helper",
+                    "kind": "function"
+                }
+            }
+        })],
+    );
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: serde_json::Value = serde_json::from_str(content).unwrap();
+    let helper_node_id = results[0]["node_id"].as_str().unwrap().to_string();
+    assert_eq!(results[0]["name"], "helper");
+    assert_eq!(results[0]["file_path"], "src/lib.rs");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_node",
+                "arguments": {
+                    "project_id": 1,
+                    "node_id": helper_node_id,
+                    "include_source": true
+                }
+            }
+        })],
+    );
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("fn helper"));
+    assert!(content.contains("\"source\""));
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_callers",
+                "arguments": {
+                    "project_id": 1,
+                    "node_id": helper_node_id
+                }
+            }
+        })],
+    );
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(content.contains("public_entry"));
+}
+
+#[test]
+fn test_mcp_codegraph_status_context_and_callees() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_codegraph_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_status",
+                    "arguments": { "project_id": 1 }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": {
+                        "project_id": 1,
+                        "query": "public_entry",
+                        "kind": "function"
+                    }
+                }
+            }),
+        ],
+    );
+    let status_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(status_text.contains("\"file_count\": 1"));
+    assert!(status_text.contains("\"edge_count\""));
+
+    let search_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: serde_json::Value = serde_json::from_str(search_text).unwrap();
+    let entry_node_id = results[0]["node_id"].as_str().unwrap().to_string();
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_callees",
+                    "arguments": {
+                        "project_id": 1,
+                        "node_id": entry_node_id
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_context",
+                    "arguments": {
+                        "project_id": 1,
+                        "task": "change helper behavior"
+                    }
+                }
+            }),
+        ],
+    );
+    let callees_text = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(callees_text.contains("helper"));
+    let context_text = responses[1]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    assert!(context_text.contains("helper"));
+    assert!(context_text.contains("snippet"));
 }
 
 #[test]
