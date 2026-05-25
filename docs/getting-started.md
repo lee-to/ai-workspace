@@ -111,7 +111,7 @@ Both projects now belong to the `backend` group.
 
 Key project files (`README*`, `Cargo.toml`, `package.json`, `go.mod`, etc.) are automatically shared on first `init` — no manual `share` needed for common files. This auto-share is skipped when the configured workspace JSON is present.
 
-If the configured workspace JSON exists, `init` also reads the optional project `slug`, shared entry `kind`, and shared entry `dependencies` metadata. This lets a committed config restore directory shares and artifact dependencies without exporting event history. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` if your repo keeps AI files under `.ai`. The configured JSON path and configured shared paths must resolve inside the project directory; absolute config paths, unsafe relative paths, symlink escapes, and final config-path symlinks are rejected. Existing ordinary files at the configured JSON path are not adopted or overwritten.
+If the configured workspace JSON exists, `init` also reads the optional project `slug`, shared entry `kind`, and shared entry `dependencies` metadata. This lets a committed config restore directory shares and artifact dependencies without exporting event history. Use `--config .ai/ai-workspace.json` or `AI_WORKSPACE_CONFIG=.ai/ai-workspace.json` if your repo keeps AI files under `.ai`. The configured JSON path and configured shared paths must resolve inside the project directory; absolute config paths, unsafe relative paths, symlink escapes, and final config-path symlinks are rejected. Config share entries are literal paths, not glob patterns; use `"docs"` rather than `"docs/**"` to share a directory. Existing ordinary files at the configured JSON path are not adopted or overwritten.
 
 ### 2. Share files
 
@@ -158,7 +158,7 @@ ai-workspace serve
 
 The server reads JSON-RPC requests from stdin and writes responses to stdout.
 
-The server exposes 11 tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first. By default, MCP project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`.
+The server exposes 11 tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, and `project_grep`. The `project_tree` and `project_grep` tools let agents navigate any registered project's file tree and search file contents by regex — without needing files to be manually shared first. By default, MCP project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`. `workspace_read`, `project_tree`, and `project_grep` can opt in to those paths; `workspace_search_fulltext` always excludes hidden or credential-like `.md` paths.
 
 ## Data Storage
 

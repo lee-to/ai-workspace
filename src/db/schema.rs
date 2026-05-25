@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::models::normalize_project_slug;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -91,7 +91,11 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
             migrate_to_indexed_files(conn)
         }
         5 => {
-            debug!("Migration v5: add Rust code graph tables");
+            debug!("Migration v5: add event group snapshots");
+            migrate_to_event_groups(conn)
+        }
+        6 => {
+            debug!("Migration v6: add Rust code graph tables");
             ensure_codegraph_schema_objects(conn)
         }
         _ => {
@@ -386,6 +390,13 @@ fn ensure_event_schema_objects(conn: &Connection) -> Result<()> {
             updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS event_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES workspace_events(id) ON DELETE CASCADE,
+            group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+            UNIQUE (event_id, group_id)
+        );
+
         CREATE TABLE IF NOT EXISTS event_targets (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             event_id INTEGER NOT NULL REFERENCES workspace_events(id) ON DELETE CASCADE,
@@ -416,6 +427,8 @@ fn ensure_event_schema_objects(conn: &Connection) -> Result<()> {
         CREATE INDEX IF NOT EXISTS idx_artifact_dependencies_project ON artifact_dependencies(depends_on_project_id);
         CREATE INDEX IF NOT EXISTS idx_workspace_events_source ON workspace_events(source_project_id);
         CREATE INDEX IF NOT EXISTS idx_workspace_events_status ON workspace_events(status);
+        CREATE INDEX IF NOT EXISTS idx_event_groups_event ON event_groups(event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_groups_group ON event_groups(group_id);
         CREATE INDEX IF NOT EXISTS idx_event_targets_event ON event_targets(event_id);
         CREATE INDEX IF NOT EXISTS idx_event_targets_project ON event_targets(affected_project_id);
         CREATE INDEX IF NOT EXISTS idx_event_artifacts_event ON event_artifacts(event_id);
@@ -428,7 +441,7 @@ fn ensure_event_schema_objects(conn: &Connection) -> Result<()> {
 }
 
 fn ensure_codegraph_schema_objects(conn: &Connection) -> Result<()> {
-    debug!("Migration v5: creating code graph tables, indexes, and FTS objects");
+    debug!("Migration v6: creating code graph tables, indexes, and FTS objects");
     execute_schema_step(
         conn,
         "codegraph tables, indexes, and FTS",
@@ -545,6 +558,29 @@ fn ensure_codegraph_schema_objects(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_to_event_groups(conn: &Connection) -> Result<()> {
+    execute_schema_step(
+        conn,
+        "event group snapshots",
+        "
+        CREATE TABLE IF NOT EXISTS event_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id INTEGER NOT NULL REFERENCES workspace_events(id) ON DELETE CASCADE,
+            group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+            UNIQUE (event_id, group_id)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_event_groups_event ON event_groups(event_id);
+        CREATE INDEX IF NOT EXISTS idx_event_groups_group ON event_groups(group_id);
+
+        INSERT OR IGNORE INTO event_groups (event_id, group_id)
+        SELECT id, group_id
+        FROM workspace_events
+        WHERE group_id IS NOT NULL;
+        ",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -572,6 +608,7 @@ mod tests {
         assert!(tables.contains(&"service_links".to_string()));
         assert!(tables.contains(&"artifact_dependencies".to_string()));
         assert!(tables.contains(&"workspace_events".to_string()));
+        assert!(tables.contains(&"event_groups".to_string()));
         assert!(tables.contains(&"event_targets".to_string()));
         assert!(tables.contains(&"event_artifacts".to_string()));
         assert!(tables.contains(&"code_files".to_string()));
@@ -662,7 +699,89 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, CURRENT_SCHEMA_VERSION);
+        assert_eq!(version, 6);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+    }
+
+    #[test]
+    fn init_db_migrates_event_groups_from_legacy_event_group_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA foreign_keys = ON;
+
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                path TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE groups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE shared_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL,
+                content TEXT,
+                label TEXT
+            );
+
+            CREATE VIRTUAL TABLE notes_fts USING fts5(label, content);
+
+            CREATE TABLE workspace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_project_id INTEGER REFERENCES projects(id) ON DELETE SET NULL,
+                source_project_slug TEXT NOT NULL,
+                source_project_name TEXT NOT NULL,
+                group_id INTEGER REFERENCES groups(id) ON DELETE SET NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('service_deleted', 'service_changed', 'artifact_changed')),
+                title TEXT NOT NULL,
+                body TEXT,
+                severity TEXT NOT NULL CHECK (severity IN ('info', 'warning', 'error', 'critical')) DEFAULT 'info',
+                status TEXT NOT NULL CHECK (status IN ('open', 'closed')) DEFAULT 'open',
+                created_at DATETIME NOT NULL DEFAULT (datetime('now')),
+                updated_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            INSERT INTO projects (id, name, slug, path)
+            VALUES (1, 'API', 'api', '/tmp/api');
+            INSERT INTO groups (id, name) VALUES (10, 'backend');
+            INSERT INTO workspace_events (
+                id,
+                source_project_id,
+                source_project_slug,
+                source_project_name,
+                group_id,
+                kind,
+                title
+            )
+            VALUES (42, 1, 'api', 'API', 10, 'service_changed', 'API changed');
+
+            PRAGMA user_version = 4;
+            ",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 6);
+
+        let group_ids = conn
+            .prepare("SELECT group_id FROM event_groups WHERE event_id = 42 ORDER BY group_id")
+            .unwrap()
+            .query_map([], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(group_ids, vec![10]);
     }
 
     #[test]
@@ -811,6 +930,7 @@ mod tests {
             "service_links",
             "artifact_dependencies",
             "workspace_events",
+            "event_groups",
             "event_targets",
             "event_artifacts",
             "code_files",

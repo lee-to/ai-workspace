@@ -239,7 +239,15 @@ fn test_legacy_database_migrates_and_cli_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
+    let event_group_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event_groups'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_group_table_count, 1);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
@@ -2927,6 +2935,70 @@ fn test_init_reads_json_backslash_and_trailing_share_paths() {
 }
 
 #[test]
+fn test_init_rejects_json_glob_share_path_with_clear_error() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    let config = r#"{
+        "name": "glob",
+        "share": ["docs/**"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        !success,
+        "init should reject glob-like config share path\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        ),
+        "stderr should explain unsupported glob syntax\nstderr:\n{stderr}"
+    );
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["list"]);
+    assert!(success, "list should succeed after rejected init: {stderr}");
+    assert!(
+        !stdout.contains("glob"),
+        "rejected init should not persist project state\nstdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_sync_rejects_json_backslash_glob_share_path_with_clear_error() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+
+    fs::create_dir(project_dir.path().join("docs")).unwrap();
+    run_cmd_in_dir(
+        &db_path,
+        project_dir.path(),
+        &["init", "--name", "glob-sync"],
+    );
+
+    let config = r#"{
+        "name": "glob-sync",
+        "share": ["docs\\**"]
+    }"#;
+    fs::write(project_dir.path().join(".ai-workspace.json"), config).unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["sync"]);
+    assert!(
+        !success,
+        "sync should reject backslash glob-like config share path\nstderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        ),
+        "stderr should explain unsupported glob syntax\nstderr:\n{stderr}"
+    );
+    assert_no_shared_path(&db_path, "docs/**");
+}
+
+#[test]
 fn test_init_rejects_json_share_path_traversal() {
     let (_db_dir, db_path) = temp_db();
     let project_dir = tempfile::tempdir().unwrap();
@@ -3266,6 +3338,80 @@ fn test_sync_with_json() {
     let (stdout, _, _) = run_cmd_in_dir(&db_path, project_dir.path(), &["status"]);
     assert!(stdout.contains("team"));
     assert!(stdout.contains("sync-lbl"));
+}
+
+#[test]
+fn test_init_reports_config_share_metadata_updates() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "old-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(success, "init should succeed\nstderr:\n{stderr}");
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "new-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(
+        success,
+        "init rerun should report share metadata update\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("shares +0 -0 ~1"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("Config already in sync with database."),
+        "stdout:\n{stdout}"
+    );
+}
+
+#[test]
+fn test_sync_reports_config_share_metadata_updates() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::write(project_dir.path().join("README.md"), "# Project").unwrap();
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "old-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["init"]);
+    assert!(success, "init should succeed\nstderr:\n{stderr}");
+    fs::write(
+        project_dir.path().join(".ai-workspace.json"),
+        r#"{
+            "name": "proj",
+            "share": [{"path": "README.md", "label": "new-readme", "kind": "file"}]
+        }"#,
+    )
+    .unwrap();
+
+    let (stdout, stderr, success) = run_cmd_in_dir(&db_path, project_dir.path(), &["sync"]);
+    assert!(
+        success,
+        "sync should report share metadata update\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(stdout.contains("shares +0 -0 ~1"), "stdout:\n{stdout}");
+    assert!(
+        !stdout.contains("Config is in sync with database."),
+        "stdout:\n{stdout}"
+    );
 }
 
 // --- Auto-share on init ---

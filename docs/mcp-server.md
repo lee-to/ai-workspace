@@ -10,11 +10,33 @@ ai-workspace serve
 
 ## Configuration
 
+### MCP server scope
+
+By default, `ai-workspace serve` runs in global scope and MCP tools can return metadata/search results for every project and group in the local workspace database. Use server scope when the MCP process should only expose one project or group:
+
+```bash
+ai-workspace serve --scope current-project
+ai-workspace serve --group backend
+ai-workspace serve --project api
+```
+
+Supported scopes are `global`, `current-project`, `group`, and `project`. `--group <name>` implies group scope, and `--project <id|slug|path>` implies project scope. CLI flags override environment variables.
+
+Environment equivalents:
+
+```bash
+AI_WORKSPACE_SCOPE=current-project
+AI_WORKSPACE_SCOPE=group AI_WORKSPACE_SCOPE_GROUP=backend
+AI_WORKSPACE_SCOPE=project AI_WORKSPACE_SCOPE_PROJECT=api
+```
+
+Scope applies to every MCP tool: context, note search, full-text file search, lists, service graphs, events, event details, reads, project tree, and project grep. Project/current-project scope is strict: it exposes only the selected project’s project-scoped items plus its group names and group notes. Group scope exposes only projects, items, notes, service links, and events visible through that group.
+
 ### Project-wide MCP tools opt-in
 
 By default, MCP tools expose only explicit shared scopes: shared files, shared directories, and notes. Project-wide reads, tree walks, grep, and absolute project path metadata are disabled unless you opt in.
 
-Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process to restore full project access:
+Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process to restore full project access inside the configured MCP scope:
 
 ```json
 {
@@ -67,11 +89,11 @@ Add to your MCP config JSON:
 
 ### `workspace_context`
 
-Get workspace metadata: all projects, their groups, and shared items (no file content).
+Get workspace metadata: visible projects, their groups, and shared items (no file content).
 
 **Parameters:** none
 
-**Returns:** JSON with `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
+**Returns:** JSON with scoped `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its visible member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ### `workspace_read`
 
@@ -95,7 +117,7 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - **Note:** returns note content (only via `item_id`)
 - `item_id` reads continue to work for shared files and directories
 - `project_id`+`rel_path` is limited to an explicitly shared file or a path inside an explicitly shared directory by default
-- Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads
+- Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads inside the configured MCP scope
 - Path traversal protection: rejects absolute paths, parent-directory traversal, and paths outside the project directory
 - Hidden/dotfile and credential-like paths are blocked by default. Hidden sensitive paths such as `.ssh/id_rsa` require both `include_hidden: true` and `include_sensitive: true`.
 - Explicitly shared `.ai-factory` context files are a narrow exception: non-sensitive `.ai-factory/...` paths are readable/searchable by default for the AI Factory preset. This exception is path-scoped and does not make hidden files in other shared directories visible.
@@ -132,6 +154,8 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 | `query` | string | yes | FTS5 query (supports phrase `"..."` and operators `AND` / `OR` / `NOT`) |
 | `limit` | integer | no | Maximum number of results (default: 20) |
 
+`workspace_search_fulltext` does not support `include_hidden` or `include_sensitive`. Hidden/dotfile and credential-like `.md` paths are always excluded from full-text search results, even when those paths are explicitly shared.
+
 **Returns:** JSON array of hits, each with:
 
 | Field | Type | Description |
@@ -146,7 +170,7 @@ Use `workspace_read` with `project_id` and `rel_path` set to the returned `path`
 
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
-- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories.
+- Hidden/dotfile and credential-like `.md` paths are skipped or removed from the index, including direct file shares and files inside shared directories. Use `workspace_read`, `project_tree`, or `project_grep` with explicit opt-in flags when you need to inspect those paths.
 - Files are indexed automatically when shared. Each `.md` file inside a shared directory is indexed as its own search document, so hits point at the exact child path.
 - Files whose mtime has changed on disk are lazily refreshed before each search with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
 - Deleted indexed child files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `ai-workspace reindex`.
@@ -156,7 +180,7 @@ Use `workspace_read` with `project_id` and `rel_path` set to the returned `path`
 
 ### `workspace_service_graph`
 
-Inspect directional service links for all projects, a specific group, or the group graphs around one project.
+Inspect directional service links visible inside the configured MCP scope.
 
 **Parameters:**
 
@@ -166,13 +190,13 @@ Inspect directional service links for all projects, a specific group, or the gro
 | `project_id` | integer | no | Project ID whose group graphs should be returned |
 | `group_id` | integer | no | Group ID whose service graph should be returned |
 
-Pass at most one selector. With no selector, the tool returns all service links.
+Pass at most one selector. With no selector, the tool returns all service links visible inside the configured MCP scope. Selectors outside the server scope return a tool-level access error.
 
 **Returns:** JSON object with a `scope` object and a `links` array. For project-scoped requests, `scope.groups` lists every group included in the graph. Each link includes id, source/target project ids and slugs, kind, label, and timestamps.
 
 ### `workspace_events`
 
-List workspace events or show a project's open event inbox.
+List workspace events visible inside the configured MCP scope or show an in-scope project's open event inbox.
 
 **Parameters:**
 
@@ -183,13 +207,13 @@ List workspace events or show a project's open event inbox.
 | `source` | string | no | Source service slug filter for list mode |
 | `status` | string | no | Event status filter: `open` or `closed` |
 
-Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists events and applies the optional filters.
+Project inbox mode cannot be combined with `source` or `status`. With no project selector, the tool lists scoped events and applies the optional filters.
 
-**Returns:** JSON array of events with source snapshots, kind, title, body, severity, status, and timestamps.
+**Returns:** JSON array of events with source snapshots, legacy `group_id`, source group snapshot `group_ids`, kind, title, body, severity, status, and timestamps.
 
 ### `workspace_event_details`
 
-Get one event with affected services and affected artifacts.
+Get one in-scope event with affected services and affected artifacts.
 
 **Parameters:**
 
@@ -197,7 +221,7 @@ Get one event with affected services and affected artifacts.
 |------|------|----------|-------------|
 | `event_id` | integer | yes | Workspace event ID |
 
-**Returns:** JSON object with `event`, `affected_services`, and `affected_artifacts`. Artifact entries include path snapshots and recommended reactions.
+**Returns:** JSON object with `event`, `affected_services`, and `affected_artifacts`. Affected services and artifacts outside the configured MCP scope are filtered out. Artifact entries include path snapshots and recommended reactions.
 
 ### CodeGraph tools
 
@@ -271,7 +295,7 @@ Return compact task context from indexed symbols. The tool searches the task des
 
 ### `project_tree`
 
-List the shared file tree of a project, respecting `.gitignore` rules. By default this only returns explicitly shared files, explicitly shared directories, and visible ancestors needed to display them. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to list the full project tree.
+List the shared file tree of an in-scope project, respecting `.gitignore` rules. By default this only returns explicitly shared files, explicitly shared directories, and visible ancestors needed to display them. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to list the full project tree inside the configured MCP scope.
 
 **Parameters:**
 
@@ -295,7 +319,7 @@ docs/
 
 ### `project_grep`
 
-Search shared project files for a regex pattern, respecting `.gitignore` rules. By default this scans only explicitly shared files and files inside explicitly shared directories. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to search the full project.
+Search shared files in an in-scope project for a regex pattern, respecting `.gitignore` rules. By default this scans only explicitly shared files and files inside explicitly shared directories. Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to search the full project inside the configured MCP scope.
 
 **Parameters:**
 
@@ -321,15 +345,15 @@ Invalid regex patterns return an `invalid_params` error.
 
 ### `list_groups`
 
-List all groups with their member projects.
+List groups visible inside the configured MCP scope with their scoped member projects.
 
 **Parameters:** none
 
-**Returns:** Array of groups, each with id, name, and projects (id, name). Project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
+**Returns:** Array of groups, each with id, name, and scoped projects (id, name). Project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
 ### `list_projects`
 
-List all projects with their groups.
+List projects visible inside the configured MCP scope with their groups.
 
 **Parameters:** none
 

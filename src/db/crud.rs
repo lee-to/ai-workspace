@@ -1,6 +1,6 @@
 use anyhow::{Context as _, Result};
 use log::{debug, error, info, warn};
-use rusqlite::{Connection, Row, params, params_from_iter, types::Type};
+use rusqlite::{Connection, Row, ToSql, params, params_from_iter, types::Type};
 use std::path::{Path, PathBuf};
 
 #[cfg(unix)]
@@ -14,7 +14,7 @@ use crate::models::{
     ServiceLink, ServiceLinkKind, ShareEntry, SharedItem, SharedItemKind, SyncReport,
     WorkspaceConfig, WorkspaceEvent, WorkspaceEventKind, normalize_project_slug,
 };
-use crate::path::normalize_portable_rel_path;
+use crate::path::{normalize_portable_rel_path, validate_config_share_path};
 
 pub enum ScopeChange {
     ToProject,
@@ -295,17 +295,9 @@ impl Db {
                 },
             )
             .with_context(|| format!("Failed to load project id={project_id} for destroy"))?;
-        let group_id: Option<i64> = {
-            let mut stmt = tx.prepare(
-                "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
-            )?;
-            let mut rows = stmt.query_map(params![source.id], |row| row.get::<_, i64>(0))?;
-            match rows.next() {
-                Some(row) => Some(row?),
-                None => None,
-            }
-        };
-        if group_id.is_none() {
+        let group_ids = Self::group_ids_for_project_conn(&tx, source.id)?;
+        let group_id = group_ids.first().copied();
+        if group_ids.is_empty() {
             warn!(
                 "Destroy event source slug='{}' has no group; impact may be limited",
                 source.slug
@@ -341,6 +333,7 @@ impl Db {
             )
         })?;
         let event_id = tx.last_insert_rowid();
+        Self::insert_event_groups(&tx, event_id, &group_ids)?;
 
         let linked_count = {
             let mut stmt = tx.prepare(
@@ -1364,8 +1357,9 @@ impl Db {
             source_target,
             &format!("creating workspace event kind={}", kind),
         )?;
-        let group_id = self.first_group_id_for_project(source.id)?;
-        if group_id.is_none() {
+        let group_ids = Self::group_ids_for_project_conn(&self.conn, source.id)?;
+        let group_id = group_ids.first().copied();
+        if group_ids.is_empty() {
             warn!(
                 "Event source slug='{}' has no group; impact may be limited",
                 source.slug
@@ -1403,6 +1397,7 @@ impl Db {
                 )
             })?;
         let event_id = self.conn.last_insert_rowid();
+        Self::insert_event_groups(&self.conn, event_id, &group_ids)?;
         let linked_count = self.insert_linked_service_event_targets(event_id, source.id)?;
         let artifact_count = self.insert_artifact_event_impacts(event_id, &source.slug)?;
         if linked_count == 0 && artifact_count == 0 {
@@ -1578,15 +1573,52 @@ impl Db {
     }
 
     #[allow(dead_code)]
-    fn first_group_id_for_project(&self, project_id: i64) -> Result<Option<i64>> {
+    pub fn list_event_group_ids(&self, event_id: i64) -> Result<Vec<i64>> {
+        debug!("Listing event groups with event_id={}", event_id);
         let mut stmt = self.conn.prepare(
-            "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id LIMIT 1",
+            "SELECT group_id
+             FROM event_groups
+             WHERE event_id = ?1 AND group_id IS NOT NULL
+             ORDER BY group_id",
         )?;
-        let mut rows = stmt.query_map(params![project_id], |row| row.get(0))?;
-        match rows.next() {
-            Some(row) => Ok(Some(row?)),
-            None => Ok(None),
+        let rows = stmt.query_map(params![event_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    #[allow(dead_code)]
+    pub fn workspace_event_has_group(&self, event_id: i64, group_id: i64) -> Result<bool> {
+        debug!(
+            "Checking event group membership with event_id={} group_id={}",
+            event_id, group_id
+        );
+        let exists: i64 = self.conn.query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM event_groups
+                 WHERE event_id = ?1 AND group_id = ?2
+             )",
+            params![event_id, group_id],
+            |row| row.get(0),
+        )?;
+        Ok(exists != 0)
+    }
+
+    fn group_ids_for_project_conn(conn: &Connection, project_id: i64) -> Result<Vec<i64>> {
+        let mut stmt = conn.prepare(
+            "SELECT group_id FROM project_groups WHERE project_id = ?1 ORDER BY group_id",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| row.get::<_, i64>(0))?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    fn insert_event_groups(conn: &Connection, event_id: i64, group_ids: &[i64]) -> Result<()> {
+        for group_id in group_ids {
+            conn.execute(
+                "INSERT OR IGNORE INTO event_groups (event_id, group_id) VALUES (?1, ?2)",
+                params![event_id, group_id],
+            )?;
         }
+        Ok(())
     }
 
     #[allow(dead_code)]
@@ -2238,14 +2270,26 @@ impl Db {
         let mut seen_share_paths = std::collections::HashSet::new();
         let mut validated_shares = Vec::new();
         for entry in &config.share {
-            let validated = validate_project_rel_path(project_root, entry.path())?;
-            let kind = entry.kind().unwrap_or_else(|| {
-                if validated.canonical_path.is_dir() {
-                    SharedItemKind::Dir
-                } else {
-                    SharedItemKind::File
+            let config_path = validate_config_share_path(entry.path())?;
+            let validated = validate_project_rel_path(project_root, &config_path)?;
+            let actual_kind = if validated.canonical_path.is_dir() {
+                SharedItemKind::Dir
+            } else {
+                SharedItemKind::File
+            };
+            let kind = if let Some(config_kind) = entry.kind() {
+                if config_kind != actual_kind {
+                    anyhow::bail!(
+                        "share '{}' declares kind '{}' but filesystem object is '{}'",
+                        entry.path(),
+                        config_kind,
+                        actual_kind
+                    );
                 }
-            });
+                config_kind
+            } else {
+                actual_kind
+            };
             if seen_share_paths.insert(validated.rel_path.clone()) {
                 validated_shares.push(ValidatedConfigShare {
                     entry,
@@ -2380,12 +2424,13 @@ impl Db {
                     current_label,
                     entry.label()
                 );
-                tx.execute(
+                let changed = tx.execute(
                     "UPDATE shared_items
                      SET kind = ?1, label = ?2, updated_at = datetime('now')
                      WHERE id = ?3",
                     params![share.kind.as_str(), entry.label(), id],
                 )?;
+                report.shares_updated += changed;
             }
         }
 
@@ -2615,11 +2660,12 @@ impl Db {
 
         tx.commit()?;
         info!(
-            "Sync complete: groups +{} -{}, shares +{} -{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
+            "Sync complete: groups +{} -{}, shares +{} -{} ~{}, dependencies +{} -{} ~{}, notes +{} -{} ~{}",
             report.groups_added,
             report.groups_removed,
             report.shares_added,
             report.shares_removed,
+            report.shares_updated,
             report.dependencies_added,
             report.dependencies_removed,
             report.dependencies_updated,
@@ -3462,12 +3508,37 @@ impl Db {
 
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
-        debug!("search_files: query='{}' limit={}", query, limit);
+        self.search_files_scoped(query, limit, None)
+    }
+
+    /// Full-text search limited to the given project IDs before ranking/limit.
+    pub fn search_files_for_projects(
+        &self,
+        query: &str,
+        limit: usize,
+        project_ids: &[i64],
+    ) -> Result<Vec<FileSearchHit>> {
+        self.search_files_scoped(query, limit, Some(project_ids))
+    }
+
+    fn search_files_scoped(
+        &self,
+        query: &str,
+        limit: usize,
+        project_ids: Option<&[i64]>,
+    ) -> Result<Vec<FileSearchHit>> {
+        debug!(
+            "search_files: query='{}' limit={} project_ids={:?}",
+            query, limit, project_ids
+        );
         if limit == 0 {
             return Ok(Vec::new());
         }
+        if project_ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(Vec::new());
+        }
         let fetch_limit = limit.saturating_mul(4).max(limit.saturating_add(16));
-        let mut stmt = self.conn.prepare(
+        let mut sql = String::from(
             "SELECT i.id, \
                     i.shared_item_id, \
                     s.project_id, \
@@ -3482,11 +3553,38 @@ impl Db {
              JOIN indexed_files i ON i.id = f.rowid \
              JOIN shared_items s ON s.id = i.shared_item_id \
              JOIN projects p ON p.id = s.project_id \
-             WHERE files_fts MATCH ?1 \
-             ORDER BY bm25(files_fts) \
-             LIMIT ?2",
-        )?;
-        let rows = stmt.query_map(params![query, fetch_limit as i64], |r| {
+             WHERE files_fts MATCH ?1",
+        );
+
+        let mut param_index = 2;
+        if let Some(project_ids) = project_ids {
+            let placeholders: Vec<_> = project_ids
+                .iter()
+                .map(|_| {
+                    let placeholder = format!("?{param_index}");
+                    param_index += 1;
+                    placeholder
+                })
+                .collect();
+            sql.push_str(" AND s.project_id IN (");
+            sql.push_str(&placeholders.join(", "));
+            sql.push(')');
+        }
+        let limit_param = param_index;
+        sql.push_str(&format!(" ORDER BY bm25(files_fts) LIMIT ?{limit_param}"));
+
+        let fetch_limit_i64 = fetch_limit as i64;
+        let mut bind_params: Vec<&dyn ToSql> = Vec::new();
+        bind_params.push(&query);
+        if let Some(project_ids) = project_ids {
+            for project_id in project_ids {
+                bind_params.push(project_id);
+            }
+        }
+        bind_params.push(&fetch_limit_i64);
+
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(rusqlite::params_from_iter(bind_params), |r| {
             Ok((
                 r.get::<_, i64>(0)?,
                 FileSearchHit {
@@ -4502,6 +4600,32 @@ mod tests {
         assert!(db.list_event_targets(event_id).unwrap().is_empty());
     }
 
+    #[test]
+    fn destroy_project_snapshots_all_source_groups_for_event() {
+        let db = test_db();
+        let auth = db
+            .create_project_with_slug("Auth", "/tmp/auth-multi-group", Some("auth"))
+            .unwrap();
+        let alpha = db.get_or_create_group("alpha").unwrap();
+        let beta = db.get_or_create_group("beta").unwrap();
+        db.add_project_to_group(auth, beta).unwrap();
+        db.add_project_to_group(auth, alpha).unwrap();
+
+        let event_id = db.destroy_project_with_service_deleted_event(auth).unwrap();
+        let event = db.get_workspace_event(event_id).unwrap().unwrap();
+        assert_eq!(event.group_id, Some(alpha));
+
+        let group_ids = db
+            .conn
+            .prepare("SELECT group_id FROM event_groups WHERE event_id = ?1 ORDER BY group_id")
+            .unwrap()
+            .query_map(params![event_id], |row| row.get::<_, i64>(0))
+            .unwrap()
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(group_ids, vec![alpha, beta]);
+    }
+
     // --- Shared Items: Files & Dirs ---
 
     #[test]
@@ -5209,6 +5333,126 @@ mod tests {
     }
 
     #[test]
+    fn sync_counts_share_label_updates() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+        db.share_file(pid, "README.md", Some("old label")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("new label".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 0);
+        assert_eq!(report.shares_removed, 0);
+        assert_eq!(report.shares_updated, 1);
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label.as_deref(), Some("new label"));
+    }
+
+    #[test]
+    fn sync_counts_share_kind_updates() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+        db.share_file(pid, "docs", None).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "docs".to_string(),
+                label: None,
+                kind: Some(SharedItemKind::Dir),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 0);
+        assert_eq!(report.shares_removed, 0);
+        assert_eq!(report.shares_updated, 1);
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+    }
+
+    #[test]
+    fn sync_rejects_configured_share_kind_mismatches() {
+        let cases = [
+            ("README.md", SharedItemKind::Dir, "file"),
+            ("docs", SharedItemKind::File, "dir"),
+            ("README.md", SharedItemKind::Note, "file"),
+        ];
+
+        for (path, declared_kind, actual_kind) in cases {
+            let db = test_db();
+            let (dir, pid) = temp_project(&db, "proj");
+            std::fs::write(dir.path().join("README.md"), "# Readme").unwrap();
+            std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+            let config = WorkspaceConfig {
+                name: "proj".to_string(),
+                slug: None,
+                groups: vec![],
+                share: vec![ShareEntry::WithMetadata {
+                    path: path.to_string(),
+                    label: None,
+                    kind: Some(declared_kind),
+                    dependencies: None,
+                }],
+                notes: vec![],
+            };
+
+            let err = db.sync_from_config(pid, &config).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "share '{path}' declares kind '{declared_kind}' but filesystem object is '{actual_kind}'"
+                )
+            );
+            assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+        }
+    }
+
+    #[test]
+    fn sync_infers_missing_kind_for_directory_share() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs".to_string())],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(pid, &config).unwrap();
+        assert_eq!(report.shares_added, 1);
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].kind, SharedItemKind::Dir);
+        assert_eq!(items[0].path.as_deref(), Some("docs"));
+    }
+
+    #[test]
     fn sync_rejects_parent_directory_share_path() {
         let db = test_db();
         let (_dir, pid) = temp_project(&db, "proj");
@@ -5364,6 +5608,28 @@ mod tests {
     }
 
     #[test]
+    fn sync_rejects_glob_like_share_path_with_clear_error() {
+        let db = test_db();
+        let (dir, pid) = temp_project(&db, "proj");
+        std::fs::create_dir(dir.path().join("docs")).unwrap();
+
+        let config = WorkspaceConfig {
+            name: "proj".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::PathOnly("docs/**".to_string())],
+            notes: vec![],
+        };
+
+        let err = db.sync_from_config(pid, &config).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "Glob patterns are not supported in .ai-workspace.json share entries. Use \"docs\" to share the directory."
+        );
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
     fn sync_reconciles_artifact_dependencies_from_config() {
         let db = test_db();
         let api_dir = tempfile::tempdir().unwrap();
@@ -5419,6 +5685,90 @@ mod tests {
         }
         let report = db.sync_from_config(api, &updated_config).unwrap();
         assert_eq!(report.dependencies_removed, 1);
+        assert!(
+            db.list_artifact_dependencies_for_project(api)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn sync_preserves_artifact_dependencies_when_dependencies_omitted() {
+        let db = test_db();
+        let (api_dir, api) = temp_project(&db, "API");
+        std::fs::write(api_dir.path().join("README.md"), "# API").unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-omitted", Some("auth"))
+            .unwrap();
+        db.share_file(api, "README.md", Some("api docs")).unwrap();
+        db.add_artifact_dependency(
+            api,
+            "README.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("api docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: None,
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.dependencies_added, 0);
+        assert_eq!(report.dependencies_removed, 0);
+        assert_eq!(report.dependencies_updated, 0);
+
+        let deps = db.list_artifact_dependencies_for_project(api).unwrap();
+        assert_eq!(deps.len(), 1);
+        assert_eq!(deps[0].depends_on_project_slug_snapshot, "auth");
+        assert_eq!(deps[0].kind, ArtifactDependencyKind::References);
+        assert_eq!(deps[0].reaction, ArtifactReaction::Update);
+    }
+
+    #[test]
+    fn sync_removes_artifact_dependencies_when_dependencies_empty() {
+        let db = test_db();
+        let (api_dir, api) = temp_project(&db, "API");
+        std::fs::write(api_dir.path().join("README.md"), "# API").unwrap();
+        db.create_project_with_slug("Auth", "/tmp/auth-empty", Some("auth"))
+            .unwrap();
+        db.share_file(api, "README.md", Some("api docs")).unwrap();
+        db.add_artifact_dependency(
+            api,
+            "README.md",
+            "auth",
+            ArtifactDependencyKind::References,
+            ArtifactReaction::Update,
+        )
+        .unwrap();
+
+        let config = WorkspaceConfig {
+            name: "API".to_string(),
+            slug: None,
+            groups: vec![],
+            share: vec![ShareEntry::WithMetadata {
+                path: "README.md".to_string(),
+                label: Some("api docs".to_string()),
+                kind: Some(SharedItemKind::File),
+                dependencies: Some(vec![]),
+            }],
+            notes: vec![],
+        };
+
+        let report = db.sync_from_config(api, &config).unwrap();
+        assert_eq!(report.dependencies_added, 0);
+        assert_eq!(report.dependencies_removed, 1);
+        assert_eq!(report.dependencies_updated, 0);
+
         assert!(
             db.list_artifact_dependencies_for_project(api)
                 .unwrap()
@@ -5563,6 +5913,7 @@ mod tests {
         assert_eq!(r2.groups_removed, 0);
         assert_eq!(r2.shares_added, 0);
         assert_eq!(r2.shares_removed, 0);
+        assert_eq!(r2.shares_updated, 0);
         assert_eq!(r2.notes_added, 0);
         assert_eq!(r2.notes_removed, 0);
         assert_eq!(r2.notes_updated, 0);

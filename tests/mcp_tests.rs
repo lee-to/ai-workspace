@@ -15,14 +15,32 @@ fn mcp_request_with_env(
     requests: &[serde_json::Value],
     envs: &[(&str, &str)],
 ) -> Vec<serde_json::Value> {
+    mcp_request_with_options(db_path, requests, envs, &[], None)
+}
+
+fn mcp_request_with_options(
+    db_path: &PathBuf,
+    requests: &[serde_json::Value],
+    envs: &[(&str, &str)],
+    serve_args: &[&str],
+    current_dir: Option<&Path>,
+) -> Vec<serde_json::Value> {
     let mut command = Command::new(binary_path());
     command
         .arg("serve")
+        .args(serve_args)
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
         .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+        .env_remove("AI_WORKSPACE_SCOPE")
+        .env_remove("AI_WORKSPACE_SCOPE_GROUP")
+        .env_remove("AI_WORKSPACE_SCOPE_PROJECT")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
 
     for (key, value) in envs {
         command.env(key, value);
@@ -51,10 +69,54 @@ fn mcp_request(db_path: &PathBuf, requests: &[serde_json::Value]) -> Vec<serde_j
     mcp_request_with_env(db_path, requests, &[])
 }
 
+fn run_mcp_server_without_requests(
+    db_path: &PathBuf,
+    envs: &[(&str, &str)],
+    serve_args: &[&str],
+    current_dir: Option<&Path>,
+) -> std::process::Output {
+    let mut command = Command::new(binary_path());
+    command
+        .arg("serve")
+        .args(serve_args)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+        .env_remove("AI_WORKSPACE_SCOPE")
+        .env_remove("AI_WORKSPACE_SCOPE_GROUP")
+        .env_remove("AI_WORKSPACE_SCOPE_PROJECT");
+
+    if let Some(current_dir) = current_dir {
+        command.current_dir(current_dir);
+    }
+
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+
+    command.output().expect("failed to run MCP server")
+}
+
 fn temp_db() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("workspace.db");
     (dir, db_path)
+}
+
+fn run_cli_in_dir(db_path: &PathBuf, dir: &Path, args: &[&str]) -> std::process::Output {
+    let output = Command::new(binary_path())
+        .args(args)
+        .current_dir(dir)
+        .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+        .output()
+        .expect("CLI command failed to start");
+    assert!(
+        output.status.success(),
+        "CLI command failed: {:?}\nstdout={}\nstderr={}",
+        args,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    output
 }
 
 #[cfg(unix)]
@@ -268,7 +330,15 @@ fn test_mcp_migrates_legacy_database_and_read_paths_work() {
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
+    let event_group_table_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'event_groups'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(event_group_table_count, 1);
     let indexed_file_rows: i64 = conn
         .query_row("SELECT COUNT(*) FROM indexed_files", [], |row| row.get(0))
         .unwrap();
@@ -567,6 +637,295 @@ fn seed_service_event_data(db_path: &PathBuf) -> (tempfile::TempDir, tempfile::T
     (auth_dir, api_dir)
 }
 
+fn seed_mcp_scope_data(
+    db_path: &PathBuf,
+) -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+    let api_dir = tempfile::tempdir().unwrap();
+    let worker_dir = tempfile::tempdir().unwrap();
+    let web_dir = tempfile::tempdir().unwrap();
+
+    for (dir, readme_marker, lib_marker) in [
+        (
+            api_dir.path(),
+            "api_fulltext_marker",
+            "pub fn api_scope_marker() -> &'static str { \"api_grep_marker\" }\n",
+        ),
+        (
+            worker_dir.path(),
+            "worker_fulltext_marker",
+            "pub fn worker_scope_marker() -> &'static str { \"worker_grep_marker\" }\n",
+        ),
+        (
+            web_dir.path(),
+            "web_fulltext_marker",
+            "pub fn web_scope_marker() -> &'static str { \"web_grep_marker\" }\n",
+        ),
+    ] {
+        std::fs::create_dir(dir.join("src")).unwrap();
+        std::fs::write(dir.join("SCOPE.md"), format!("{readme_marker}\n")).unwrap();
+        std::fs::write(dir.join("src").join("lib.rs"), lib_marker).unwrap();
+    }
+
+    let run = |dir: &std::path::Path, args: &[&str]| {
+        let output = Command::new(binary_path())
+            .args(args)
+            .current_dir(dir)
+            .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
+            .output()
+            .expect("seed command failed");
+        assert!(
+            output.status.success(),
+            "seed command failed: {:?}\nstdout={}\nstderr={}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+
+    run(
+        api_dir.path(),
+        &[
+            "init", "--name", "API", "--slug", "api", "--group", "backend",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &["share", "SCOPE.md", "--label", "api-scope"],
+    );
+    run(
+        api_dir.path(),
+        &["share", "src/lib.rs", "--label", "api-lib"],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "note",
+            "api project note scope marker",
+            "--scope",
+            "project",
+            "--label",
+            "api-note",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "note",
+            "backend group note scope marker",
+            "--group",
+            "backend",
+            "--label",
+            "backend-note",
+        ],
+    );
+
+    run(
+        worker_dir.path(),
+        &[
+            "init", "--name", "Worker", "--slug", "worker", "--group", "backend",
+        ],
+    );
+    run(
+        worker_dir.path(),
+        &["share", "SCOPE.md", "--label", "worker-scope"],
+    );
+    run(
+        worker_dir.path(),
+        &["share", "src/lib.rs", "--label", "worker-lib"],
+    );
+    run(
+        worker_dir.path(),
+        &[
+            "note",
+            "worker project note scope marker",
+            "--scope",
+            "project",
+            "--label",
+            "worker-note",
+        ],
+    );
+
+    run(
+        web_dir.path(),
+        &[
+            "init", "--name", "Web", "--slug", "web", "--group", "frontend",
+        ],
+    );
+    run(
+        web_dir.path(),
+        &["share", "SCOPE.md", "--label", "web-scope"],
+    );
+    run(
+        web_dir.path(),
+        &["share", "src/lib.rs", "--label", "web-lib"],
+    );
+    run(
+        web_dir.path(),
+        &[
+            "note",
+            "web project note scope marker",
+            "--scope",
+            "project",
+            "--label",
+            "web-note",
+        ],
+    );
+    run(
+        web_dir.path(),
+        &[
+            "note",
+            "frontend group note scope marker",
+            "--group",
+            "frontend",
+            "--label",
+            "frontend-note",
+        ],
+    );
+
+    run(
+        api_dir.path(),
+        &[
+            "link",
+            "add",
+            "api",
+            "worker",
+            "--kind",
+            "depends_on",
+            "--label",
+            "Worker API",
+        ],
+    );
+    run(
+        web_dir.path(),
+        &[
+            "link",
+            "add",
+            "web",
+            "api",
+            "--kind",
+            "depends_on",
+            "--label",
+            "API",
+        ],
+    );
+    run(
+        api_dir.path(),
+        &[
+            "artifact",
+            "depends",
+            "src/lib.rs",
+            "worker",
+            "--kind",
+            "references",
+            "--reaction",
+            "update",
+        ],
+    );
+    run(
+        worker_dir.path(),
+        &[
+            "event",
+            "create",
+            "--kind",
+            "service_changed",
+            "--source",
+            "worker",
+            "--title",
+            "Worker changed",
+        ],
+    );
+    run(
+        web_dir.path(),
+        &[
+            "event",
+            "create",
+            "--kind",
+            "service_changed",
+            "--source",
+            "web",
+            "--title",
+            "Web changed",
+        ],
+    );
+
+    (api_dir, worker_dir, web_dir)
+}
+
+fn project_id_by_slug(db_path: &PathBuf, slug: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT id FROM projects WHERE slug = ?1",
+        params![slug],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn group_id_by_name(db_path: &PathBuf, name: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT id FROM groups WHERE name = ?1",
+        params![name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn add_project_to_group_by_name(db_path: &PathBuf, project_slug: &str, group_name: &str) {
+    let conn = Connection::open(db_path).unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO groups (name) VALUES (?1)",
+        params![group_name],
+    )
+    .unwrap();
+    let project_id: i64 = conn
+        .query_row(
+            "SELECT id FROM projects WHERE slug = ?1",
+            params![project_slug],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let group_id: i64 = conn
+        .query_row(
+            "SELECT id FROM groups WHERE name = ?1",
+            params![group_name],
+            |row| row.get(0),
+        )
+        .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO project_groups (project_id, group_id) VALUES (?1, ?2)",
+        params![project_id, group_id],
+    )
+    .unwrap();
+}
+
+fn event_id_by_source_slug(db_path: &PathBuf, slug: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT id FROM workspace_events WHERE source_project_slug = ?1",
+        params![slug],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn tool_text(response: &serde_json::Value) -> &str {
+    response["result"]["content"][0]["text"].as_str().unwrap()
+}
+
+fn assert_tool_error_contains(response: &serde_json::Value, expected: &str) {
+    let result = &response["result"];
+    assert_eq!(
+        result["isError"], true,
+        "response was not an error: {result}"
+    );
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains(expected),
+        "expected error to contain '{expected}', got '{text}'"
+    );
+}
+
 /// Seed a project with markdown content for workspace_search_fulltext policy tests.
 fn seed_fulltext_policy_project(db_path: &PathBuf) -> tempfile::TempDir {
     let project_dir = tempfile::tempdir().unwrap();
@@ -800,6 +1159,25 @@ fn test_mcp_tools_list() {
             "{name} should expose include_sensitive"
         );
     }
+
+    let fulltext = tools
+        .iter()
+        .find(|tool| tool["name"] == "workspace_search_fulltext")
+        .expect("workspace_search_fulltext tool should be present");
+    let fulltext_schema = &fulltext["inputSchema"];
+    let fulltext_properties = &fulltext_schema["properties"];
+    assert!(
+        fulltext_properties["include_hidden"].is_null(),
+        "workspace_search_fulltext should not expose include_hidden"
+    );
+    assert!(
+        fulltext_properties["include_sensitive"].is_null(),
+        "workspace_search_fulltext should not expose include_sensitive"
+    );
+    assert_eq!(
+        fulltext_schema["additionalProperties"], false,
+        "workspace_search_fulltext should reject undocumented schema properties"
+    );
 }
 
 #[test]
@@ -1141,6 +1519,597 @@ fn test_mcp_service_graph_events_and_event_details() {
 }
 
 #[test]
+fn test_mcp_scope_global_returns_all_projects() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "workspace_context", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_search",
+                    "arguments": { "query": "scope" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_search_fulltext",
+                    "arguments": {
+                        "query": "api_fulltext_marker OR worker_fulltext_marker OR web_fulltext_marker"
+                    }
+                }
+            }),
+        ],
+    );
+
+    let context: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let project_slugs: Vec<_> = context["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| project["slug"].as_str().unwrap())
+        .collect();
+    assert!(project_slugs.contains(&"api"));
+    assert!(project_slugs.contains(&"worker"));
+    assert!(project_slugs.contains(&"web"));
+
+    let search_text = tool_text(&responses[1]);
+    assert!(search_text.contains("api project note scope marker"));
+    assert!(search_text.contains("worker project note scope marker"));
+    assert!(search_text.contains("web project note scope marker"));
+
+    let fulltext_text = tool_text(&responses[2]);
+    assert!(fulltext_text.contains("api_fulltext_marker"));
+    assert!(fulltext_text.contains("worker_fulltext_marker"));
+    assert!(fulltext_text.contains("web_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_scope_group_filters_context_search_graph_events_and_direct_tools() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    let web_id = project_id_by_slug(&db_path, "web");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "workspace_context", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "list_projects", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": { "name": "list_groups", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_search",
+                    "arguments": { "query": "scope" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_search_fulltext",
+                    "arguments": {
+                        "query": "api_fulltext_marker OR worker_fulltext_marker OR web_fulltext_marker"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": { "name": "workspace_service_graph", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 7,
+                "method": "tools/call",
+                "params": { "name": "workspace_events", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 8,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": { "project_id": web_id, "rel_path": "src/lib.rs" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 9,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_tree",
+                    "arguments": { "project_id": web_id }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 10,
+                "method": "tools/call",
+                "params": {
+                    "name": "project_grep",
+                    "arguments": { "project_id": web_id, "pattern": "web_grep_marker" }
+                }
+            }),
+        ],
+        &[],
+        &["--group", "backend"],
+        None,
+    );
+
+    let context: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let project_slugs: Vec<_> = context["projects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|project| project["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(project_slugs.len(), 2);
+    assert!(project_slugs.contains(&"api"));
+    assert!(project_slugs.contains(&"worker"));
+    assert!(!project_slugs.contains(&"web"));
+    assert_eq!(context["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(context["groups"][0]["name"], "backend");
+
+    let projects: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[1])).unwrap();
+    assert_eq!(projects.len(), 2);
+    assert!(projects.iter().all(|project| project["slug"] != "web"));
+
+    let groups: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[2])).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "backend");
+    assert!(
+        groups[0]["projects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|project| project["slug"] != "web")
+    );
+
+    let search_text = tool_text(&responses[3]);
+    assert!(search_text.contains("api project note scope marker"));
+    assert!(search_text.contains("worker project note scope marker"));
+    assert!(search_text.contains("backend group note scope marker"));
+    assert!(!search_text.contains("web project note scope marker"));
+    assert!(!search_text.contains("frontend group note scope marker"));
+
+    let fulltext_text = tool_text(&responses[4]);
+    assert!(fulltext_text.contains("api_fulltext_marker"));
+    assert!(fulltext_text.contains("worker_fulltext_marker"));
+    assert!(!fulltext_text.contains("web_fulltext_marker"));
+
+    let graph: serde_json::Value = serde_json::from_str(tool_text(&responses[5])).unwrap();
+    let links = graph["links"].as_array().unwrap();
+    assert_eq!(links.len(), 1);
+    assert_eq!(links[0]["from"], "api");
+    assert_eq!(links[0]["to"], "worker");
+
+    let events: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[6])).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|event| event["source_project_slug"] == "worker")
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["source_project_slug"] != "web")
+    );
+
+    assert_tool_error_contains(&responses[7], "outside MCP scope");
+    assert_tool_error_contains(&responses[8], "outside MCP scope");
+    assert_tool_error_contains(&responses[9], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_group_scope_sees_destroy_event_for_each_source_group() {
+    let (_db_dir, db_path) = temp_db();
+    let source_dir = tempfile::tempdir().unwrap();
+    let observer_dir = tempfile::tempdir().unwrap();
+
+    run_cli_in_dir(
+        &db_path,
+        source_dir.path(),
+        &[
+            "init",
+            "--name",
+            "Shared Auth",
+            "--slug",
+            "shared-auth",
+            "--group",
+            "alpha",
+        ],
+    );
+    run_cli_in_dir(&db_path, source_dir.path(), &["init", "--group", "beta"]);
+    run_cli_in_dir(
+        &db_path,
+        observer_dir.path(),
+        &[
+            "init", "--name", "Observer", "--slug", "observer", "--group", "gamma",
+        ],
+    );
+    run_cli_in_dir(&db_path, observer_dir.path(), &["destroy", "shared-auth"]);
+
+    let alpha = group_id_by_name(&db_path, "alpha");
+    let beta = group_id_by_name(&db_path, "beta");
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "workspace_events", "arguments": {} }
+    });
+
+    let alpha_response = mcp_request_with_options(
+        &db_path,
+        &[request.clone()],
+        &[],
+        &["--group", "alpha"],
+        None,
+    );
+    let alpha_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&alpha_response[0])).unwrap();
+    let alpha_event = alpha_events
+        .iter()
+        .find(|event| event["source_project_slug"] == "shared-auth")
+        .expect("alpha scope should see shared-auth delete event");
+    let alpha_group_ids: Vec<i64> = alpha_event["group_ids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|group_id| group_id.as_i64().unwrap())
+        .collect();
+    assert_eq!(alpha_group_ids, vec![alpha, beta]);
+
+    let beta_response = mcp_request_with_options(
+        &db_path,
+        &[request.clone()],
+        &[],
+        &["--group", "beta"],
+        None,
+    );
+    let beta_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&beta_response[0])).unwrap();
+    assert!(
+        beta_events
+            .iter()
+            .any(|event| event["source_project_slug"] == "shared-auth"),
+        "beta scope should see shared-auth delete event"
+    );
+
+    let gamma_response =
+        mcp_request_with_options(&db_path, &[request], &[], &["--group", "gamma"], None);
+    let gamma_events: Vec<serde_json::Value> =
+        serde_json::from_str(tool_text(&gamma_response[0])).unwrap();
+    assert!(
+        gamma_events
+            .iter()
+            .all(|event| event["source_project_slug"] != "shared-auth"),
+        "unrelated gamma scope should not see shared-auth delete event"
+    );
+}
+
+#[test]
+fn test_mcp_scope_env_group_and_project_selectors_filter_projects() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": { "name": "list_projects", "arguments": {} }
+        })],
+        &[
+            ("AI_WORKSPACE_SCOPE", "group"),
+            ("AI_WORKSPACE_SCOPE_GROUP", "backend"),
+        ],
+        &[],
+        None,
+    );
+    let projects: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let slugs: Vec<_> = projects
+        .iter()
+        .map(|project| project["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs.len(), 2);
+    assert!(slugs.contains(&"api"));
+    assert!(slugs.contains(&"worker"));
+    assert!(!slugs.contains(&"web"));
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": { "name": "list_projects", "arguments": {} }
+        })],
+        &[
+            ("AI_WORKSPACE_SCOPE", "project"),
+            ("AI_WORKSPACE_SCOPE_PROJECT", "api"),
+        ],
+        &[],
+        None,
+    );
+    let projects: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert_eq!(projects.len(), 1);
+    assert_eq!(projects[0]["slug"], "api");
+}
+
+#[test]
+fn test_mcp_scope_project_is_strict_and_cli_overrides_env_group() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    let worker_id = project_id_by_slug(&db_path, "worker");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "workspace_context", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "list_groups", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_search_fulltext",
+                    "arguments": {
+                        "query": "api_fulltext_marker OR worker_fulltext_marker OR web_fulltext_marker"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": { "name": "workspace_service_graph", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_read",
+                    "arguments": { "project_id": worker_id, "rel_path": "src/lib.rs" }
+                }
+            }),
+        ],
+        &[
+            ("AI_WORKSPACE_SCOPE", "group"),
+            ("AI_WORKSPACE_SCOPE_GROUP", "frontend"),
+        ],
+        &["--project", "api"],
+        None,
+    );
+
+    let context: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert_eq!(context["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(context["projects"][0]["slug"], "api");
+    assert_eq!(context["groups"].as_array().unwrap().len(), 1);
+    assert_eq!(context["groups"][0]["name"], "backend");
+    assert_eq!(
+        context["groups"][0]["projects"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(context["groups"][0]["projects"][0]["slug"], "api");
+    let notes = context["groups"][0]["notes"].as_array().unwrap();
+    assert!(notes.iter().any(|note| {
+        note["preview"]
+            .as_str()
+            .unwrap()
+            .contains("backend group note scope marker")
+    }));
+
+    let groups: Vec<serde_json::Value> = serde_json::from_str(tool_text(&responses[1])).unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(groups[0]["projects"][0]["slug"], "api");
+
+    let fulltext_text = tool_text(&responses[2]);
+    assert!(fulltext_text.contains("api_fulltext_marker"));
+    assert!(!fulltext_text.contains("worker_fulltext_marker"));
+    assert!(!fulltext_text.contains("web_fulltext_marker"));
+
+    let graph: serde_json::Value = serde_json::from_str(tool_text(&responses[3])).unwrap();
+    assert!(graph["links"].as_array().unwrap().is_empty());
+    assert_tool_error_contains(&responses[4], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_scope_fulltext_applies_project_scope_before_limit() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "api_fulltext_marker OR worker_fulltext_marker OR web_fulltext_marker",
+                    "limit": 1
+                }
+            }
+        })],
+        &[],
+        &["--project", "web"],
+        None,
+    );
+
+    let fulltext_text = tool_text(&responses[0]);
+    assert!(fulltext_text.contains("web_fulltext_marker"));
+    assert!(!fulltext_text.contains("api_fulltext_marker"));
+    assert!(!fulltext_text.contains("worker_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_scope_group_filters_project_service_graph_scope_groups() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    add_project_to_group_by_name(&db_path, "api", "frontend");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_service_graph",
+                "arguments": { "project": "api" }
+            }
+        })],
+        &[],
+        &["--group", "backend"],
+        None,
+    );
+
+    let graph: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let groups = graph["scope"]["groups"].as_array().unwrap();
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0]["name"], "backend");
+}
+
+#[test]
+fn test_mcp_scope_current_project_env_and_event_details_gate() {
+    let (_db_dir, db_path) = temp_db();
+    let (api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    let worker_event_id = event_id_by_source_slug(&db_path, "worker");
+    let web_event_id = event_id_by_source_slug(&db_path, "web");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": { "name": "workspace_context", "arguments": {} }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_event_details",
+                    "arguments": { "event_id": worker_event_id }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "workspace_event_details",
+                    "arguments": { "event_id": web_event_id }
+                }
+            }),
+        ],
+        &[("AI_WORKSPACE_SCOPE", "current-project")],
+        &[],
+        Some(api_dir.path()),
+    );
+
+    let context: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert_eq!(context["projects"].as_array().unwrap().len(), 1);
+    assert_eq!(context["projects"][0]["slug"], "api");
+
+    let details: serde_json::Value = serde_json::from_str(tool_text(&responses[1])).unwrap();
+    assert_eq!(details["event"]["source_project_slug"], "worker");
+    assert!(
+        details["affected_services"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|target| target["project"] == "api")
+    );
+    assert!(
+        details["affected_artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|artifact| artifact["project"] == "api")
+    );
+
+    assert_tool_error_contains(&responses[2], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_scope_invalid_serve_configurations_fail_startup() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+
+    let output = run_mcp_server_without_requests(
+        &db_path,
+        &[],
+        &["--scope", "global", "--group", "backend"],
+        None,
+    );
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("global"));
+    assert!(stderr.contains("group"));
+
+    let output = run_mcp_server_without_requests(&db_path, &[], &["--scope", "group"], None);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("group"));
+
+    let output =
+        run_mcp_server_without_requests(&db_path, &[("AI_WORKSPACE_SCOPE", "project")], &[], None);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("project"));
+}
+
+#[test]
 fn test_mcp_workspace_read() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_data(&db_path);
@@ -1261,6 +2230,44 @@ fn test_mcp_workspace_search_fulltext_filters_directory_hidden_sensitive_childre
         "only public directory markdown should match: {content}"
     );
     assert_eq!(results[0]["path"], "docs/public.md");
+    assert!(!content.contains("directory_sensitive_fulltext_marker"));
+    assert!(!content.contains("directory_hidden_fulltext_marker"));
+}
+
+#[test]
+fn test_mcp_workspace_search_fulltext_ignores_hidden_sensitive_opt_in_arguments() {
+    let (_db_dir, db_path) = temp_db();
+    let _project_dir = seed_fulltext_policy_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "workspace_search_fulltext",
+                "arguments": {
+                    "query": "hidden_sensitive_fulltext_marker OR directory_visible_fulltext_marker OR directory_sensitive_fulltext_marker OR directory_hidden_fulltext_marker",
+                    "include_hidden": true,
+                    "include_sensitive": true
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let results: Vec<serde_json::Value> = serde_json::from_str(content).unwrap();
+    assert_eq!(
+        results.len(),
+        1,
+        "manual opt-in arguments must not reveal hidden/sensitive markdown: {content}"
+    );
+    assert_eq!(results[0]["path"], "docs/public.md");
+    assert!(!content.contains("hidden_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_sensitive_fulltext_marker"));
     assert!(!content.contains("directory_hidden_fulltext_marker"));
 }

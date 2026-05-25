@@ -91,9 +91,19 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 ```
 
 That's it. The agent now has access to 17 MCP tools: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
-By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`; MCP clients must explicitly opt in where supported.
+By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`. `workspace_read`, `project_tree`, and `project_grep` support explicit opt-in flags; `workspace_search_fulltext` is stricter and never returns hidden or credential-like `.md` paths.
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
+
+You can also restrict the MCP server to part of the local workspace:
+
+```bash
+ai-workspace serve --scope current-project
+ai-workspace serve --group backend
+ai-workspace serve --project api
+```
+
+The same modes are available through `AI_WORKSPACE_SCOPE=global|current-project|group|project`, `AI_WORKSPACE_SCOPE_GROUP`, and `AI_WORKSPACE_SCOPE_PROJECT`. CLI flags override env vars. Scoping filters metadata, search, service graphs, events, reads, tree, and grep; `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` only broadens filesystem access inside the configured MCP scope.
 
 ## Example Prompts
 
@@ -157,7 +167,7 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `search <query>` | Full-text search over shared `.md` files (FTS5, bm25-ranked) |
 | `reindex` | Rebuild the full-text index for all shared `.md` files |
 | `codegraph reindex/sync/status/search` | Build and inspect a local Rust-only code graph |
-| `serve` | Start the MCP server |
+| `serve [--scope ...] [--group ...] [--project ...]` | Start the MCP server, optionally scoped to a project or group |
 | `update` | Update to the latest version |
 
 ## Team Sharing
@@ -181,7 +191,46 @@ ai-workspace init
 # → picks up name, slug, groups, shares, notes, and dependencies from the configured workspace JSON
 ```
 
-The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present. Shared paths from config must exist and resolve inside the project directory. The workspace JSON exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
+The `--name` flag overrides the name from `.json`, and `--group` is additive. Running `sync` also reconciles the database with the configured workspace JSON if present.
+
+### `.ai-workspace.json` path style
+
+Use forward slashes in committed `.ai-workspace.json` share paths, even on Windows. Shared paths from config must exist, stay inside the project directory, and be project-relative literal file or directory paths:
+
+```json
+{
+  "share": [
+    "examples",
+    "docs",
+    "docs/README.md"
+  ]
+}
+```
+
+Do not use glob patterns or Windows separator/trailing-slash style in committed configs:
+
+```json
+{
+  "share": [
+    "docs/**",
+    "examples\\"
+  ]
+}
+```
+
+To share everything under `docs`, share the directory with `"docs"` instead of `"docs/**"`. Backslash or trailing-slash entries may be normalized for compatibility when imported, but they are not the canonical style for committed config. `ai-workspace export` writes normalized `/` paths without trailing directory slashes, such as `"docs/README.md"` and `"examples"`.
+
+Artifact dependency sync is partial: if a share object omits `dependencies`, existing dependency rows for that share are left unchanged. To manage dependencies declaratively, include `dependencies`; an explicit empty array removes all dependencies for that share:
+
+```json
+{
+  "path": "docs/auth.md",
+  "kind": "file",
+  "dependencies": []
+}
+```
+
+The workspace JSON exports project-scoped configuration only: group notes and event history stay local and are intentionally not exported.
 
 If your repo keeps AI-related files under a dedicated directory, pass a custom config path. The path must be relative and remain inside the project root; absolute paths, `..`, backslashes on Unix, symlink escapes, and final config-path symlinks are rejected. Existing files at that path are only updated when they are already recognizable ai-workspace configs, so ordinary files such as `README.md` or `package.json` are not overwritten by a mistaken config path:
 
