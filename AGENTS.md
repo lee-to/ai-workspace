@@ -3,7 +3,7 @@
 > Project map for AI agents. Keep this file up-to-date as the project evolves.
 
 ## Project Overview
-Cross-project shared context CLI + MCP server. Manages shared files, directories, and notes across projects organized into groups, with full-text search.
+Cross-project shared context CLI + MCP server. Manages shared files, directories, and notes across projects organized into groups, with full-text search and a local Rust-only CodeGraph MVP.
 
 ## Tech Stack
 - **Language:** Rust (edition 2024)
@@ -23,6 +23,7 @@ ai-workspace/
 │   ├── models.rs           # Data models (Project, Group, SharedItem, SharedItemKind)
 │   ├── walk.rs             # File tree walker and grep (ignore + regex crates)
 │   ├── indexer.rs          # FTS5 indexer for shared .md files (mtime refresh, reindex)
+│   ├── codegraph.rs        # Rust-only CodeGraph parser, sync/reindex, source snippets
 │   ├── cli/
 │   │   └── mod.rs          # CLI subcommands and handlers
 │   ├── db/
@@ -32,7 +33,7 @@ ai-workspace/
 │   └── mcp/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
 │       ├── protocol.rs     # JSON-RPC types (request, response, error)
-│       └── tools.rs        # MCP tool implementations (workspace_context, read, search, search_fulltext, project_tree, project_grep)
+│       └── tools.rs        # MCP tool implementations (workspace, project, service, event, codegraph tools)
 ├── tests/
 │   ├── cli_tests.rs        # CLI integration tests
 │   ├── fts_search.rs       # FTS5 fulltext search integration tests
@@ -50,6 +51,7 @@ ai-workspace/
 | src/cli/mod.rs | CLI command definitions and handlers |
 | src/models.rs | Shared data types |
 | src/walk.rs | File tree walker and project grep |
+| src/codegraph.rs | Rust CodeGraph extraction, reference resolution, incremental sync |
 
 ## Documentation
 | Document | Path | Description |

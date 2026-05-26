@@ -293,6 +293,48 @@ pub enum EventCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum CodeGraphCommand {
+    /// Rebuild the Rust code graph for a project
+    Reindex {
+        /// Project id, slug, or registered path (defaults to current project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Index the full project instead of shared file/dir scopes
+        #[arg(long)]
+        full_project: bool,
+    },
+    /// Incrementally refresh changed Rust files in the code graph
+    Sync {
+        /// Project id, slug, or registered path (defaults to current project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Index the full project instead of shared file/dir scopes
+        #[arg(long)]
+        full_project: bool,
+    },
+    /// Show code graph health and counts
+    Status {
+        /// Project id, slug, or registered path (defaults to current project)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Search indexed Rust symbols
+    Search {
+        /// Symbol search text
+        query: String,
+        /// Project id, slug, or registered path (defaults to current project)
+        #[arg(long)]
+        project: Option<String>,
+        /// Optional node kind such as function, method, struct, trait, or import
+        #[arg(long)]
+        kind: Option<String>,
+        /// Max number of results
+        #[arg(long, short, default_value = "20")]
+        limit: usize,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize current directory as a project
     Init {
@@ -422,6 +464,11 @@ pub enum Command {
     },
     /// Rebuild the full-text index for all shared .md files
     Reindex,
+    /// Index and inspect Rust code structure
+    Codegraph {
+        #[command(subcommand)]
+        command: CodeGraphCommand,
+    },
 }
 
 /// Resolve the current project from cwd
@@ -435,6 +482,23 @@ fn require_project(db: &Db) -> Result<crate::models::Project> {
             Ok(p)
         }
         None => bail!("No project found for current directory.\nRun `ai-workspace init` first."),
+    }
+}
+
+fn resolve_cli_project(db: &Db, target: Option<&str>) -> Result<crate::models::Project> {
+    match target {
+        Some(target) => db
+            .resolve_project_target(target)?
+            .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", target)),
+        None => require_project(db),
+    }
+}
+
+fn codegraph_scope(full_project: bool) -> crate::codegraph::CodeGraphScope {
+    if full_project {
+        crate::codegraph::CodeGraphScope::FullProject
+    } else {
+        crate::codegraph::CodeGraphScope::SharedOnly
     }
 }
 
@@ -889,6 +953,29 @@ fn print_table(headers: &[&str], rows: &[Vec<String>]) {
         }
     }
     println!("{}", style_table_border(&border));
+}
+
+fn print_codegraph_run_stats(stats: &crate::codegraph::CodeGraphRunStats) {
+    print_table(
+        &[
+            "Scanned",
+            "Indexed",
+            "Unchanged",
+            "Removed",
+            "Nodes",
+            "Edges",
+            "Unresolved",
+        ],
+        &[vec![
+            stats.scanned_files.to_string(),
+            stats.indexed_files.to_string(),
+            stats.skipped_unchanged.to_string(),
+            stats.removed_files.to_string(),
+            stats.node_count.to_string(),
+            stats.edge_count.to_string(),
+            stats.unresolved_ref_count.to_string(),
+        ]],
+    );
 }
 
 fn project_display_slug(db: &Db, project_id: i64) -> Result<String> {
@@ -2517,6 +2604,143 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 stats.indexed, stats.skipped_size, stats.skipped_non_utf8, stats.skipped_missing
             ));
             Ok(())
+        }
+
+        Command::Codegraph { command } => {
+            let db = Db::open_default()?;
+            match command {
+                CodeGraphCommand::Reindex {
+                    project,
+                    full_project,
+                } => {
+                    debug!(
+                        "Parsed codegraph reindex command: project={:?} full_project={}",
+                        project, full_project
+                    );
+                    let project = resolve_cli_project(&db, project.as_deref())?;
+                    if full_project {
+                        warn!(
+                            "codegraph reindex using explicit full-project scope for project_slug='{}'",
+                            project.slug
+                        );
+                    }
+                    let stats = crate::codegraph::reindex_project(
+                        &db,
+                        &project,
+                        codegraph_scope(full_project),
+                    )?;
+                    print_success(format!(
+                        "CodeGraph reindex complete for '{}' ({})",
+                        project.name, project.slug
+                    ));
+                    print_codegraph_run_stats(&stats);
+                    Ok(())
+                }
+                CodeGraphCommand::Sync {
+                    project,
+                    full_project,
+                } => {
+                    debug!(
+                        "Parsed codegraph sync command: project={:?} full_project={}",
+                        project, full_project
+                    );
+                    let project = resolve_cli_project(&db, project.as_deref())?;
+                    if full_project {
+                        warn!(
+                            "codegraph sync using explicit full-project scope for project_slug='{}'",
+                            project.slug
+                        );
+                    }
+                    let stats = crate::codegraph::sync_project(
+                        &db,
+                        &project,
+                        codegraph_scope(full_project),
+                    )?;
+                    print_success(format!(
+                        "CodeGraph sync complete for '{}' ({})",
+                        project.name, project.slug
+                    ));
+                    print_codegraph_run_stats(&stats);
+                    Ok(())
+                }
+                CodeGraphCommand::Status { project } => {
+                    debug!("Parsed codegraph status command: project={:?}", project);
+                    let project = resolve_cli_project(&db, project.as_deref())?;
+                    let stats = db.code_graph_stats(project.id)?;
+                    println!(
+                        "Project: {} (id={}, slug={})",
+                        project.name, project.id, project.slug
+                    );
+                    println!("Files: {}", stats.file_count);
+                    println!("Nodes: {}", stats.node_count);
+                    println!("Edges: {}", stats.edge_count);
+                    println!("Unresolved refs: {}", stats.unresolved_ref_count);
+                    println!(
+                        "Last indexed: {}",
+                        stats.last_indexed_at.as_deref().unwrap_or("-")
+                    );
+                    if stats.file_count == 0 {
+                        warn!(
+                            "codegraph status found empty graph for project_slug='{}'",
+                            project.slug
+                        );
+                        print_info("CodeGraph is empty. Run `ai-workspace codegraph sync`.");
+                    }
+                    Ok(())
+                }
+                CodeGraphCommand::Search {
+                    query,
+                    project,
+                    kind,
+                    limit,
+                } => {
+                    debug!(
+                        "Parsed codegraph search command: project={:?} kind={:?} limit={} query='{}'",
+                        project, kind, limit, query
+                    );
+                    let project = resolve_cli_project(&db, project.as_deref())?;
+                    let kind = kind
+                        .as_deref()
+                        .map(|kind| kind.parse::<crate::models::CodeNodeKind>())
+                        .transpose()
+                        .with_context(|| {
+                            "Invalid --kind. Expected one of: file, module, struct, enum, trait, impl, function, method, const, type_alias, import"
+                        })?;
+                    let hits = db.search_code_nodes(
+                        project.id,
+                        &crate::models::CodeNodeSearch {
+                            query: Some(query.clone()),
+                            kind,
+                            language: Some("rust".to_string()),
+                            file_path: None,
+                            limit,
+                        },
+                    )?;
+                    if hits.is_empty() {
+                        warn!(
+                            "codegraph search returned no results: project_slug='{}' query='{}'",
+                            project.slug, query
+                        );
+                        print_info(format!("No CodeGraph matches for '{}'", query));
+                        return Ok(());
+                    }
+                    let rows = hits
+                        .iter()
+                        .map(|hit| {
+                            vec![
+                                hit.node.kind.to_string(),
+                                hit.node.name.clone(),
+                                truncate_for_cell(&hit.node.qualified_name, 64),
+                                hit.node.file_path.clone(),
+                                hit.node.start_line.to_string(),
+                            ]
+                        })
+                        .collect::<Vec<_>>();
+                    print_table(&["Kind", "Name", "Qualified", "File", "Line"], &rows);
+                    print_info(format!("{} result(s)", hits.len()));
+                    Ok(())
+                }
+            }
         }
     }
 }

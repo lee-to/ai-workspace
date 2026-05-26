@@ -323,6 +323,127 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "required": ["event_id"],
                         "additionalProperties": false
                     }
+                },
+                {
+                    "name": "codegraph_status",
+                    "description": "Return Rust CodeGraph health and counts for one in-scope project. By default counts only currently shared file/dir scopes; set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to expose full-project indexed metadata inside the MCP scope.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Project ID"
+                            },
+                            "project": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Project id, slug, or registered path"
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "codegraph_search",
+                    "description": "Search indexed Rust symbols by text, kind, language, and file path without scanning project files. Results are limited to the configured MCP scope and current shared file/dir visibility unless project-wide tools are enabled.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": { "type": "integer", "minimum": 1 },
+                            "project": { "type": "string", "minLength": 1 },
+                            "query": {
+                                "type": "string",
+                                "description": "Optional FTS text query over symbol names, qualified names, docstrings, and signatures"
+                            },
+                            "kind": {
+                                "type": "string",
+                                "enum": ["file", "module", "struct", "enum", "trait", "impl", "function", "method", "const", "type_alias", "import"]
+                            },
+                            "language": {
+                                "type": "string",
+                                "description": "Language filter; MVP indexes rust"
+                            },
+                            "file_path": {
+                                "type": "string",
+                                "description": "Project-relative source path filter"
+                            },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 200,
+                                "default": 20
+                            }
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "codegraph_node",
+                    "description": "Return one visible indexed Rust symbol by node_id. Source snippets are optional, bounded, and subject to the current MCP scope/shared-path policy.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": { "type": "integer", "minimum": 1 },
+                            "project": { "type": "string", "minLength": 1 },
+                            "node_id": { "type": "string", "minLength": 1 },
+                            "include_source": {
+                                "type": "boolean",
+                                "description": "Include a compact source snippet around the symbol (default: false)"
+                            }
+                        },
+                        "required": ["node_id"],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "codegraph_callers",
+                    "description": "Return visible incoming Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": { "type": "integer", "minimum": 1 },
+                            "project": { "type": "string", "minLength": 1 },
+                            "node_id": { "type": "string", "minLength": 1 },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+                        },
+                        "required": ["node_id"],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "codegraph_callees",
+                    "description": "Return visible outgoing Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": { "type": "integer", "minimum": 1 },
+                            "project": { "type": "string", "minLength": 1 },
+                            "node_id": { "type": "string", "minLength": 1 },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": 200, "default": 20 }
+                        },
+                        "required": ["node_id"],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "codegraph_context",
+                    "description": "Return compact visible Rust symbols, entry points, related calls, and snippets for a task description. Prefer this before grep when CodeGraph is populated.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": { "type": "integer", "minimum": 1 },
+                            "project": { "type": "string", "minLength": 1 },
+                            "task": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Task or question to search symbol context for"
+                            },
+                            "limit": { "type": "integer", "minimum": 1, "maximum": 20, "default": 8 }
+                        },
+                        "required": ["task"],
+                        "additionalProperties": false
+                    }
                 }
             ]
         }),
@@ -354,11 +475,11 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_eleven_tools() {
+    fn handle_tools_list_returns_seventeen_tools() {
         let resp = handle_tools_list(json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 11);
+        assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
         assert!(names.contains(&"workspace_read"));
@@ -371,6 +492,12 @@ mod tests {
         assert!(names.contains(&"workspace_service_graph"));
         assert!(names.contains(&"workspace_events"));
         assert!(names.contains(&"workspace_event_details"));
+        assert!(names.contains(&"codegraph_status"));
+        assert!(names.contains(&"codegraph_search"));
+        assert!(names.contains(&"codegraph_node"));
+        assert!(names.contains(&"codegraph_callers"));
+        assert!(names.contains(&"codegraph_callees"));
+        assert!(names.contains(&"codegraph_context"));
     }
 
     #[test]

@@ -8,6 +8,7 @@ A cross-project shared context CLI and MCP server that enables AI agents to acce
 - **Shared Items**: Share files, directories, and notes (project-scoped or group-scoped) with labels
 - **MCP Server**: Expose workspace context, file reading, and full-text search via JSON-RPC over stdio
 - **Full-Text Search**: FTS5-powered search over shared note labels and content
+- **CodeGraph MVP**: Rust-only local semantic index over shared or explicitly full-project Rust source scopes
 - **CLI Interface**: Complete CRUD operations via `ai-workspace` binary with subcommands
 
 ## Tech Stack

@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::models::normalize_project_slug;
 
-const CURRENT_SCHEMA_VERSION: i64 = 5;
+const CURRENT_SCHEMA_VERSION: i64 = 6;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -93,6 +93,10 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
         5 => {
             debug!("Migration v5: add event group snapshots");
             migrate_to_event_groups(conn)
+        }
+        6 => {
+            debug!("Migration v6: add Rust code graph tables");
+            ensure_codegraph_schema_objects(conn)
         }
         _ => {
             error!("No migration registered for schema version {}", version);
@@ -436,6 +440,124 @@ fn ensure_event_schema_objects(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_codegraph_schema_objects(conn: &Connection) -> Result<()> {
+    debug!("Migration v6: creating code graph tables, indexes, and FTS objects");
+    execute_schema_step(
+        conn,
+        "codegraph tables, indexes, and FTS",
+        "
+        CREATE TABLE IF NOT EXISTS code_files (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            content_hash TEXT NOT NULL,
+            size INTEGER NOT NULL,
+            mtime INTEGER NOT NULL,
+            indexed_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            node_count INTEGER NOT NULL DEFAULT 0,
+            errors_json TEXT,
+            UNIQUE(project_id, path)
+        );
+
+        CREATE TABLE IF NOT EXISTS code_nodes (
+            stable_id TEXT PRIMARY KEY,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL CHECK (kind IN (
+                'file',
+                'module',
+                'struct',
+                'enum',
+                'trait',
+                'impl',
+                'function',
+                'method',
+                'const',
+                'type_alias',
+                'import'
+            )),
+            name TEXT NOT NULL,
+            qualified_name TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            language TEXT NOT NULL,
+            start_line INTEGER NOT NULL,
+            start_column INTEGER NOT NULL,
+            end_line INTEGER NOT NULL,
+            end_column INTEGER NOT NULL,
+            docstring TEXT,
+            signature TEXT,
+            visibility TEXT,
+            flags_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS code_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_node_id TEXT NOT NULL,
+            target_node_id TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('contains', 'calls', 'imports', 'references')),
+            line INTEGER,
+            column INTEGER,
+            metadata_json TEXT,
+            provenance TEXT NOT NULL DEFAULT 'extractor'
+        );
+
+        CREATE TABLE IF NOT EXISTS code_unresolved_refs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+            source_node_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            ref_name TEXT NOT NULL,
+            kind TEXT NOT NULL CHECK (kind IN ('calls', 'imports', 'references')),
+            line INTEGER NOT NULL,
+            column INTEGER NOT NULL,
+            metadata_json TEXT
+        );
+
+        CREATE VIRTUAL TABLE IF NOT EXISTS code_nodes_fts USING fts5(
+            stable_id UNINDEXED,
+            name,
+            qualified_name,
+            docstring,
+            signature,
+            tokenize='unicode61 remove_diacritics 2'
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_code_files_project_path
+        ON code_files(project_id, path);
+
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_project_file
+        ON code_nodes(project_id, file_path);
+
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_project_kind
+        ON code_nodes(project_id, kind);
+
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_project_name
+        ON code_nodes(project_id, name);
+
+        CREATE INDEX IF NOT EXISTS idx_code_nodes_project_qualified_name
+        ON code_nodes(project_id, qualified_name);
+
+        CREATE INDEX IF NOT EXISTS idx_code_edges_project_source_kind
+        ON code_edges(project_id, source_node_id, kind);
+
+        CREATE INDEX IF NOT EXISTS idx_code_edges_project_target_kind
+        ON code_edges(project_id, target_node_id, kind);
+
+        CREATE INDEX IF NOT EXISTS idx_code_unresolved_refs_project_file
+        ON code_unresolved_refs(project_id, file_path);
+
+        CREATE TRIGGER IF NOT EXISTS trg_code_nodes_delete_fts
+        AFTER DELETE ON code_nodes
+        BEGIN
+            DELETE FROM code_nodes_fts WHERE stable_id = OLD.stable_id;
+        END;
+        ",
+    )?;
+    info!("CodeGraph schema initialized");
+    Ok(())
+}
+
 fn migrate_to_event_groups(conn: &Connection) -> Result<()> {
     execute_schema_step(
         conn,
@@ -489,6 +611,10 @@ mod tests {
         assert!(tables.contains(&"event_groups".to_string()));
         assert!(tables.contains(&"event_targets".to_string()));
         assert!(tables.contains(&"event_artifacts".to_string()));
+        assert!(tables.contains(&"code_files".to_string()));
+        assert!(tables.contains(&"code_nodes".to_string()));
+        assert!(tables.contains(&"code_edges".to_string()));
+        assert!(tables.contains(&"code_unresolved_refs".to_string()));
     }
 
     #[test]
@@ -573,8 +699,8 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 5);
+        assert_eq!(version, 6);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
     }
 
     #[test]
@@ -646,7 +772,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
 
         let group_ids = conn
             .prepare("SELECT group_id FROM event_groups WHERE event_id = 42 ORDER BY group_id")
@@ -807,6 +933,10 @@ mod tests {
             "event_groups",
             "event_targets",
             "event_artifacts",
+            "code_files",
+            "code_nodes",
+            "code_edges",
+            "code_unresolved_refs",
         ] {
             let count: i64 = conn
                 .query_row(

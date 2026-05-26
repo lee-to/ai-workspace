@@ -3,8 +3,11 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
-use crate::db::Db;
-use crate::models::{FileSearchHit, Group, Project, SharedItem, SharedItemKind};
+use crate::db::{CodeGraphEdgeDirection, Db};
+use crate::models::{
+    CodeEdge, CodeEdgeKind, CodeGraphSearchHit, CodeNode, CodeNodeSearch, FileSearchHit, Group,
+    Project, SharedItem, SharedItemKind,
+};
 use crate::walk;
 
 const PROJECT_WIDE_TOOLS_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS";
@@ -563,6 +566,72 @@ fn shared_tree_needs_hidden_traversal(
         .any(|scope| scope_allows_shared_ai_factory(scope, options))
 }
 
+struct CodeGraphVisibility {
+    project_id: i64,
+    canonical_root: PathBuf,
+    project_wide: bool,
+    scopes: Vec<SharedPathScope>,
+}
+
+impl CodeGraphVisibility {
+    fn load(project_id: i64, db: &Db) -> Result<Self, String> {
+        let project = db
+            .get_project_by_id(project_id)
+            .map_err(|e| format!("Failed to resolve project: {}", e))?
+            .ok_or_else(|| format!("Project {} not found", project_id))?;
+        let root = PathBuf::from(&project.path);
+        let canonical_root = root
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+        let project_wide = project_wide_tools_enabled();
+        let scopes = if project_wide {
+            Vec::new()
+        } else {
+            shared_path_scopes(project_id, &canonical_root, db)?
+        };
+        Ok(Self {
+            project_id,
+            canonical_root,
+            project_wide,
+            scopes,
+        })
+    }
+
+    fn path_visible(&self, rel_path: &str) -> bool {
+        let Ok(normalized) = normalize_rel_path(rel_path) else {
+            return false;
+        };
+        let rel = Path::new(&normalized);
+        if !walk::path_allowed_by_options(rel, walk::WalkOptions::default()) {
+            return false;
+        }
+        let target = self.canonical_root.join(rel);
+        let Ok(canonical) = target.canonicalize() else {
+            return false;
+        };
+        if !canonical.starts_with(&self.canonical_root) {
+            return false;
+        }
+        if self.project_wide {
+            return true;
+        }
+        let Some(scope) = find_shared_scope(&normalized, &self.scopes) else {
+            return false;
+        };
+        canonical_path_is_shared(&canonical, scope)
+    }
+
+    fn visible_file_paths(&self, db: &Db) -> Result<Vec<String>, String> {
+        let paths = db
+            .list_code_file_paths(self.project_id)
+            .map_err(|e| format!("Failed to list CodeGraph files: {}", e))?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| self.path_visible(path))
+            .collect())
+    }
+}
+
 #[cfg(test)]
 pub fn handle_tool_call(id: serde_json::Value, params: serde_json::Value) -> JsonRpcResponse {
     handle_tool_call_scoped(id, params, &McpScope::global())
@@ -829,6 +898,168 @@ pub fn handle_tool_call_scoped(
                 Err(e) => return tool_error(id, &e),
             };
             workspace_event_details_scoped(id, event_id, &db, scope)
+        }
+        "codegraph_status" => {
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            let visibility = match CodeGraphVisibility::load(project_id, &db) {
+                Ok(visibility) => visibility,
+                Err(e) => return tool_error(id, &e),
+            };
+            codegraph_status(id, project_id, &db, &visibility)
+        }
+        "codegraph_search" => {
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            let visibility = match CodeGraphVisibility::load(project_id, &db) {
+                Ok(visibility) => visibility,
+                Err(e) => return tool_error(id, &e),
+            };
+            let query = arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
+            let kind = match arguments.get("kind").and_then(|v| v.as_str()) {
+                Some(kind) => match kind.parse::<crate::models::CodeNodeKind>() {
+                    Ok(kind) => Some(kind),
+                    Err(_) => {
+                        return JsonRpcResponse::error(
+                            id,
+                            McpError::invalid_params("Invalid kind for codegraph_search"),
+                        );
+                    }
+                },
+                None => None,
+            };
+            let language = arguments
+                .get("language")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
+            let file_path = arguments
+                .get("file_path")
+                .and_then(|v| v.as_str())
+                .map(|value| value.to_string());
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(20);
+            codegraph_search(
+                id,
+                project_id,
+                &CodeNodeSearch {
+                    query,
+                    kind,
+                    language,
+                    file_path,
+                    limit,
+                },
+                &db,
+                &visibility,
+            )
+        }
+        "codegraph_node" => {
+            let node_id = match arguments.get("node_id").and_then(|v| v.as_str()) {
+                Some(node_id) => node_id.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: node_id"),
+                    );
+                }
+            };
+            let include_source = arguments
+                .get("include_source")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            let visibility = match CodeGraphVisibility::load(project_id, &db) {
+                Ok(visibility) => visibility,
+                Err(e) => return tool_error(id, &e),
+            };
+            codegraph_node(id, project_id, &node_id, include_source, &db, &visibility)
+        }
+        "codegraph_callers" | "codegraph_callees" => {
+            let node_id = match arguments.get("node_id").and_then(|v| v.as_str()) {
+                Some(node_id) => node_id.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: node_id"),
+                    );
+                }
+            };
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(20);
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            let visibility = match CodeGraphVisibility::load(project_id, &db) {
+                Ok(visibility) => visibility,
+                Err(e) => return tool_error(id, &e),
+            };
+            let direction = if tool_name == "codegraph_callers" {
+                CodeGraphEdgeDirection::Incoming
+            } else {
+                CodeGraphEdgeDirection::Outgoing
+            };
+            codegraph_edges(id, project_id, &node_id, direction, limit, &db, &visibility)
+        }
+        "codegraph_context" => {
+            let task = match arguments.get("task").and_then(|v| v.as_str()) {
+                Some(task) => task.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: task"),
+                    );
+                }
+            };
+            let limit = arguments
+                .get("limit")
+                .and_then(|v| v.as_u64())
+                .map(|value| value as usize)
+                .unwrap_or(8);
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            let visibility = match CodeGraphVisibility::load(project_id, &db) {
+                Ok(visibility) => visibility,
+                Err(e) => return tool_error(id, &e),
+            };
+            codegraph_context(id, project_id, &task, limit, &db, &visibility)
         }
         _ => {
             error!("Unknown tool: {}", tool_name);
@@ -2191,6 +2422,465 @@ fn workspace_event_details_scoped(
             "created_at": artifact.created_at,
             "updated_at": artifact.updated_at
         })).collect::<Vec<_>>()
+    });
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn codegraph_project_id_from_args(arguments: &serde_json::Value, db: &Db) -> Result<i64, String> {
+    let project_id = arguments.get("project_id").and_then(|value| value.as_i64());
+    let project = arguments.get("project").and_then(|value| value.as_str());
+    if project_id.is_some() && project.is_some() {
+        return Err("Provide either project_id OR project, not both".to_string());
+    }
+    if let Some(project_id) = project_id {
+        if db
+            .get_project_by_id(project_id)
+            .map_err(|err| format!("Failed to resolve project: {}", err))?
+            .is_some()
+        {
+            return Ok(project_id);
+        }
+        return Err(format!("Project {} not found", project_id));
+    }
+    if let Some(project) = project {
+        return db
+            .resolve_project_target(project)
+            .map_err(|err| format!("Failed to resolve project: {}", err))?
+            .map(|project| project.id)
+            .ok_or_else(|| format!("Project '{}' not found", project));
+    }
+    Err("Missing required parameter: project_id or project".to_string())
+}
+
+fn codegraph_project_id_from_args_scoped(
+    arguments: &serde_json::Value,
+    db: &Db,
+    scope: &McpScope,
+) -> Result<i64, String> {
+    let project_id = codegraph_project_id_from_args(arguments, db)?;
+    if scope.allows_project(project_id) {
+        Ok(project_id)
+    } else {
+        Err(ACCESS_DENIED_SCOPE.to_string())
+    }
+}
+
+fn search_visible_code_nodes(
+    project_id: i64,
+    search: &CodeNodeSearch,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> Result<Vec<CodeGraphSearchHit>, String> {
+    let requested_limit = if search.limit == 0 {
+        20
+    } else {
+        search.limit.min(200)
+    };
+    let mut scoped_search = search.clone();
+    scoped_search.limit = requested_limit
+        .saturating_mul(8)
+        .clamp(requested_limit, 200);
+    if let Some(file_path) = search.file_path.as_deref() {
+        let normalized = normalize_rel_path(file_path)?;
+        if !visibility.path_visible(&normalized) {
+            return Err(ACCESS_DENIED_NOT_SHARED.to_string());
+        }
+        scoped_search.file_path = Some(normalized);
+    }
+
+    let hits = db
+        .search_code_nodes(project_id, &scoped_search)
+        .map_err(|err| err.to_string())?;
+    Ok(hits
+        .into_iter()
+        .filter(|hit| visibility.path_visible(&hit.node.file_path))
+        .take(requested_limit)
+        .collect())
+}
+
+fn visible_codegraph_edges(
+    project_id: i64,
+    node_id: &str,
+    direction: CodeGraphEdgeDirection,
+    limit: usize,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> Result<Vec<(CodeEdge, CodeNode)>, String> {
+    let requested_limit = if limit == 0 { 20 } else { limit.min(200) };
+    let fetch_limit = requested_limit
+        .saturating_mul(8)
+        .clamp(requested_limit, 200);
+    let edges = db
+        .list_code_edges(
+            project_id,
+            node_id,
+            direction,
+            Some(CodeEdgeKind::Calls),
+            fetch_limit,
+        )
+        .map_err(|err| err.to_string())?;
+    let mut visible = Vec::new();
+    for edge in edges {
+        let Some(source) = db
+            .get_code_node(project_id, &edge.source_node_id)
+            .map_err(|err| err.to_string())?
+        else {
+            continue;
+        };
+        let Some(target) = db
+            .get_code_node(project_id, &edge.target_node_id)
+            .map_err(|err| err.to_string())?
+        else {
+            continue;
+        };
+        if !visibility.path_visible(&source.file_path)
+            || !visibility.path_visible(&target.file_path)
+        {
+            continue;
+        }
+        let related = match direction {
+            CodeGraphEdgeDirection::Incoming => source,
+            CodeGraphEdgeDirection::Outgoing => target,
+        };
+        visible.push((edge, related));
+        if visible.len() >= requested_limit {
+            break;
+        }
+    }
+    Ok(visible)
+}
+
+fn codegraph_status(
+    id: serde_json::Value,
+    project_id: i64,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> JsonRpcResponse {
+    info!("codegraph_status: project_id={}", project_id);
+    let stats = if visibility.project_wide {
+        db.code_graph_stats(project_id)
+    } else {
+        match visibility.visible_file_paths(db) {
+            Ok(paths) => db.code_graph_stats_for_paths(project_id, &paths),
+            Err(err) => return tool_error(id, &err),
+        }
+    };
+    match stats {
+        Ok(stats) => {
+            if stats.file_count == 0 {
+                warn!(
+                    "codegraph_status: empty graph for project_id={}",
+                    project_id
+                );
+            }
+            let text = serde_json::to_string_pretty(&stats).unwrap_or_default();
+            tool_result(id, text)
+        }
+        Err(err) => tool_error(id, &format!("codegraph_status failed: {}", err)),
+    }
+}
+
+fn codegraph_search(
+    id: serde_json::Value,
+    project_id: i64,
+    search: &CodeNodeSearch,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> JsonRpcResponse {
+    info!(
+        "codegraph_search: project_id={} query={:?} kind={:?} limit={}",
+        project_id, search.query, search.kind, search.limit
+    );
+    match search_visible_code_nodes(project_id, search, db, visibility) {
+        Ok(hits) => {
+            if hits.is_empty() {
+                warn!(
+                    "codegraph_search: empty result project_id={} query={:?}",
+                    project_id, search.query
+                );
+            }
+            let result = hits
+                .iter()
+                .map(|hit| {
+                    serde_json::json!({
+                        "node_id": &hit.node.stable_id,
+                        "kind": hit.node.kind.as_str(),
+                        "name": &hit.node.name,
+                        "qualified_name": &hit.node.qualified_name,
+                        "file_path": &hit.node.file_path,
+                        "language": &hit.node.language,
+                        "start_line": hit.node.start_line,
+                        "end_line": hit.node.end_line,
+                        "signature": &hit.node.signature,
+                        "rank": hit.rank
+                    })
+                })
+                .collect::<Vec<_>>();
+            info!(
+                "codegraph_search: returning {} node(s) for project_id={}",
+                result.len(),
+                project_id
+            );
+            let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+            tool_result(id, text)
+        }
+        Err(err) => tool_error(id, &format!("codegraph_search failed: {}", err)),
+    }
+}
+
+fn codegraph_node(
+    id: serde_json::Value,
+    project_id: i64,
+    node_id: &str,
+    include_source: bool,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> JsonRpcResponse {
+    info!(
+        "codegraph_node: project_id={} node_id={} include_source={}",
+        project_id, node_id, include_source
+    );
+    let node = match db.get_code_node(project_id, node_id) {
+        Ok(Some(node)) => node,
+        Ok(None) => match db.find_code_nodes_by_name(project_id, node_id, 3) {
+            Ok(mut nodes) => {
+                nodes.retain(|node| visibility.path_visible(&node.file_path));
+                if nodes.len() == 1 {
+                    nodes.remove(0)
+                } else if nodes.len() > 1 {
+                    warn!(
+                        "codegraph_node: ambiguous name project_id={} node_id={} matches={}",
+                        project_id,
+                        node_id,
+                        nodes.len()
+                    );
+                    return tool_error(
+                        id,
+                        &format!(
+                            "CodeGraph node '{}' is ambiguous; use a stable node_id from codegraph_search",
+                            node_id
+                        ),
+                    );
+                } else {
+                    warn!(
+                        "codegraph_node: node not found project_id={} node_id={}",
+                        project_id, node_id
+                    );
+                    return tool_error(id, &format!("CodeGraph node '{}' not found", node_id));
+                }
+            }
+            Err(err) => return tool_error(id, &format!("codegraph_node lookup failed: {}", err)),
+        },
+        Err(err) => return tool_error(id, &format!("codegraph_node failed: {}", err)),
+    };
+    if !visibility.path_visible(&node.file_path) {
+        warn!(
+            "codegraph_node: denied unshared node project_id={} node_id={} file_path={}",
+            project_id, node_id, node.file_path
+        );
+        return tool_error(id, ACCESS_DENIED_NOT_SHARED);
+    }
+    let mut result = serde_json::json!({
+        "node_id": &node.stable_id,
+        "kind": node.kind.as_str(),
+        "name": &node.name,
+        "qualified_name": &node.qualified_name,
+        "file_path": &node.file_path,
+        "language": &node.language,
+        "start_line": node.start_line,
+        "start_column": node.start_column,
+        "end_line": node.end_line,
+        "end_column": node.end_column,
+        "docstring": &node.docstring,
+        "signature": &node.signature,
+        "visibility": &node.visibility,
+        "flags_json": &node.flags_json
+    });
+    if include_source {
+        match db.get_project_by_id(project_id) {
+            Ok(Some(project)) => match crate::codegraph::source_snippet(&project, &node, 2) {
+                Ok(snippet) => {
+                    result["source"] = serde_json::json!(snippet);
+                }
+                Err(err) => {
+                    error!(
+                        "codegraph_node source read failed: project_id={} node_id={} error={}",
+                        project_id, node_id, err
+                    );
+                    return tool_error(id, &format!("codegraph_node source read failed: {}", err));
+                }
+            },
+            Ok(None) => return tool_error(id, &format!("Project {} not found", project_id)),
+            Err(err) => return tool_error(id, &format!("Failed to resolve project: {}", err)),
+        }
+    }
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn codegraph_edges(
+    id: serde_json::Value,
+    project_id: i64,
+    node_id: &str,
+    direction: CodeGraphEdgeDirection,
+    limit: usize,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> JsonRpcResponse {
+    info!(
+        "codegraph_edges: project_id={} node_id={} direction={:?} limit={}",
+        project_id, node_id, direction, limit
+    );
+    if let Ok(Some(anchor)) = db.get_code_node(project_id, node_id)
+        && !visibility.path_visible(&anchor.file_path)
+    {
+        warn!(
+            "codegraph_edges: denied unshared anchor project_id={} node_id={} file_path={}",
+            project_id, node_id, anchor.file_path
+        );
+        return tool_error(id, ACCESS_DENIED_NOT_SHARED);
+    }
+    let edges = match visible_codegraph_edges(project_id, node_id, direction, limit, db, visibility)
+    {
+        Ok(edges) => edges,
+        Err(err) => return tool_error(id, &format!("codegraph edge query failed: {}", err)),
+    };
+    let result = edges
+        .iter()
+        .map(|(edge, related)| {
+            let related = serde_json::json!({
+                "node_id": &related.stable_id,
+                "kind": related.kind.as_str(),
+                "name": &related.name,
+                "qualified_name": &related.qualified_name,
+                "file_path": &related.file_path,
+                "start_line": related.start_line
+            });
+            serde_json::json!({
+                "edge_id": edge.id,
+                "kind": edge.kind.as_str(),
+                "source_node_id": &edge.source_node_id,
+                "target_node_id": &edge.target_node_id,
+                "line": edge.line,
+                "column": edge.column,
+                "related": related
+            })
+        })
+        .collect::<Vec<_>>();
+    info!(
+        "codegraph_edges: returning {} edge(s) for project_id={}",
+        result.len(),
+        project_id
+    );
+    let text = serde_json::to_string_pretty(&result).unwrap_or_default();
+    tool_result(id, text)
+}
+
+fn codegraph_context(
+    id: serde_json::Value,
+    project_id: i64,
+    task: &str,
+    limit: usize,
+    db: &Db,
+    visibility: &CodeGraphVisibility,
+) -> JsonRpcResponse {
+    info!(
+        "codegraph_context: project_id={} task_len={} limit={}",
+        project_id,
+        task.len(),
+        limit
+    );
+    let search = CodeNodeSearch {
+        query: Some(task.to_string()),
+        kind: None,
+        language: Some("rust".to_string()),
+        file_path: None,
+        limit: limit.min(20),
+    };
+    let mut hits = match search_visible_code_nodes(project_id, &search, db, visibility) {
+        Ok(hits) => hits,
+        Err(err) => return tool_error(id, &format!("codegraph_context search failed: {}", err)),
+    };
+    if hits.is_empty() {
+        debug!("codegraph_context: full task query returned no hits; trying individual terms");
+        let mut seen = std::collections::HashSet::new();
+        for term in task
+            .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+            .filter(|term| term.len() >= 3)
+        {
+            let term_search = CodeNodeSearch {
+                query: Some(term.to_string()),
+                kind: None,
+                language: Some("rust".to_string()),
+                file_path: None,
+                limit: limit.min(20),
+            };
+            match search_visible_code_nodes(project_id, &term_search, db, visibility) {
+                Ok(term_hits) => {
+                    for hit in term_hits {
+                        if seen.insert(hit.node.stable_id.clone()) {
+                            hits.push(hit);
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "codegraph_context fallback term search failed: project_id={} term={} error={}",
+                        project_id, term, err
+                    );
+                }
+            }
+            if hits.len() >= limit.min(20) {
+                break;
+            }
+        }
+    }
+    let project = match db.get_project_by_id(project_id) {
+        Ok(Some(project)) => project,
+        Ok(None) => return tool_error(id, &format!("Project {} not found", project_id)),
+        Err(err) => return tool_error(id, &format!("Failed to resolve project: {}", err)),
+    };
+    let mut blocks = Vec::new();
+    for hit in hits.iter().take(limit.min(20)) {
+        let callers = visible_codegraph_edges(
+            project_id,
+            &hit.node.stable_id,
+            CodeGraphEdgeDirection::Incoming,
+            200,
+            db,
+            visibility,
+        )
+        .unwrap_or_default()
+        .len();
+        let callees = visible_codegraph_edges(
+            project_id,
+            &hit.node.stable_id,
+            CodeGraphEdgeDirection::Outgoing,
+            200,
+            db,
+            visibility,
+        )
+        .unwrap_or_default()
+        .len();
+        let snippet = crate::codegraph::source_snippet(&project, &hit.node, 1).unwrap_or_default();
+        blocks.push(serde_json::json!({
+            "node_id": &hit.node.stable_id,
+            "kind": hit.node.kind.as_str(),
+            "name": &hit.node.name,
+            "qualified_name": &hit.node.qualified_name,
+            "file_path": &hit.node.file_path,
+            "start_line": hit.node.start_line,
+            "signature": &hit.node.signature,
+            "callers_count": callers,
+            "callees_count": callees,
+            "snippet": snippet
+        }));
+    }
+    let result = serde_json::json!({
+        "project_id": project_id,
+        "task": task,
+        "entries": blocks
     });
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     tool_result(id, text)
