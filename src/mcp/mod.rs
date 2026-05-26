@@ -326,7 +326,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_status",
-                    "description": "Return Rust CodeGraph health and counts for one project. Uses only locally indexed metadata.",
+                    "description": "Return Rust CodeGraph health and counts for one in-scope project. By default counts only currently shared file/dir scopes; set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to expose full-project indexed metadata inside the MCP scope.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -346,7 +346,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_search",
-                    "description": "Search indexed Rust symbols by text, kind, language, and file path without scanning project files.",
+                    "description": "Search indexed Rust symbols by text, kind, language, and file path without scanning project files. Results are limited to the configured MCP scope and current shared file/dir visibility unless project-wide tools are enabled.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -380,7 +380,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_node",
-                    "description": "Return one indexed Rust symbol by node_id. Source snippets are optional and bounded.",
+                    "description": "Return one visible indexed Rust symbol by node_id. Source snippets are optional, bounded, and subject to the current MCP scope/shared-path policy.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -398,7 +398,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_callers",
-                    "description": "Return incoming Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
+                    "description": "Return visible incoming Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -413,7 +413,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_callees",
-                    "description": "Return outgoing Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
+                    "description": "Return visible outgoing Rust calls edges for a symbol node_id. Output is bounded and metadata-only by default.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -428,7 +428,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 },
                 {
                     "name": "codegraph_context",
-                    "description": "Return compact Rust symbols, entry points, related calls, and snippets for a task description. Prefer this before grep when CodeGraph is populated.",
+                    "description": "Return compact visible Rust symbols, entry points, related calls, and snippets for a task description. Prefer this before grep when CodeGraph is populated.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {

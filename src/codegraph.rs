@@ -147,57 +147,48 @@ fn sync_project_inner(
 ) -> Result<CodeGraphRunStats> {
     let mut stats = CodeGraphRunStats::default();
     let candidates = collect_candidate_files(db, project, scope, &mut stats)?;
+    let candidate_by_path = candidates
+        .iter()
+        .map(|candidate| (candidate.rel_path.clone(), candidate.clone()))
+        .collect::<BTreeMap<_, _>>();
     let candidate_paths = candidates
         .iter()
         .map(|candidate| candidate.rel_path.clone())
         .collect::<BTreeSet<_>>();
 
-    if !force {
-        for indexed_path in db.list_code_file_paths(project.id)? {
-            if !candidate_paths.contains(&indexed_path) {
-                db.delete_code_graph_file(project.id, &indexed_path)
-                    .with_context(|| {
-                        format!(
-                            "codegraph cleanup failed for project_id={} path='{}'",
-                            project.id, indexed_path
-                        )
-                    })?;
-                stats.removed_files += 1;
-            }
-        }
-    }
-
-    let changed_paths = candidates
-        .iter()
-        .map(|candidate| candidate.rel_path.clone())
-        .collect::<HashSet<_>>();
-    let existing_nodes = db
-        .list_code_nodes_for_project(project.id)?
-        .into_iter()
-        .filter(|node| !changed_paths.contains(&node.file_path))
-        .collect::<Vec<_>>();
+    let removed_paths = if force {
+        BTreeSet::new()
+    } else {
+        db.list_code_file_paths(project.id)?
+            .into_iter()
+            .filter(|indexed_path| !candidate_paths.contains(indexed_path))
+            .collect::<BTreeSet<_>>()
+    };
+    let existing_nodes_before = db.list_code_nodes_for_project(project.id)?;
 
     let patterns = RustPatterns::new()?;
-    let mut parsed_files = Vec::new();
-    for candidate in candidates {
+    let mut decisions = BTreeMap::<String, ParseDecision>::new();
+    let mut changed_paths = BTreeSet::<String>::new();
+    let mut changed_nodes = Vec::<CodeNode>::new();
+    for candidate in &candidates {
         stats.scanned_files += 1;
         debug!(
             "codegraph parse candidate start: project_id={} path={}",
             project.id, candidate.rel_path
         );
-        match parse_candidate(db, project, &candidate, &patterns, force) {
-            Ok(ParseDecision::Unchanged) => {
-                stats.skipped_unchanged += 1;
+        match parse_candidate(db, project, candidate, &patterns, force) {
+            Ok(decision @ ParseDecision::Unchanged) => {
                 debug!(
                     "codegraph incremental skip unchanged: project_id={} path={}",
                     project.id, candidate.rel_path
                 );
+                decisions.insert(candidate.rel_path.clone(), decision);
             }
-            Ok(ParseDecision::SkippedPolicy) => {
-                stats.skipped_policy += 1;
+            Ok(decision @ ParseDecision::SkippedPolicy) => {
+                decisions.insert(candidate.rel_path.clone(), decision);
             }
-            Ok(ParseDecision::SkippedOversized) => {
-                stats.skipped_oversized += 1;
+            Ok(decision @ ParseDecision::SkippedOversized) => {
+                decisions.insert(candidate.rel_path.clone(), decision);
             }
             Ok(ParseDecision::Parsed(parsed)) => {
                 debug!(
@@ -206,7 +197,9 @@ fn sync_project_inner(
                     parsed.nodes.len(),
                     parsed.refs.len()
                 );
-                parsed_files.push(*parsed);
+                changed_paths.insert(parsed.file.path.clone());
+                changed_nodes.extend(parsed.nodes.iter().cloned());
+                decisions.insert(candidate.rel_path.clone(), ParseDecision::Parsed(parsed));
             }
             Err(err) => {
                 error!(
@@ -218,7 +211,86 @@ fn sync_project_inner(
         }
     }
 
+    if !force && (!changed_paths.is_empty() || !removed_paths.is_empty()) {
+        let dependent_paths = dependent_paths_for_reparse(
+            db,
+            project.id,
+            &changed_paths,
+            &removed_paths,
+            &changed_nodes,
+            &candidate_paths,
+        )?;
+        for path in dependent_paths {
+            if changed_paths.contains(&path) || removed_paths.contains(&path) {
+                continue;
+            }
+            if !matches!(decisions.get(&path), Some(ParseDecision::Unchanged)) {
+                continue;
+            }
+            let Some(candidate) = candidate_by_path.get(&path) else {
+                continue;
+            };
+            debug!(
+                "codegraph reparse dependent: project_id={} path={}",
+                project.id, path
+            );
+            match parse_candidate(db, project, candidate, &patterns, true) {
+                Ok(ParseDecision::Parsed(parsed)) => {
+                    changed_paths.insert(parsed.file.path.clone());
+                    changed_nodes.extend(parsed.nodes.iter().cloned());
+                    decisions.insert(path, ParseDecision::Parsed(parsed));
+                }
+                Ok(ParseDecision::Unchanged) => {}
+                Ok(ParseDecision::SkippedPolicy) => {
+                    decisions.insert(path, ParseDecision::SkippedPolicy);
+                }
+                Ok(ParseDecision::SkippedOversized) => {
+                    decisions.insert(path, ParseDecision::SkippedOversized);
+                }
+                Err(err) => {
+                    error!(
+                        "codegraph dependent extraction failed: project_id={} path={} error={}",
+                        project.id, candidate.rel_path, err
+                    );
+                    return Err(err).context("codegraph dependent extract phase failed");
+                }
+            }
+        }
+    }
+
+    let parsed_paths = decisions
+        .iter()
+        .filter(|(_path, decision)| matches!(decision, ParseDecision::Parsed(_)))
+        .map(|(path, _decision)| path.clone())
+        .collect::<HashSet<_>>();
+    let existing_nodes = existing_nodes_before
+        .into_iter()
+        .filter(|node| {
+            !parsed_paths.contains(&node.file_path) && !removed_paths.contains(&node.file_path)
+        })
+        .collect::<Vec<_>>();
+    let mut parsed_files = Vec::new();
+    for (_path, decision) in decisions {
+        match decision {
+            ParseDecision::Parsed(parsed) => parsed_files.push(*parsed),
+            ParseDecision::Unchanged => stats.skipped_unchanged += 1,
+            ParseDecision::SkippedPolicy => stats.skipped_policy += 1,
+            ParseDecision::SkippedOversized => stats.skipped_oversized += 1,
+        }
+    }
+
     resolve_references(&existing_nodes, &mut parsed_files, &mut stats);
+
+    for removed_path in &removed_paths {
+        db.delete_code_graph_file(project.id, removed_path)
+            .with_context(|| {
+                format!(
+                    "codegraph cleanup failed for project_id={} path='{}'",
+                    project.id, removed_path
+                )
+            })?;
+        stats.removed_files += 1;
+    }
 
     for parsed in parsed_files {
         stats.indexed_files += 1;
@@ -233,6 +305,8 @@ fn sync_project_inner(
                 )
             })?;
     }
+    db.prune_code_graph_dangling_references(project.id)
+        .context("codegraph dangling reference cleanup failed")?;
 
     info!(
         "codegraph sync complete: project_id={} scanned={} indexed={} skipped_unchanged={} removed={} nodes={} edges={} unresolved={} resolved={}",
@@ -247,6 +321,74 @@ fn sync_project_inner(
         stats.resolved_ref_count
     );
     Ok(stats)
+}
+
+fn dependent_paths_for_reparse(
+    db: &Db,
+    project_id: i64,
+    changed_paths: &BTreeSet<String>,
+    removed_paths: &BTreeSet<String>,
+    changed_nodes: &[CodeNode],
+    candidate_paths: &BTreeSet<String>,
+) -> Result<BTreeSet<String>> {
+    let mut target_paths = changed_paths.clone();
+    target_paths.extend(removed_paths.iter().cloned());
+    let mut dependent_paths = BTreeSet::<String>::new();
+
+    if !target_paths.is_empty() {
+        dependent_paths.extend(db.list_code_edge_source_paths_for_target_paths(
+            project_id,
+            &target_paths.iter().cloned().collect::<Vec<_>>(),
+        )?);
+    }
+
+    let changed_names = changed_reference_names(changed_nodes);
+    if !changed_names.is_empty() {
+        let changed_names_vec = changed_names.iter().cloned().collect::<Vec<_>>();
+        dependent_paths.extend(
+            db.list_code_edge_source_paths_for_target_names(project_id, &changed_names_vec)?,
+        );
+        for unresolved in db.list_code_unresolved_refs_for_project(project_id)? {
+            if unresolved_ref_may_match_changed_names(&unresolved.ref_name, &changed_names) {
+                dependent_paths.insert(unresolved.file_path);
+            }
+        }
+    }
+
+    dependent_paths.retain(|path| candidate_paths.contains(path));
+    Ok(dependent_paths)
+}
+
+fn changed_reference_names(changed_nodes: &[CodeNode]) -> BTreeSet<String> {
+    changed_nodes
+        .iter()
+        .filter(|node| {
+            !matches!(
+                node.kind,
+                CodeNodeKind::File | CodeNodeKind::Import | CodeNodeKind::Impl
+            )
+        })
+        .flat_map(|node| [node.name.clone(), node.qualified_name.clone()])
+        .filter(|name| !name.trim().is_empty())
+        .collect()
+}
+
+fn unresolved_ref_may_match_changed_names(
+    ref_name: &str,
+    changed_names: &BTreeSet<String>,
+) -> bool {
+    let ref_name = ref_name.trim();
+    if ref_name.is_empty() {
+        return false;
+    }
+    if changed_names.contains(ref_name) {
+        return true;
+    }
+    let short = ref_name.rsplit("::").next().unwrap_or(ref_name);
+    changed_names.contains(short)
+        || changed_names
+            .iter()
+            .any(|name| name.ends_with(&format!("::{ref_name}")))
 }
 
 enum ParseDecision {

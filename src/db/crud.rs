@@ -141,6 +141,12 @@ fn path_is_same_or_child(path: &str, root: &str) -> bool {
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
+fn sql_placeholders(count: usize) -> String {
+    std::iter::repeat_n("?", count)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
 pub fn default_db_path() -> Result<std::path::PathBuf> {
     if let Ok(p) = std::env::var("AI_WORKSPACE_DB") {
@@ -3150,8 +3156,7 @@ impl Db {
         for node_id in &node_ids {
             tx.execute(
                 "DELETE FROM code_edges
-                 WHERE project_id = ?1
-                   AND (source_node_id = ?2 OR target_node_id = ?2)",
+                 WHERE project_id = ?1 AND source_node_id = ?2",
                 params![project_id, node_id],
             )?;
             tx.execute(
@@ -3169,6 +3174,43 @@ impl Db {
             "DELETE FROM code_files WHERE project_id = ?1 AND path = ?2",
             params![project_id, file_path],
         )?;
+        Ok(())
+    }
+
+    pub fn prune_code_graph_dangling_references(&self, project_id: i64) -> Result<()> {
+        debug!(
+            "codegraph prune dangling references: project_id={}",
+            project_id
+        );
+        let tx = self.conn.unchecked_transaction()?;
+        let edges = tx.execute(
+            "DELETE FROM code_edges
+             WHERE project_id = ?1
+               AND (
+                   source_node_id NOT IN (
+                       SELECT stable_id FROM code_nodes WHERE project_id = ?1
+                   )
+                   OR target_node_id NOT IN (
+                       SELECT stable_id FROM code_nodes WHERE project_id = ?1
+                   )
+               )",
+            params![project_id],
+        )?;
+        let unresolved = tx.execute(
+            "DELETE FROM code_unresolved_refs
+             WHERE project_id = ?1
+               AND source_node_id NOT IN (
+                   SELECT stable_id FROM code_nodes WHERE project_id = ?1
+               )",
+            params![project_id],
+        )?;
+        tx.commit()?;
+        if edges > 0 || unresolved > 0 {
+            info!(
+                "codegraph pruned dangling references: project_id={} edges={} unresolved={}",
+                project_id, edges, unresolved
+            );
+        }
         Ok(())
     }
 
@@ -3236,6 +3278,117 @@ impl Db {
             params![project_id],
             |row| row.get(0),
         )?;
+        Ok(CodeGraphStats {
+            project_id,
+            file_count,
+            node_count,
+            edge_count,
+            unresolved_ref_count,
+            last_indexed_at,
+        })
+    }
+
+    pub fn code_graph_stats_for_paths(
+        &self,
+        project_id: i64,
+        file_paths: &[String],
+    ) -> Result<CodeGraphStats> {
+        debug!(
+            "codegraph scoped stats: project_id={} paths={}",
+            project_id,
+            file_paths.len()
+        );
+        if file_paths.is_empty() {
+            return Ok(CodeGraphStats {
+                project_id,
+                ..CodeGraphStats::default()
+            });
+        }
+
+        let placeholders = sql_placeholders(file_paths.len());
+        let mut file_params: Vec<&dyn ToSql> = Vec::with_capacity(file_paths.len() + 1);
+        file_params.push(&project_id);
+        for path in file_paths {
+            file_params.push(path);
+        }
+
+        let file_count = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM code_files
+                 WHERE project_id = ? AND path IN ({placeholders})"
+            ),
+            params_from_iter(file_params.iter().copied()),
+            |row| row.get(0),
+        )?;
+
+        let mut node_params: Vec<&dyn ToSql> = Vec::with_capacity(file_paths.len() + 1);
+        node_params.push(&project_id);
+        for path in file_paths {
+            node_params.push(path);
+        }
+        let node_count = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM code_nodes
+                 WHERE project_id = ? AND file_path IN ({placeholders})"
+            ),
+            params_from_iter(node_params.iter().copied()),
+            |row| row.get(0),
+        )?;
+
+        let mut edge_params: Vec<&dyn ToSql> = Vec::with_capacity(file_paths.len() * 2 + 1);
+        edge_params.push(&project_id);
+        for path in file_paths {
+            edge_params.push(path);
+        }
+        for path in file_paths {
+            edge_params.push(path);
+        }
+        let edge_count = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*)
+                 FROM code_edges e
+                 JOIN code_nodes src
+                   ON src.stable_id = e.source_node_id
+                  AND src.project_id = e.project_id
+                 JOIN code_nodes target
+                   ON target.stable_id = e.target_node_id
+                  AND target.project_id = e.project_id
+                 WHERE e.project_id = ?
+                   AND src.file_path IN ({placeholders})
+                   AND target.file_path IN ({placeholders})"
+            ),
+            params_from_iter(edge_params.iter().copied()),
+            |row| row.get(0),
+        )?;
+
+        let mut unresolved_params: Vec<&dyn ToSql> = Vec::with_capacity(file_paths.len() + 1);
+        unresolved_params.push(&project_id);
+        for path in file_paths {
+            unresolved_params.push(path);
+        }
+        let unresolved_ref_count = self.conn.query_row(
+            &format!(
+                "SELECT COUNT(*) FROM code_unresolved_refs
+                 WHERE project_id = ? AND file_path IN ({placeholders})"
+            ),
+            params_from_iter(unresolved_params.iter().copied()),
+            |row| row.get(0),
+        )?;
+
+        let mut indexed_params: Vec<&dyn ToSql> = Vec::with_capacity(file_paths.len() + 1);
+        indexed_params.push(&project_id);
+        for path in file_paths {
+            indexed_params.push(path);
+        }
+        let last_indexed_at = self.conn.query_row(
+            &format!(
+                "SELECT MAX(indexed_at) FROM code_files
+                 WHERE project_id = ? AND path IN ({placeholders})"
+            ),
+            params_from_iter(indexed_params.iter().copied()),
+            |row| row.get(0),
+        )?;
+
         Ok(CodeGraphStats {
             project_id,
             file_count,
@@ -3461,6 +3614,118 @@ impl Db {
             params_from_iter(values.iter().map(|value| value.as_ref())),
             Self::map_code_edge,
         )?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_code_edge_source_paths_for_target_paths(
+        &self,
+        project_id: i64,
+        target_file_paths: &[String],
+    ) -> Result<Vec<String>> {
+        if target_file_paths.is_empty() {
+            return Ok(Vec::new());
+        }
+        debug!(
+            "codegraph edge source paths by target paths: project_id={} targets={}",
+            project_id,
+            target_file_paths.len()
+        );
+        let placeholders = sql_placeholders(target_file_paths.len());
+        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(target_file_paths.len() + 1);
+        values.push(&project_id);
+        for path in target_file_paths {
+            values.push(path);
+        }
+        let sql = format!(
+            "SELECT DISTINCT src.file_path
+             FROM code_edges e
+             JOIN code_nodes target
+               ON target.stable_id = e.target_node_id
+              AND target.project_id = e.project_id
+             JOIN code_nodes src
+               ON src.stable_id = e.source_node_id
+              AND src.project_id = e.project_id
+             WHERE e.project_id = ?
+               AND target.file_path IN ({placeholders})
+             ORDER BY src.file_path"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter().copied()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_code_edge_source_paths_for_target_names(
+        &self,
+        project_id: i64,
+        target_names: &[String],
+    ) -> Result<Vec<String>> {
+        if target_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        debug!(
+            "codegraph edge source paths by target names: project_id={} targets={}",
+            project_id,
+            target_names.len()
+        );
+        let placeholders = sql_placeholders(target_names.len());
+        let mut values: Vec<&dyn ToSql> = Vec::with_capacity(target_names.len() * 2 + 1);
+        values.push(&project_id);
+        for name in target_names {
+            values.push(name);
+        }
+        for name in target_names {
+            values.push(name);
+        }
+        let sql = format!(
+            "SELECT DISTINCT src.file_path
+             FROM code_edges e
+             JOIN code_nodes target
+               ON target.stable_id = e.target_node_id
+              AND target.project_id = e.project_id
+             JOIN code_nodes src
+               ON src.stable_id = e.source_node_id
+              AND src.project_id = e.project_id
+             WHERE e.project_id = ?
+               AND (
+                   target.name IN ({placeholders})
+                   OR target.qualified_name IN ({placeholders})
+               )
+             ORDER BY src.file_path"
+        );
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(values.iter().copied()), |row| {
+            row.get::<_, String>(0)
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    pub fn list_code_unresolved_refs_for_project(
+        &self,
+        project_id: i64,
+    ) -> Result<Vec<CodeUnresolvedRef>> {
+        debug!("codegraph list unresolved refs: project_id={}", project_id);
+        let mut stmt = self.conn.prepare(
+            "SELECT id, project_id, source_node_id, file_path, ref_name, kind,
+                    line, column, metadata_json
+             FROM code_unresolved_refs
+             WHERE project_id = ?1
+             ORDER BY file_path, line, column",
+        )?;
+        let rows = stmt.query_map(params![project_id], |row| {
+            Ok(CodeUnresolvedRef {
+                id: row.get(0)?,
+                project_id: row.get(1)?,
+                source_node_id: row.get(2)?,
+                file_path: row.get(3)?,
+                ref_name: row.get(4)?,
+                kind: parse_row_enum(row, 5)?,
+                line: row.get(6)?,
+                column: row.get(7)?,
+                metadata_json: row.get(8)?,
+            })
+        })?;
         Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 

@@ -229,11 +229,13 @@ The `codegraph_*` tools expose a local Rust-only code graph built by `ai-workspa
 
 CodeGraph indexing is local SQLite metadata. By default, the CLI indexes only explicitly shared Rust files and directories. Full-project indexing requires `ai-workspace codegraph reindex --full-project` or `sync --full-project`; hidden/dotfile and credential-like paths are still excluded by default.
 
+MCP access applies the configured server scope first, then filters CodeGraph rows by the project's current shared file/dir scopes. Stale rows from paths that were unshared after indexing are not returned. Full-project-indexed rows outside current shared scopes are returned only when `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set for the MCP server.
+
 Known MVP limitations: Rust only, conservative parser fallback instead of compiler-grade parsing, limited reference resolution, no watcher, no framework route detection, and no multi-language indexing.
 
 #### `codegraph_status`
 
-Return graph health and counts for one project.
+Return graph health and counts for one in-scope project. By default, counts include only currently shared files.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -244,7 +246,7 @@ Provide either `project_id` or `project`.
 
 #### `codegraph_search`
 
-Search indexed Rust symbols by text, kind, language, and file path.
+Search visible indexed Rust symbols by text, kind, language, and file path.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -260,7 +262,7 @@ Returns bounded JSON entries with `node_id`, kind, name, qualified name, file pa
 
 #### `codegraph_node`
 
-Return one symbol's metadata by stable `node_id`. If a name or qualified name is passed and it resolves to exactly one node, it is accepted as a convenience.
+Return one visible symbol's metadata by stable `node_id`. If a name or qualified name is passed and it resolves to exactly one visible node, it is accepted as a convenience.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -271,7 +273,7 @@ Return one symbol's metadata by stable `node_id`. If a name or qualified name is
 
 #### `codegraph_callers` and `codegraph_callees`
 
-Return incoming or outgoing `calls` edges for a symbol.
+Return visible incoming or outgoing `calls` edges for a symbol.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|
@@ -284,7 +286,7 @@ Each edge includes source/target node IDs, call location, and compact related-no
 
 #### `codegraph_context`
 
-Return compact task context from indexed symbols. The tool searches the task description, falls back to meaningful individual terms when the full phrase has no match, and returns entry symbols with small snippets plus caller/callee counts.
+Return compact task context from visible indexed symbols. The tool searches the task description, falls back to meaningful individual terms when the full phrase has no match, and returns entry symbols with small snippets plus caller/callee counts.
 
 | Name | Type | Required | Description |
 |------|------|----------|-------------|

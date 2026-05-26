@@ -1337,6 +1337,235 @@ fn test_mcp_codegraph_status_context_and_callees() {
 }
 
 #[test]
+fn test_mcp_codegraph_rejects_projects_outside_scope() {
+    let (_db_dir, db_path) = temp_db();
+    let (_api_dir, _worker_dir, _web_dir) = seed_mcp_scope_data(&db_path);
+    let web_id = project_id_by_slug(&db_path, "web");
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_status",
+                    "arguments": { "project_id": web_id }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": { "project_id": web_id, "query": "web_scope_marker" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_node",
+                    "arguments": { "project_id": web_id, "node_id": "web_scope_marker" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_callers",
+                    "arguments": { "project_id": web_id, "node_id": "web_scope_marker" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_callees",
+                    "arguments": { "project_id": web_id, "node_id": "web_scope_marker" }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 6,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_context",
+                    "arguments": { "project_id": web_id, "task": "web_scope_marker" }
+                }
+            }),
+        ],
+        &[],
+        &["--project", "api"],
+        None,
+    );
+    for response in &responses {
+        assert_tool_error_contains(response, "outside MCP scope");
+    }
+
+    let responses = mcp_request_with_options(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_status",
+                "arguments": { "project_id": web_id }
+            }
+        })],
+        &[],
+        &["--group", "backend"],
+        None,
+    );
+    assert_tool_error_contains(&responses[0], "outside MCP scope");
+}
+
+#[test]
+fn test_mcp_codegraph_filters_unshared_stale_rows_before_sync() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_codegraph_project(&db_path);
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": {
+                    "project_id": 1,
+                    "query": "helper",
+                    "kind": "function"
+                }
+            }
+        })],
+    );
+    let results: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    let helper_node_id = results[0]["node_id"].as_str().unwrap().to_string();
+
+    run_cli_for_mcp_seed(&db_path, project_dir.path(), &["rm", "src"]);
+
+    let responses = mcp_request(
+        &db_path,
+        &[
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_status",
+                    "arguments": { "project_id": 1 }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 3,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_search",
+                    "arguments": {
+                        "project_id": 1,
+                        "query": "helper",
+                        "kind": "function"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 4,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_node",
+                    "arguments": {
+                        "project_id": 1,
+                        "node_id": helper_node_id,
+                        "include_source": true
+                    }
+                }
+            }),
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": 5,
+                "method": "tools/call",
+                "params": {
+                    "name": "codegraph_context",
+                    "arguments": {
+                        "project_id": 1,
+                        "task": "change helper behavior"
+                    }
+                }
+            }),
+        ],
+    );
+    let status: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert_eq!(status["file_count"], 0);
+    let search_results: serde_json::Value = serde_json::from_str(tool_text(&responses[1])).unwrap();
+    assert!(search_results.as_array().unwrap().is_empty());
+    assert_tool_error_contains(&responses[2], "path is not shared");
+    let context: serde_json::Value = serde_json::from_str(tool_text(&responses[3])).unwrap();
+    assert!(context["entries"].as_array().unwrap().is_empty());
+}
+
+#[test]
+fn test_mcp_codegraph_full_project_index_hides_unshared_files_without_env_gate() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_scoped_project(&db_path);
+    run_cli_for_mcp_seed(
+        &db_path,
+        project_dir.path(),
+        &["codegraph", "reindex", "--full-project"],
+    );
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": {
+                    "project_id": 1,
+                    "query": "private",
+                    "kind": "function"
+                }
+            }
+        })],
+    );
+    let default_results: serde_json::Value =
+        serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert!(default_results.as_array().unwrap().is_empty());
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "codegraph_search",
+                "arguments": {
+                    "project_id": 1,
+                    "query": "private",
+                    "kind": "function"
+                }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS", "1")],
+    );
+    let gated_results: serde_json::Value = serde_json::from_str(tool_text(&responses[0])).unwrap();
+    assert_eq!(gated_results[0]["name"], "private");
+    assert_eq!(gated_results[0]["file_path"], "src/private.rs");
+}
+
+#[test]
 fn test_mcp_workspace_context() {
     let (_db_dir, db_path) = temp_db();
     let _project_dir = seed_data(&db_path);

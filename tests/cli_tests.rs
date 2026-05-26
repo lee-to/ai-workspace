@@ -318,6 +318,75 @@ impl Worker {
     project_dir
 }
 
+fn seed_two_file_codegraph_project(db_path: &PathBuf) -> tempfile::TempDir {
+    let project_dir = tempfile::tempdir().unwrap();
+    fs::create_dir(project_dir.path().join("src")).unwrap();
+    fs::write(
+        project_dir.path().join("src/a.rs"),
+        "pub fn caller() {\n    foo();\n}\n",
+    )
+    .unwrap();
+    fs::write(
+        project_dir.path().join("src/b.rs"),
+        "pub fn foo() -> i32 {\n    1\n}\n",
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(db_path, project_dir.path(), &["init", "--name", "two-file"]);
+    assert!(success, "init should succeed: {stderr}");
+    let (_stdout, stderr, success) = run_cmd_in_dir(db_path, project_dir.path(), &["share", "src"]);
+    assert!(success, "share src should succeed: {stderr}");
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(db_path, project_dir.path(), &["codegraph", "reindex"]);
+    assert!(success, "codegraph reindex should succeed: {stderr}");
+
+    project_dir
+}
+
+fn codegraph_call_edge_count(db_path: &PathBuf, source_name: &str, target_name: &str) -> i64 {
+    let conn = Connection::open(db_path).unwrap();
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM code_edges e
+         JOIN code_nodes src
+           ON src.stable_id = e.source_node_id
+          AND src.project_id = e.project_id
+         JOIN code_nodes target
+           ON target.stable_id = e.target_node_id
+          AND target.project_id = e.project_id
+         WHERE e.project_id = 1
+           AND e.kind = 'calls'
+           AND src.name = ?1
+           AND target.name = ?2",
+        params![source_name, target_name],
+        |row| row.get(0),
+    )
+    .unwrap()
+}
+
+fn codegraph_call_edges(db_path: &PathBuf) -> Vec<(String, String)> {
+    let conn = Connection::open(db_path).unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT src.name, target.name
+             FROM code_edges e
+             JOIN code_nodes src
+               ON src.stable_id = e.source_node_id
+              AND src.project_id = e.project_id
+             JOIN code_nodes target
+               ON target.stable_id = e.target_node_id
+              AND target.project_id = e.project_id
+             WHERE e.project_id = 1 AND e.kind = 'calls'
+             ORDER BY src.name, target.name",
+        )
+        .unwrap();
+    stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap()
+}
+
 #[test]
 fn test_codegraph_cli_reindex_status_and_search() {
     let (_db_dir, db_path) = temp_db();
@@ -388,6 +457,48 @@ fn test_codegraph_sync_skips_unchanged_and_removes_deleted_files() {
         "status after deletion should succeed\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(stdout.contains("Files: 0"));
+}
+
+#[test]
+fn test_codegraph_sync_preserves_edge_from_changed_file_to_unchanged_target() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_two_file_codegraph_project(&db_path);
+
+    assert_eq!(codegraph_call_edge_count(&db_path, "caller", "foo"), 1);
+    fs::write(
+        project_dir.path().join("src/a.rs"),
+        "// caller changed\npub fn caller() {\n    foo();\n}\n",
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "sync"]);
+    assert!(success, "codegraph sync should succeed: {stderr}");
+    assert_eq!(codegraph_call_edge_count(&db_path, "caller", "foo"), 1);
+}
+
+#[test]
+fn test_codegraph_sync_rebuilds_edge_from_unchanged_file_to_changed_target() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_two_file_codegraph_project(&db_path);
+
+    assert_eq!(codegraph_call_edge_count(&db_path, "caller", "foo"), 1);
+    fs::write(
+        project_dir.path().join("src/b.rs"),
+        "// target changed\npub fn foo() -> i32 {\n    2\n}\n",
+    )
+    .unwrap();
+
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "sync"]);
+    assert!(success, "codegraph sync should succeed: {stderr}");
+    assert_eq!(codegraph_call_edge_count(&db_path, "caller", "foo"), 1);
+
+    let sync_edges = codegraph_call_edges(&db_path);
+    let (_stdout, stderr, success) =
+        run_cmd_in_dir(&db_path, project_dir.path(), &["codegraph", "reindex"]);
+    assert!(success, "codegraph reindex should succeed: {stderr}");
+    assert_eq!(sync_edges, codegraph_call_edges(&db_path));
 }
 
 #[test]
