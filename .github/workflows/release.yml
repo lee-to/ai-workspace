@@ -3,12 +3,6 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      tag:
-        description: "Release tag to build, for example v1.2.0"
-        required: true
-        type: string
 
 permissions:
   contents: write
@@ -19,8 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -29,10 +21,9 @@ jobs:
           package_name="$(python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); print(data["package"]["name"])')"
           package_version="$(python3 -c 'import tomllib; data = tomllib.load(open("Cargo.toml", "rb")); print(data["package"]["version"])')"
           expected_tag="v${package_version}"
-          release_tag="${{ inputs.tag || github.ref_name }}"
 
-          if [ "${release_tag}" != "${expected_tag}" ]; then
-            echo "::error::Release tag ${release_tag} does not match Cargo.toml package version ${package_version}. Expected ${expected_tag}."
+          if [ "${GITHUB_REF_NAME}" != "${expected_tag}" ]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} does not match Cargo.toml package version ${package_version}. Expected ${expected_tag}."
             exit 1
           fi
 
@@ -73,8 +64,6 @@ jobs:
             archive: tar.gz
     steps:
       - uses: actions/checkout@v6
-        with:
-          ref: ${{ inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -124,5 +113,4 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
-          tag_name: ${{ inputs.tag || github.ref_name }}
           files: artifacts/*
