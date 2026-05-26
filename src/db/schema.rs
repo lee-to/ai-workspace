@@ -333,6 +333,7 @@ fn unique_slug(base: &str, used_slugs: &mut std::collections::HashSet<String>) -
 }
 
 fn run_schema_maintenance(conn: &Connection) -> Result<()> {
+    migrate_projects_slug(conn)?;
     remove_orphaned_notes_fts_rows(conn)
 }
 
@@ -684,6 +685,44 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM notes_fts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn init_db_backfills_missing_project_slugs_on_current_schema() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT,
+                path TEXT NOT NULL UNIQUE,
+                created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+            );
+
+            CREATE TABLE shared_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                kind TEXT NOT NULL
+            );
+
+            CREATE VIRTUAL TABLE notes_fts USING fts5(label, content);
+
+            INSERT INTO projects (id, name, slug, path)
+            VALUES (1, 'Legacy API', NULL, '/tmp/legacy-api');
+
+            PRAGMA user_version = 6;
+            ",
+        )
+        .unwrap();
+
+        init_db(&conn).unwrap();
+
+        let slug: String = conn
+            .query_row("SELECT slug FROM projects WHERE id = 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(slug, "legacy-api");
     }
 
     #[test]

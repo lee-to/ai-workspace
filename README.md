@@ -105,6 +105,31 @@ ai-workspace serve --project api
 
 The same modes are available through `AI_WORKSPACE_SCOPE=global|current-project|group|project`, `AI_WORKSPACE_SCOPE_GROUP`, and `AI_WORKSPACE_SCOPE_PROJECT`. CLI flags override env vars. Scoping filters metadata, search, service graphs, events, reads, tree, and grep; `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` only broadens filesystem access inside the configured MCP scope.
 
+### AI Factory integration
+
+AI Workspace works well with AI Factory projects. Use the preset once per project to create and share the baseline `.ai-factory` context files:
+
+```bash
+ai-workspace init --preset ai-factory
+```
+
+For Rust projects, share the source scopes you want CodeGraph to expose through MCP, then build the graph:
+
+```bash
+ai-workspace share dir src
+# or, for Rust workspaces:
+ai-workspace share dir crates
+ai-workspace codegraph sync
+```
+
+Then ask your agent to persist an AI Factory rule with the `aif-rules` skill:
+
+```text
+After each implementation, run `ai-workspace codegraph sync` so the local CodeGraph stays current.
+```
+
+With that rule in place, AI Factory agents refresh CodeGraph after implementation work, and the MCP tools (`codegraph_context`, `codegraph_search`, `codegraph_callers`, and `codegraph_callees`) can use fresh symbol and call data before falling back to grep. If your team intentionally indexes the whole Rust project instead of shared scopes, make the rule `ai-workspace codegraph sync --full-project` and run the MCP server with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1`.
+
 ## Example Prompts
 
 Once connected, you can talk to your AI agent naturally. Here are some examples:
