@@ -89,7 +89,30 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          Compress-Archive -Path "target/${{ matrix.target }}/release/ai-workspace.exe" -DestinationPath "${{ matrix.artifact }}.${{ matrix.archive }}"
+          $exePath = "target/${{ matrix.target }}/release/ai-workspace.exe"
+          $archivePath = "${{ matrix.artifact }}.${{ matrix.archive }}"
+          if (Test-Path -LiteralPath $archivePath) {
+            Remove-Item -LiteralPath $archivePath -Force
+          }
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::Open($archivePath, [System.IO.Compression.ZipArchiveMode]::Create)
+          try {
+            [System.IO.Compression.ZipFileExtensions]::CreateEntryFromFile(
+              $archive,
+              $exePath,
+              "ai-workspace.exe",
+              [System.IO.Compression.CompressionLevel]::NoCompression
+            ) | Out-Null
+          } finally {
+            $archive.Dispose()
+          }
+
+      - name: Verify Windows package compatibility
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./.github/scripts/verify-windows-zip.ps1 -ZipPath "${{ matrix.artifact }}.${{ matrix.archive }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
