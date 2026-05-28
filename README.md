@@ -311,10 +311,21 @@ curl -fsSL https://github.com/lee-to/ai-workspace/releases/latest/download/ai-wo
 <summary><b>Windows (x86_64, PowerShell)</b></summary>
 
 ```powershell
-Invoke-WebRequest -Uri "https://github.com/lee-to/ai-workspace/releases/latest/download/ai-workspace-x86_64-pc-windows-msvc.zip" -OutFile ai-workspace.zip
+$release = "https://github.com/lee-to/ai-workspace/releases/latest/download"
+Invoke-WebRequest -Uri "$release/ai-workspace-x86_64-pc-windows-msvc.zip" -OutFile ai-workspace.zip
+Invoke-WebRequest -Uri "$release/SHA256SUMS.txt" -OutFile SHA256SUMS.txt
+
+$match = Select-String -Path SHA256SUMS.txt -Pattern "ai-workspace-x86_64-pc-windows-msvc.zip"
+if (-not $match) { throw "Checksum entry not found for ai-workspace.zip" }
+
+$expected = ($match.Line -split '\s+')[0].ToLowerInvariant()
+$actual = (Get-FileHash ai-workspace.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+if ($actual -ne $expected) { throw "Checksum mismatch for ai-workspace.zip" }
+
 Expand-Archive ai-workspace.zip -DestinationPath "$env:USERPROFILE\bin" -Force
 ```
 
+Every release publishes `SHA256SUMS.txt`; verify the archive before expanding it.
 Add `%USERPROFILE%\bin` to `PATH` if needed.
 </details>
 
