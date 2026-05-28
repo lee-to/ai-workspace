@@ -13,4 +13,9 @@ You should receive a response within 48 hours. We will work with you to understa
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| 1.x     | Yes       |
+| < 1.0   | No        |
+
+## Suspicious Release Artifacts
+
+If a browser or antivirus tool flags a release artifact, do not run it or add an exception. Verify the download against the release's `SHA256SUMS.txt` file when available, then report the version, asset name, download URL, security product, and detection name to the email above.
