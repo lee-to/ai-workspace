@@ -1,6 +1,6 @@
 [package]
 name = "ai-workspace"
-version = "1.2.3"
+version = "1.2.4"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Danil Shutsky <thecutcode@gmail.com>"]
@@ -27,7 +27,7 @@ dirs = "6"
 anyhow = "1"
 ignore = "0.4"
 regex = "1"
-self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "ureq", "rustls"] }
+self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "ureq", "rustls"] }
 
 [dev-dependencies]
 tempfile = "3"
