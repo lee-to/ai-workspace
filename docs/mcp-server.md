@@ -95,6 +95,24 @@ Get workspace metadata: visible projects, their groups, and shared items (no fil
 
 **Returns:** JSON with scoped `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its visible member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
 
+### `project_file_write`
+
+Create or overwrite a regular file inside an in-scope project, immediately share it, and index it when it is a Markdown file.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | — | Project ID to write into |
+| `project` | string | — | Project id, slug, or registered path to write into |
+| `rel_path` | string | yes | Relative file path within the project |
+| `content` | string | yes | Full file content to write |
+| `label` | string | no | Optional shared item label |
+| `overwrite` | boolean | no | Replace an existing file (default: `false`) |
+| `create_dirs` | boolean | no | Create missing parent directories (default: `true`) |
+
+Provide `project_id` or `project` unless the MCP server is scoped to a single project/current project. The tool rejects absolute paths, parent-directory traversal, symlink targets, non-file targets, and hidden or credential-like paths. On success, the file is registered as a shared file and `.md` content is added to the full-text index.
+
 ### `workspace_read`
 
 Read the content of a shared file, directory, or note. Supports two modes: by shared item ID or by project ID + relative path.

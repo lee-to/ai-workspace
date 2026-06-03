@@ -1,9 +1,11 @@
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use super::protocol::{JsonRpcResponse, McpError};
-use crate::db::{CodeGraphEdgeDirection, Db};
+use crate::db::{CodeGraphEdgeDirection, Db, SharedItemUpdate};
 use crate::models::{
     CodeEdge, CodeEdgeKind, CodeGraphSearchHit, CodeNode, CodeNodeSearch, FileSearchHit, Group,
     Project, SharedItem, SharedItemKind,
@@ -659,6 +661,57 @@ pub fn handle_tool_call_scoped(
             };
             workspace_context_scoped(id, &db, scope)
         }
+        "project_file_write" => {
+            let rel_path = match arguments.get("rel_path").and_then(|v| v.as_str()) {
+                Some(path) => path.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: rel_path"),
+                    );
+                }
+            };
+            let content = match arguments.get("content").and_then(|v| v.as_str()) {
+                Some(content) => content.to_string(),
+                None => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params("Missing required parameter: content"),
+                    );
+                }
+            };
+            let label = arguments
+                .get("label")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let overwrite = arguments
+                .get("overwrite")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let create_dirs = arguments
+                .get("create_dirs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let project_id = match project_id_from_write_args_or_scope(&arguments, &db, scope) {
+                Ok(project_id) => project_id,
+                Err(e) => return tool_error(id, &e),
+            };
+            project_file_write_scoped(
+                id,
+                project_id,
+                &rel_path,
+                &content,
+                label.as_deref(),
+                overwrite,
+                create_dirs,
+                &db,
+            )
+        }
         "workspace_read" => {
             let options = walk_options_from_args(&arguments);
             let item_id = arguments.get("item_id").and_then(|v| v.as_i64());
@@ -1102,6 +1155,234 @@ fn tool_error(id: serde_json::Value, msg: &str) -> JsonRpcResponse {
 
 fn open_db() -> Result<Db, String> {
     Db::open_default().map_err(|e| format!("Failed to open database: {}", e))
+}
+
+fn project_id_from_write_args_or_scope(
+    arguments: &serde_json::Value,
+    db: &Db,
+    scope: &McpScope,
+) -> Result<i64, String> {
+    if arguments.get("project_id").is_some() || arguments.get("project").is_some() {
+        return codegraph_project_id_from_args_scoped(arguments, db, scope);
+    }
+
+    match scope {
+        McpScope::Project { project_id, .. } => Ok(*project_id),
+        McpScope::Global | McpScope::Group { .. } => {
+            Err("Missing required parameter: project_id or project".to_string())
+        }
+    }
+}
+
+fn ensure_write_parent_inside_project(
+    canonical_root: &Path,
+    parent: &Path,
+    create_dirs: bool,
+) -> Result<(), String> {
+    if parent.exists() {
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|e| format!("Cannot resolve parent directory: {}", e))?;
+        if !canonical_parent.starts_with(canonical_root) {
+            return Err("Access denied: parent directory is outside project directory".to_string());
+        }
+        if !canonical_parent.is_dir() {
+            return Err("Parent path is not a directory".to_string());
+        }
+        return Ok(());
+    }
+
+    if !create_dirs {
+        return Err("Parent directory does not exist".to_string());
+    }
+
+    let mut existing_ancestor = parent;
+    while !existing_ancestor.exists() {
+        existing_ancestor = existing_ancestor
+            .parent()
+            .ok_or_else(|| "Cannot resolve parent directory".to_string())?;
+    }
+    let canonical_ancestor = existing_ancestor
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve parent directory: {}", e))?;
+    if !canonical_ancestor.starts_with(canonical_root) {
+        return Err("Access denied: parent directory is outside project directory".to_string());
+    }
+
+    std::fs::create_dir_all(parent).map_err(|e| format!("Failed to create directories: {}", e))?;
+    let canonical_parent = parent
+        .canonicalize()
+        .map_err(|e| format!("Cannot resolve parent directory: {}", e))?;
+    if !canonical_parent.starts_with(canonical_root) {
+        return Err("Access denied: parent directory is outside project directory".to_string());
+    }
+    Ok(())
+}
+
+fn existing_file_share_id(db: &Db, project_id: i64, rel_path: &str) -> Result<Option<i64>, String> {
+    let items = db
+        .get_shared_items_for_project(project_id)
+        .map_err(|e| format!("Failed to list shared items: {}", e))?;
+    for item in items {
+        let Some(path) = item.path.as_deref() else {
+            continue;
+        };
+        let Ok(normalized) = normalize_rel_path(path) else {
+            continue;
+        };
+        if normalized != rel_path {
+            continue;
+        }
+        return match item.kind {
+            SharedItemKind::File => Ok(Some(item.id)),
+            SharedItemKind::Dir => Err(format!(
+                "Cannot write file '{}': path is already shared as a directory",
+                rel_path
+            )),
+            SharedItemKind::Note => Ok(None),
+        };
+    }
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_file_write_scoped(
+    id: serde_json::Value,
+    project_id: i64,
+    rel_path: &str,
+    content: &str,
+    label: Option<&str>,
+    overwrite: bool,
+    create_dirs: bool,
+    db: &Db,
+) -> JsonRpcResponse {
+    info!(
+        "project_file_write: project_id={}, rel_path={}, overwrite={}, create_dirs={}",
+        project_id, rel_path, overwrite, create_dirs
+    );
+
+    let normalized = match normalize_rel_path(rel_path) {
+        Ok(path) => path,
+        Err(e) => return tool_error(id, &e),
+    };
+    let rel = Path::new(&normalized);
+    if !walk::path_allowed_by_options(rel, walk::WalkOptions::default()) {
+        warn!("project_file_write denied blocked path: {}", normalized);
+        return tool_error(
+            id,
+            "Access denied: hidden or credential-like paths cannot be written through MCP",
+        );
+    }
+
+    let (root, canonical_root) = match resolve_project_root(project_id, db) {
+        Ok(root) => root,
+        Err(e) => return tool_error(id, &e),
+    };
+    let full_path = root.join(&normalized);
+    let parent = match full_path.parent() {
+        Some(parent) => parent,
+        None => return tool_error(id, "Path must include a file name"),
+    };
+    if let Err(e) = ensure_write_parent_inside_project(&canonical_root, parent, create_dirs) {
+        warn!("project_file_write denied parent '{}': {}", normalized, e);
+        return tool_error(id, &e);
+    }
+
+    match std::fs::symlink_metadata(&full_path) {
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                warn!("project_file_write denied symlink target: {}", normalized);
+                return tool_error(id, "Access denied: refusing to write through symlink");
+            }
+            if !meta.is_file() {
+                return tool_error(id, "Target path exists and is not a regular file");
+            }
+            let canonical_target = match full_path.canonicalize() {
+                Ok(path) => path,
+                Err(e) => return tool_error(id, &format!("Cannot resolve target file: {}", e)),
+            };
+            if !canonical_target.starts_with(&canonical_root) {
+                return tool_error(id, "Access denied: path is outside project directory");
+            }
+            if !overwrite {
+                return tool_error(id, "File already exists; pass overwrite=true to replace it");
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return tool_error(id, &format!("Cannot inspect target file: {}", e)),
+    }
+
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if overwrite {
+        options.create(true).truncate(true);
+    } else {
+        options.create_new(true);
+    }
+    let mut file = match options.open(&full_path) {
+        Ok(file) => file,
+        Err(e) => return tool_error(id, &format!("Failed to open target file: {}", e)),
+    };
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        return tool_error(id, &format!("Failed to write file: {}", e));
+    }
+    if let Err(e) = file.flush() {
+        return tool_error(id, &format!("Failed to flush file: {}", e));
+    }
+
+    let canonical_target = match full_path.canonicalize() {
+        Ok(path) => path,
+        Err(e) => return tool_error(id, &format!("Cannot resolve written file: {}", e)),
+    };
+    if !canonical_target.starts_with(&canonical_root) {
+        return tool_error(id, "Access denied: path is outside project directory");
+    }
+
+    let item_id = match existing_file_share_id(db, project_id, &normalized) {
+        Ok(Some(item_id)) => {
+            if let Some(label) = label {
+                let update = SharedItemUpdate {
+                    content: None,
+                    label: Some(Some(label.to_string())),
+                    scope_change: None,
+                };
+                if let Err(e) = db.update_shared_item(item_id, project_id, &update) {
+                    return tool_error(id, &format!("Failed to update shared item label: {}", e));
+                }
+            }
+            item_id
+        }
+        Ok(None) => match db.share_file(project_id, &normalized, label) {
+            Ok(item_id) => item_id,
+            Err(e) => return tool_error(id, &format!("Failed to share file: {}", e)),
+        },
+        Err(e) => return tool_error(id, &e),
+    };
+
+    let item = match db.get_item_by_id(item_id) {
+        Ok(Some(item)) => item,
+        Ok(None) => return tool_error(id, "Shared item not found after write"),
+        Err(e) => return tool_error(id, &format!("Failed to load shared item: {}", e)),
+    };
+    let index_stats = match crate::indexer::index_shared_item(db, &item, &canonical_root) {
+        Ok(stats) => stats,
+        Err(e) => return tool_error(id, &format!("Failed to index shared file: {}", e)),
+    };
+
+    tool_result(
+        id,
+        serde_json::json!({
+            "project_id": project_id,
+            "shared_item_id": item_id,
+            "path": normalized,
+            "bytes_written": content.len(),
+            "indexed": index_stats.indexed,
+            "skipped_size": index_stats.skipped_size,
+            "skipped_non_utf8": index_stats.skipped_non_utf8,
+            "skipped_missing": index_stats.skipped_missing
+        })
+        .to_string(),
+    )
 }
 
 fn walk_options_from_args(arguments: &serde_json::Value) -> walk::WalkOptions {
@@ -2918,7 +3199,7 @@ fn event_json(db: &Db, event: &crate::models::WorkspaceEvent) -> serde_json::Val
 mod tests {
     use super::*;
     use serde_json::json;
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, tempdir};
 
     fn test_db() -> Db {
         let tmp = NamedTempFile::new().unwrap();
@@ -3016,6 +3297,104 @@ mod tests {
         );
         assert!(resp.error.is_some());
         assert_eq!(resp.error.unwrap().code, -32602);
+    }
+
+    // --- project_file_write ---
+
+    #[test]
+    fn project_file_write_creates_shares_and_indexes_markdown() {
+        let db = test_db();
+        let project_dir = tempdir().unwrap();
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let pid = db.create_project("docs", &project_path).unwrap();
+
+        let resp = project_file_write_scoped(
+            json!(1),
+            pid,
+            "docs/generated/context.md",
+            "persistedtoken content",
+            Some("generated context"),
+            false,
+            true,
+            &db,
+        );
+        assert!(resp.error.is_none());
+
+        let written_path = project_dir.path().join("docs/generated/context.md");
+        assert_eq!(
+            std::fs::read_to_string(written_path).unwrap(),
+            "persistedtoken content"
+        );
+
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        let item = items
+            .iter()
+            .find(|item| item.path.as_deref() == Some("docs/generated/context.md"))
+            .unwrap();
+        assert_eq!(item.kind, SharedItemKind::File);
+        assert_eq!(item.label.as_deref(), Some("generated context"));
+
+        let hits = db.search_files("persistedtoken", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].shared_item_id, item.id);
+        assert_eq!(hits[0].path, "docs/generated/context.md");
+
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["shared_item_id"], item.id);
+        assert_eq!(parsed["indexed"], 1);
+    }
+
+    #[test]
+    fn project_file_write_refuses_existing_file_without_overwrite() {
+        let db = test_db();
+        let project_dir = tempdir().unwrap();
+        std::fs::write(project_dir.path().join("existing.md"), "original").unwrap();
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let pid = db.create_project("docs", &project_path).unwrap();
+
+        let resp = project_file_write_scoped(
+            json!(1),
+            pid,
+            "existing.md",
+            "replacement",
+            None,
+            false,
+            true,
+            &db,
+        );
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            std::fs::read_to_string(project_dir.path().join("existing.md")).unwrap(),
+            "original"
+        );
+        assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn project_file_write_rejects_hidden_or_sensitive_paths() {
+        let db = test_db();
+        let project_dir = tempdir().unwrap();
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let pid = db.create_project("docs", &project_path).unwrap();
+
+        let resp = project_file_write_scoped(
+            json!(1),
+            pid,
+            ".env",
+            "SECRET=value",
+            None,
+            false,
+            true,
+            &db,
+        );
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(!project_dir.path().join(".env").exists());
     }
 
     // --- tool_result / tool_error formatting ---

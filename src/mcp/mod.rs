@@ -106,6 +106,49 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                     }
                 },
                 {
+                    "name": "project_file_write",
+                    "description": "Create or overwrite a regular file inside an in-scope project, immediately share it, and index it when it is a Markdown file.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Project ID to write into"
+                            },
+                            "project": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Project id, slug, or registered path to write into"
+                            },
+                            "rel_path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Relative project path for the file to create or overwrite"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Full file content to write"
+                            },
+                            "label": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional shared item label"
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing file (default: false)"
+                            },
+                            "create_dirs": {
+                                "type": "boolean",
+                                "description": "Create missing parent directories (default: true)"
+                            }
+                        },
+                        "required": ["rel_path", "content"],
+                        "additionalProperties": false
+                    }
+                },
+                {
                     "name": "workspace_read",
                     "description": "Read an in-scope shared item by item_id, or read an in-scope project path only when it is inside shared scopes. Set AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1 to allow project-wide path reads inside the MCP scope.",
                     "inputSchema": {
@@ -475,13 +518,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_seventeen_tools() {
+    fn handle_tools_list_returns_eighteen_tools() {
         let resp = handle_tools_list(json!(1));
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
+        assert!(names.contains(&"project_file_write"));
         assert!(names.contains(&"workspace_read"));
         assert!(names.contains(&"workspace_search"));
         assert!(names.contains(&"list_groups"));
