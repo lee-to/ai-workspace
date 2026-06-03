@@ -9,6 +9,15 @@ use protocol::{JsonRpcRequest, JsonRpcResponse, McpError};
 
 pub use tools::{McpScope, McpScopeKind, McpScopeRequest, resolve_scope};
 
+const SERVER_INSTRUCTIONS: &str = "\
+Use ai-workspace as durable shared context for related local projects. \
+At the start of tasks where project or group context may matter, call workspace_context to identify visible projects, groups, shared items, service links, events, and indexed code scopes. \
+Prefer workspace_read, workspace_search_fulltext, workspace_service_graph, workspace_events, and codegraph_context/codegraph_search before broad filesystem scans when shared context can answer the question. \
+When implementation changes create long-lived project knowledge, architecture decisions, setup steps, cross-project contracts, or conventions, update an appropriate shared Markdown context file with project_file_write inside the configured MCP scope. \
+Do not rewrite context after every code edit; update it only for durable knowledge that future agents or related projects need. \
+Keep all reads and writes within MCP scope and the shared/project-wide access policy. \
+When changed Rust code should be discoverable through codegraph_* tools, run or ask the user to run ai-workspace codegraph sync for the relevant project.";
+
 pub fn serve(scope: McpScope) -> Result<()> {
     info!("MCP server starting (stdio transport)");
 
@@ -74,6 +83,7 @@ fn handle_request_with_scope(req: JsonRpcRequest, scope: &McpScope) -> Option<Js
 
 fn handle_initialize(id: serde_json::Value) -> JsonRpcResponse {
     info!("MCP initialize");
+    debug!("MCP initialize includes server instructions");
     JsonRpcResponse::result(
         id,
         serde_json::json!({
@@ -84,7 +94,11 @@ fn handle_initialize(id: serde_json::Value) -> JsonRpcResponse {
             "serverInfo": {
                 "name": "ai-workspace",
                 "version": env!("CARGO_PKG_VERSION")
-            }
+            },
+            // `instructions` is accepted by newer MCP clients as a server usage hint.
+            // Keep the advertised protocol version stable for compatibility; older clients
+            // that do not consume this field can ignore it as extra result metadata.
+            "instructions": SERVER_INSTRUCTIONS
         }),
     )
 }
@@ -97,7 +111,7 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
             "tools": [
                 {
                     "name": "workspace_context",
-                    "description": "Get workspace metadata within the configured MCP server scope: projects, groups, shared items list (no file content)",
+                    "description": "Get workspace metadata within the configured MCP server scope: projects, groups, shared items list (no file content). Prefer this as the first tool when task context may span ai-workspace projects or groups.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {},
@@ -472,6 +486,29 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2024-11-05");
         assert!(result["capabilities"]["tools"].is_object());
         assert_eq!(result["serverInfo"]["name"], "ai-workspace");
+        let instructions = result["instructions"]
+            .as_str()
+            .expect("initialize result should include instructions");
+        assert!(
+            !instructions.trim().is_empty(),
+            "initialize instructions should not be empty"
+        );
+        assert!(
+            instructions.contains("workspace_context"),
+            "initialize instructions should mention workspace_context"
+        );
+        assert!(
+            instructions.contains("project_file_write"),
+            "initialize instructions should mention project_file_write"
+        );
+        assert!(
+            instructions.contains("durable knowledge"),
+            "initialize instructions should describe durable context update guidance"
+        );
+        assert!(
+            instructions.contains("MCP scope"),
+            "initialize instructions should describe scoped access"
+        );
     }
 
     #[test]

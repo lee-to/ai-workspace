@@ -84,6 +84,22 @@ Add to your MCP config JSON:
 - **Transport:** stdio (line-delimited JSON)
 - **Protocol version:** `2024-11-05`
 - **Capabilities:** `tools`
+- **Initialize instructions:** server-level guidance that tells capable MCP clients how agents should discover and maintain shared context.
+
+The server includes an `instructions` field in the `initialize` response. Newer MCP clients can use this as a model hint; clients that do not consume it can continue using the tools normally.
+
+## Agent workflow
+
+The initialize instructions guide agents toward this workflow:
+
+1. Call `workspace_context` at the start of tasks where project or group context may matter.
+2. Prefer shared context tools (`workspace_read`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`) and Rust CodeGraph tools before broad filesystem scans when those tools can answer the question.
+3. Update shared Markdown context with `project_file_write` only when implementation creates durable knowledge: project setup, architecture decisions, cross-project contracts, conventions, or other facts future agents should reuse.
+4. Do not rewrite context after every code edit. Context updates should be intentional and scoped to long-lived knowledge.
+5. Keep all reads and writes inside the configured MCP scope and shared/project-wide access policy.
+6. When changed Rust code should be discoverable through `codegraph_*` tools, run `ai-workspace codegraph sync` for the relevant project.
+
+Future MCP prompts, resources, configurable instruction templates, and automatic file watching are intentionally outside the current tool surface.
 
 ## Tools
 

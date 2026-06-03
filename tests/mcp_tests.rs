@@ -1109,6 +1109,29 @@ fn test_mcp_initialize() {
     let result = &responses[0]["result"];
     assert_eq!(result["protocolVersion"], "2024-11-05");
     assert_eq!(result["serverInfo"]["name"], "ai-workspace");
+    let instructions = result["instructions"]
+        .as_str()
+        .expect("initialize result should include instructions");
+    assert!(
+        !instructions.trim().is_empty(),
+        "initialize instructions should not be empty"
+    );
+    assert!(
+        instructions.contains("workspace_context"),
+        "initialize instructions should mention workspace_context"
+    );
+    assert!(
+        instructions.contains("project_file_write"),
+        "initialize instructions should mention project_file_write"
+    );
+    assert!(
+        instructions.contains("durable knowledge"),
+        "initialize instructions should describe durable context update guidance"
+    );
+    assert!(
+        instructions.contains("MCP scope"),
+        "initialize instructions should describe scoped access"
+    );
 }
 
 #[test]
