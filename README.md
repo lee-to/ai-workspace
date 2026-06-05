@@ -90,10 +90,26 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 18 MCP tools: `workspace_context`, `project_file_write`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
+That's it. The agent now has access to 17 MCP tools by default: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
 By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`. `workspace_read`, `project_tree`, and `project_grep` support explicit opt-in flags; `workspace_search_fulltext` is stricter and never returns hidden or credential-like `.md` paths.
 
 By default, MCP tools expose only files, directories, and notes that you explicitly share. Full project tree, grep, path reads, and absolute project path metadata require opting in with `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process.
+
+File writes are disabled by default. To expose `project_file_write`, set `AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE=1` on the MCP server process intentionally. This opt-in is separate from `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS`; enabling project-wide reads/search does not enable filesystem writes.
+
+```json
+{
+  "mcpServers": {
+    "ai-workspace": {
+      "command": "ai-workspace",
+      "args": ["serve"],
+      "env": {
+        "AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE": "1"
+      }
+    }
+  }
+}
+```
 
 You can also restrict the MCP server to part of the local workspace:
 

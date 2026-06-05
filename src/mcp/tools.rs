@@ -13,6 +13,7 @@ use crate::models::{
 use crate::walk;
 
 const PROJECT_WIDE_TOOLS_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS";
+pub(crate) const PROJECT_FILE_WRITE_ENV: &str = "AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE";
 const MCP_SCOPE_ENV: &str = "AI_WORKSPACE_SCOPE";
 const MCP_SCOPE_GROUP_ENV: &str = "AI_WORKSPACE_SCOPE_GROUP";
 const MCP_SCOPE_PROJECT_ENV: &str = "AI_WORKSPACE_SCOPE_PROJECT";
@@ -365,6 +366,17 @@ fn project_wide_tools_enabled() -> bool {
     enabled
 }
 
+pub(crate) fn project_file_write_enabled() -> bool {
+    let enabled = std::env::var(PROJECT_FILE_WRITE_ENV).ok().as_deref() == Some("1");
+    if enabled {
+        debug!(
+            "{}=1; project_file_write MCP tool enabled",
+            PROJECT_FILE_WRITE_ENV
+        );
+    }
+    enabled
+}
+
 fn normalize_rel_path(input: &str) -> Result<String, String> {
     crate::path::normalize_portable_rel_path(input)
         .map_err(|_| ACCESS_DENIED_INVALID_PATH.to_string())
@@ -662,6 +674,13 @@ pub fn handle_tool_call_scoped(
             workspace_context_scoped(id, &db, scope)
         }
         "project_file_write" => {
+            if !project_file_write_enabled() {
+                return tool_error(
+                    id,
+                    "Permission denied: project_file_write is disabled. Set AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE=1 on the MCP server process to enable file writes intentionally.",
+                );
+            }
+
             let rel_path = match arguments.get("rel_path").and_then(|v| v.as_str()) {
                 Some(path) => path.to_string(),
                 None => {
@@ -3395,6 +3414,44 @@ mod tests {
         let result = resp.result.unwrap();
         assert_eq!(result["isError"], true);
         assert!(!project_dir.path().join(".env").exists());
+    }
+
+    #[test]
+    fn project_file_write_post_write_share_failure_reports_error_without_indexing() {
+        let db = test_db();
+        let project_dir = tempdir().unwrap();
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let pid = db.create_project("docs", &project_path).unwrap();
+        db.share_dir(pid, "conflict.md", Some("conflicting dir share"))
+            .unwrap();
+
+        let resp = project_file_write_scoped(
+            json!(1),
+            pid,
+            "conflict.md",
+            "partial failure content",
+            None,
+            false,
+            true,
+            &db,
+        );
+
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("already shared as a directory")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_dir.path().join("conflict.md")).unwrap(),
+            "partial failure content"
+        );
+        assert!(
+            db.search_files("partial", 10).unwrap().is_empty(),
+            "failed share/index path must not report indexed content"
+        );
     }
 
     // --- tool_result / tool_error formatting ---
