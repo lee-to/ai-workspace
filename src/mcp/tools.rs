@@ -1,6 +1,5 @@
 use log::{debug, error, info, warn};
 use std::collections::HashSet;
-use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -1264,6 +1263,44 @@ fn existing_file_share_id(db: &Db, project_id: i64, rel_path: &str) -> Result<Op
     Ok(None)
 }
 
+fn atomic_write_file(target_path: &Path, content: &str, overwrite: bool) -> Result<(), String> {
+    atomic_write_file_with_writer(target_path, content, overwrite, |tmp, content| {
+        tmp.write_all(content.as_bytes())?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
+        Ok(())
+    })
+}
+
+fn atomic_write_file_with_writer<F>(
+    target_path: &Path,
+    content: &str,
+    overwrite: bool,
+    write_tmp: F,
+) -> Result<(), String>
+where
+    F: FnOnce(&mut tempfile::NamedTempFile, &str) -> std::io::Result<()>,
+{
+    let parent = target_path
+        .parent()
+        .ok_or_else(|| "Path must include a file name".to_string())?;
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".ai-workspace-write-")
+        .tempfile_in(parent)
+        .map_err(|e| format!("Failed to create temporary file: {}", e))?;
+
+    write_tmp(&mut tmp, content).map_err(|e| format!("Failed to write temporary file: {}", e))?;
+
+    let persist_result = if overwrite {
+        tmp.persist(target_path)
+    } else {
+        tmp.persist_noclobber(target_path)
+    };
+    persist_result
+        .map(|_| ())
+        .map_err(|e| format!("Failed to replace target file: {}", e.error))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn project_file_write_scoped(
     id: serde_json::Value,
@@ -1275,6 +1312,34 @@ fn project_file_write_scoped(
     create_dirs: bool,
     db: &Db,
 ) -> JsonRpcResponse {
+    project_file_write_scoped_with_writer(
+        id,
+        project_id,
+        rel_path,
+        content,
+        label,
+        overwrite,
+        create_dirs,
+        db,
+        atomic_write_file,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn project_file_write_scoped_with_writer<F>(
+    id: serde_json::Value,
+    project_id: i64,
+    rel_path: &str,
+    content: &str,
+    label: Option<&str>,
+    overwrite: bool,
+    create_dirs: bool,
+    db: &Db,
+    write_file: F,
+) -> JsonRpcResponse
+where
+    F: FnOnce(&Path, &str, bool) -> Result<(), String>,
+{
     info!(
         "project_file_write: project_id={}, rel_path={}, overwrite={}, create_dirs={}",
         project_id, rel_path, overwrite, create_dirs
@@ -1331,22 +1396,8 @@ fn project_file_write_scoped(
         Err(e) => return tool_error(id, &format!("Cannot inspect target file: {}", e)),
     }
 
-    let mut options = OpenOptions::new();
-    options.write(true);
-    if overwrite {
-        options.create(true).truncate(true);
-    } else {
-        options.create_new(true);
-    }
-    let mut file = match options.open(&full_path) {
-        Ok(file) => file,
-        Err(e) => return tool_error(id, &format!("Failed to open target file: {}", e)),
-    };
-    if let Err(e) = file.write_all(content.as_bytes()) {
-        return tool_error(id, &format!("Failed to write file: {}", e));
-    }
-    if let Err(e) = file.flush() {
-        return tool_error(id, &format!("Failed to flush file: {}", e));
+    if let Err(e) = write_file(&full_path, content, overwrite) {
+        return tool_error(id, &e);
     }
 
     let canonical_target = match full_path.canonicalize() {
@@ -3392,6 +3443,74 @@ mod tests {
             "original"
         );
         assert!(db.get_shared_items_for_project(pid).unwrap().is_empty());
+    }
+
+    #[test]
+    fn atomic_write_failure_preserves_existing_file() {
+        let project_dir = tempdir().unwrap();
+        let target = project_dir.path().join("existing.md");
+        std::fs::write(&target, "original").unwrap();
+
+        let err = atomic_write_file_with_writer(&target, "replacement", true, |tmp, _| {
+            tmp.write_all(b"partial replacement")?;
+            Err(std::io::Error::other("simulated write failure"))
+        })
+        .unwrap_err();
+
+        assert!(err.contains("simulated write failure"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+        let temp_entries: Vec<_> = std::fs::read_dir(project_dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(".ai-workspace-write-"))
+            .collect();
+        assert!(
+            temp_entries.is_empty(),
+            "failed temporary write should clean up temp files"
+        );
+    }
+
+    #[test]
+    fn project_file_write_overwrite_failure_preserves_existing_file_and_index() {
+        let db = test_db();
+        let project_dir = tempdir().unwrap();
+        let target = project_dir.path().join("existing.md");
+        std::fs::write(&target, "originaltoken content").unwrap();
+        let project_path = project_dir.path().to_string_lossy().to_string();
+        let pid = db.create_project("docs", &project_path).unwrap();
+        let item_id = db.share_file(pid, "existing.md", Some("existing")).unwrap();
+        let item = db.get_item_by_id(item_id).unwrap().unwrap();
+        crate::indexer::index_shared_item(&db, &item, project_dir.path()).unwrap();
+
+        let resp = project_file_write_scoped_with_writer(
+            json!(1),
+            pid,
+            "existing.md",
+            "replacementtoken content",
+            Some("replacement"),
+            true,
+            true,
+            &db,
+            |_path, _content, _overwrite| Err("Failed to write temporary file: simulated".into()),
+        );
+
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        assert!(
+            result["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("simulated")
+        );
+        assert_eq!(
+            std::fs::read_to_string(project_dir.path().join("existing.md")).unwrap(),
+            "originaltoken content"
+        );
+        let items = db.get_shared_items_for_project(pid).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].label.as_deref(), Some("existing"));
+        assert_eq!(db.search_files("originaltoken", 10).unwrap().len(), 1);
+        assert!(db.search_files("replacementtoken", 10).unwrap().is_empty());
     }
 
     #[test]
