@@ -105,7 +105,14 @@ fn handle_initialize(id: serde_json::Value) -> JsonRpcResponse {
 
 fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
     info!("MCP tools/list");
-    JsonRpcResponse::result(
+    handle_tools_list_with_project_file_write(id, tools::project_file_write_enabled())
+}
+
+fn handle_tools_list_with_project_file_write(
+    id: serde_json::Value,
+    include_project_file_write: bool,
+) -> JsonRpcResponse {
+    let mut response = JsonRpcResponse::result(
         id,
         serde_json::json!({
             "tools": [
@@ -116,6 +123,49 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                         "type": "object",
                         "properties": {},
                         "required": [],
+                        "additionalProperties": false
+                    }
+                },
+                {
+                    "name": "project_file_write",
+                    "description": "Create or overwrite a regular file inside an in-scope project, immediately share it, and index it when it is a Markdown file.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "description": "Project ID to write into"
+                            },
+                            "project": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Project id, slug, or registered path to write into"
+                            },
+                            "rel_path": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Relative project path for the file to create or overwrite"
+                            },
+                            "content": {
+                                "type": "string",
+                                "description": "Full file content to write"
+                            },
+                            "label": {
+                                "type": "string",
+                                "minLength": 1,
+                                "description": "Optional shared item label"
+                            },
+                            "overwrite": {
+                                "type": "boolean",
+                                "description": "Overwrite an existing file (default: false)"
+                            },
+                            "create_dirs": {
+                                "type": "boolean",
+                                "description": "Create missing parent directories (default: true)"
+                            }
+                        },
+                        "required": ["rel_path", "content"],
                         "additionalProperties": false
                     }
                 },
@@ -461,7 +511,16 @@ fn handle_tools_list(id: serde_json::Value) -> JsonRpcResponse {
                 }
             ]
         }),
-    )
+    );
+
+    if !include_project_file_write
+        && let Some(result) = response.result.as_mut()
+        && let Some(tools) = result["tools"].as_array_mut()
+    {
+        tools.retain(|tool| tool["name"] != "project_file_write");
+    }
+
+    response
 }
 
 #[cfg(test)]
@@ -512,13 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn handle_tools_list_returns_seventeen_tools() {
-        let resp = handle_tools_list(json!(1));
+    fn handle_tools_list_returns_seventeen_tools_by_default() {
+        let resp = handle_tools_list_with_project_file_write(json!(1), false);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
         assert_eq!(tools.len(), 17);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
+        assert!(!names.contains(&"project_file_write"));
         assert!(names.contains(&"workspace_read"));
         assert!(names.contains(&"workspace_search"));
         assert!(names.contains(&"list_groups"));
