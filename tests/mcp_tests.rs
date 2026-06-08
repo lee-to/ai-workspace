@@ -31,6 +31,7 @@ fn mcp_request_with_options(
         .args(serve_args)
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
         .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+        .env_remove("AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE")
         .env_remove("AI_WORKSPACE_SCOPE")
         .env_remove("AI_WORKSPACE_SCOPE_GROUP")
         .env_remove("AI_WORKSPACE_SCOPE_PROJECT")
@@ -81,6 +82,7 @@ fn run_mcp_server_without_requests(
         .args(serve_args)
         .env("AI_WORKSPACE_DB", db_path.to_string_lossy().to_string())
         .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+        .env_remove("AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE")
         .env_remove("AI_WORKSPACE_SCOPE")
         .env_remove("AI_WORKSPACE_SCOPE_GROUP")
         .env_remove("AI_WORKSPACE_SCOPE_PROJECT");
@@ -1130,6 +1132,7 @@ fn test_mcp_tools_list() {
     let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
 
     assert!(tool_names.contains(&"workspace_context"));
+    assert!(!tool_names.contains(&"project_file_write"));
     assert!(tool_names.contains(&"workspace_read"));
     assert!(tool_names.contains(&"workspace_search"));
     assert!(tool_names.contains(&"list_groups"));
@@ -1178,6 +1181,140 @@ fn test_mcp_tools_list() {
         fulltext_schema["additionalProperties"], false,
         "workspace_search_fulltext should reject undocumented schema properties"
     );
+}
+
+#[test]
+fn test_mcp_tools_list_includes_project_file_write_only_when_enabled() {
+    let (_db_dir, db_path) = temp_db();
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/list",
+            "params": {}
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE", "1")],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let tools = responses[0]["result"]["tools"].as_array().unwrap();
+    let tool_names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(tool_names.contains(&"project_file_write"));
+
+    let tool = tools
+        .iter()
+        .find(|tool| tool["name"] == "project_file_write")
+        .expect("project_file_write should be present when enabled");
+    assert_eq!(tool["inputSchema"]["additionalProperties"], false);
+}
+
+#[test]
+fn test_mcp_project_file_write_disabled_by_default_has_no_side_effects() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_data(&db_path);
+    let target = project_dir.path().join("docs/generated/context.md");
+
+    let responses = mcp_request(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_file_write",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": "docs/generated/context.md",
+                    "content": "disabled_write_token"
+                }
+            }
+        })],
+    );
+
+    assert_eq!(responses.len(), 1);
+    let result = &responses[0]["result"];
+    assert_eq!(result["isError"], true);
+    let text = result["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE=1"));
+    assert!(!target.exists(), "disabled write must not create the file");
+
+    let conn = Connection::open(&db_path).unwrap();
+    let shared_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM shared_items WHERE project_id = 1 AND path = 'docs/generated/context.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_count, 0, "disabled write must not share the file");
+    let indexed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM indexed_files WHERE rel_path = 'docs/generated/context.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_count, 0, "disabled write must not index the file");
+}
+
+#[test]
+fn test_mcp_project_file_write_enabled_creates_shares_and_indexes_markdown() {
+    let (_db_dir, db_path) = temp_db();
+    let project_dir = seed_data(&db_path);
+    let target = project_dir.path().join("docs/generated/context.md");
+
+    let responses = mcp_request_with_env(
+        &db_path,
+        &[serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "project_file_write",
+                "arguments": {
+                    "project_id": 1,
+                    "rel_path": "docs/generated/context.md",
+                    "content": "enabled_write_token",
+                    "label": "generated context"
+                }
+            }
+        })],
+        &[("AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE", "1")],
+    );
+
+    assert_eq!(responses.len(), 1);
+    assert!(responses[0]["error"].is_null());
+    assert_eq!(
+        std::fs::read_to_string(&target).unwrap(),
+        "enabled_write_token"
+    );
+
+    let content = responses[0]["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(content).unwrap();
+    assert_eq!(parsed["path"], "docs/generated/context.md");
+    assert_eq!(parsed["indexed"], 1);
+
+    let conn = Connection::open(&db_path).unwrap();
+    let label: String = conn
+        .query_row(
+            "SELECT label FROM shared_items WHERE project_id = 1 AND path = 'docs/generated/context.md'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(label, "generated context");
+    let indexed_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files_fts WHERE content MATCH 'enabled_write_token'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(indexed_count, 1);
 }
 
 #[test]

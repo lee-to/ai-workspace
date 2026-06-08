@@ -52,6 +52,28 @@ Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` on the MCP server process to resto
 }
 ```
 
+### Project file write opt-in
+
+By default, MCP filesystem writes are disabled and `project_file_write` is omitted from `tools/list`. Calling it directly returns a permission error before resolving or writing any path.
+
+Set `AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE=1` on the MCP server process to enable file writes intentionally:
+
+```json
+{
+  "mcpServers": {
+    "ai-workspace": {
+      "command": "ai-workspace",
+      "args": ["serve"],
+      "env": {
+        "AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE": "1"
+      }
+    }
+  }
+}
+```
+
+This write opt-in is separate from `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS`; enabling project-wide reads, tree, grep, and metadata does not enable file writes.
+
 ### Claude Code (CLI)
 
 ```bash
@@ -94,6 +116,28 @@ Get workspace metadata: visible projects, their groups, and shared items (no fil
 **Parameters:** none
 
 **Returns:** JSON with scoped `projects` and `groups` arrays. Each project includes its shared items (id, kind, path, label, dependencies). Each dependency includes the source service slug, dependency kind, and recommended reaction. Each group includes its visible member projects and group notes (with preview). Absolute project paths are omitted unless `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` is set.
+
+### `project_file_write`
+
+Create or overwrite a regular file inside an in-scope project, immediately share it, and index it when it is a Markdown file.
+
+Disabled by default. Set `AI_WORKSPACE_ALLOW_PROJECT_FILE_WRITE=1` on the MCP server process to expose this tool in `tools/list` and allow calls.
+
+**Parameters:**
+
+| Name | Type | Required | Description |
+|------|------|----------|-------------|
+| `project_id` | integer | — | Project ID to write into |
+| `project` | string | — | Project id, slug, or registered path to write into |
+| `rel_path` | string | yes | Relative file path within the project |
+| `content` | string | yes | Full file content to write |
+| `label` | string | no | Optional shared item label |
+| `overwrite` | boolean | no | Replace an existing file (default: `false`) |
+| `create_dirs` | boolean | no | Create missing parent directories (default: `true`) |
+
+Provide `project_id` or `project` unless the MCP server is scoped to a single project/current project. The tool rejects absolute paths, parent-directory traversal, symlink targets, non-file targets, and hidden or credential-like paths. When disabled, the tool returns a permission error before path resolution and has no file, database, or index side effects. On success, the file is registered as a shared file and `.md` content is added to the full-text index.
+
+The tool reports full success only after the file write, shared-item registration/update, and indexing step have completed. If sharing or indexing fails after the filesystem write succeeds, the response is an MCP tool error; the written or overwritten file is left on disk and the failed database/index side effect is not reported as successful.
 
 ### `workspace_read`
 
