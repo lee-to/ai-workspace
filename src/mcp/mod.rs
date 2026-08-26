@@ -1,4 +1,4 @@
-mod protocol;
+pub(crate) mod protocol;
 mod tools;
 
 use anyhow::Result;

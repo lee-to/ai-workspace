@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize)]
-pub struct JsonRpcRequest {
+pub(crate) struct JsonRpcRequest {
     #[allow(dead_code)]
     pub jsonrpc: Option<String>,
     #[serde(default)]
@@ -12,7 +12,7 @@ pub struct JsonRpcRequest {
 }
 
 #[derive(Debug, Serialize)]
-pub struct JsonRpcResponse {
+pub(crate) struct JsonRpcResponse {
     pub jsonrpc: String,
     pub id: serde_json::Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -42,9 +42,11 @@ impl JsonRpcResponse {
 }
 
 #[derive(Debug, Serialize)]
-pub struct McpError {
+pub(crate) struct McpError {
     pub code: i32,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<serde_json::Value>,
 }
 
 impl McpError {
@@ -52,6 +54,15 @@ impl McpError {
         McpError {
             code: -32700,
             message: format!("Parse error: {}", msg),
+            data: None,
+        }
+    }
+
+    pub fn invalid_request(msg: &str) -> Self {
+        McpError {
+            code: -32600,
+            message: format!("Invalid request: {}", msg),
+            data: None,
         }
     }
 
@@ -59,6 +70,7 @@ impl McpError {
         McpError {
             code: -32601,
             message: format!("Method not found: {}", method),
+            data: None,
         }
     }
 
@@ -66,6 +78,7 @@ impl McpError {
         McpError {
             code: -32602,
             message: format!("Invalid params: {}", msg),
+            data: None,
         }
     }
 
@@ -74,6 +87,26 @@ impl McpError {
         McpError {
             code: -32603,
             message: format!("Internal error: {}", msg),
+            data: None,
+        }
+    }
+
+    pub fn header_mismatch(msg: &str) -> Self {
+        McpError {
+            code: -32020,
+            message: format!("Header mismatch: {msg}"),
+            data: None,
+        }
+    }
+
+    pub fn unsupported_protocol_version(requested: &str, supported: &[&str]) -> Self {
+        McpError {
+            code: -32022,
+            message: "Unsupported protocol version".into(),
+            data: Some(serde_json::json!({
+                "supported": supported,
+                "requested": requested,
+            })),
         }
     }
 }
@@ -104,9 +137,14 @@ mod tests {
     #[test]
     fn mcp_error_codes() {
         assert_eq!(McpError::parse_error("x").code, -32700);
+        assert_eq!(McpError::invalid_request("x").code, -32600);
         assert_eq!(McpError::method_not_found("x").code, -32601);
         assert_eq!(McpError::invalid_params("x").code, -32602);
         assert_eq!(McpError::internal_error("x").code, -32603);
+        assert_eq!(McpError::header_mismatch("x").code, -32020);
+        let unsupported = McpError::unsupported_protocol_version("old", &["new"]);
+        assert_eq!(unsupported.code, -32022);
+        assert_eq!(unsupported.data.unwrap()["supported"], json!(["new"]));
     }
 
     #[test]

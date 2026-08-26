@@ -3,13 +3,13 @@
 > Project map for AI agents. Keep this file up-to-date as the project evolves.
 
 ## Project Overview
-Cross-project shared context CLI + MCP server. Manages shared files, directories, and notes across projects organized into groups, with full-text search and a local Rust-only CodeGraph MVP.
+Cross-project shared context CLI + MCP server. Manages local shared context with SQLite and optionally publishes versioned project snapshots to a PostgreSQL-backed, read-only hosted MCP service.
 
 ## Tech Stack
 - **Language:** Rust (edition 2024)
-- **Database:** SQLite (rusqlite, bundled)
+- **Database:** SQLite (rusqlite, bundled) locally; PostgreSQL (sqlx) for cloud snapshots
 - **CLI:** Clap v4 (derive)
-- **Protocol:** MCP over stdio (JSON-RPC, custom implementation)
+- **Protocol:** MCP over stdio locally and authenticated HTTP in cloud mode
 
 ## Project Structure
 ```
@@ -24,6 +24,14 @@ ai-workspace/
 │   ├── walk.rs             # File tree walker and grep (ignore + regex crates)
 │   ├── indexer.rs          # FTS5 indexer for shared .md files (mtime refresh, reindex)
 │   ├── codegraph.rs        # Rust-only CodeGraph parser, sync/reindex, source snippets
+│   ├── cloud/
+│   │   ├── auth.rs         # OIDC/JWKS JWT validation
+│   │   ├── client.rs       # Snapshot push HTTP client
+│   │   ├── http.rs         # Hosted Axum server and snapshot endpoint
+│   │   ├── mcp.rs          # Hosted read-only MCP adapter
+│   │   ├── models.rs       # Versioned cloud wire records
+│   │   ├── snapshot.rs     # Deterministic local snapshot builder
+│   │   └── store.rs        # PostgreSQL tenant read model
 │   ├── cli/
 │   │   └── mod.rs          # CLI subcommands and handlers
 │   ├── db/
@@ -34,9 +42,14 @@ ai-workspace/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
 │       ├── protocol.rs     # JSON-RPC types (request, response, error)
 │       └── tools.rs        # MCP tool implementations (workspace, project, service, event, codegraph tools)
+├── migrations/
+│   └── 0001_cloud_read_model.sql # PostgreSQL JSONB/FTS tables and forced RLS
 ├── tests/
 │   ├── cli_tests.rs        # CLI integration tests
+│   ├── cloud_push.rs       # Snapshot push/redaction integration tests
+│   ├── cloud_server.rs     # Cloud CLI/server boundary tests
 │   ├── fts_search.rs       # FTS5 fulltext search integration tests
+│   ├── mcp_http_tests.rs   # Hosted/local MCP compatibility tests
 │   └── mcp_tests.rs        # MCP protocol integration tests
 └── .ai-factory/
     └── DESCRIPTION.md      # Project specification and tech stack
@@ -52,6 +65,10 @@ ai-workspace/
 | src/models.rs | Shared data types |
 | src/walk.rs | File tree walker and project grep |
 | src/codegraph.rs | Rust CodeGraph extraction, reference resolution, incremental sync |
+| src/cloud/http.rs | Hosted HTTP server and authenticated snapshot endpoint |
+| src/cloud/mcp.rs | Hosted MCP protocol and seven-tool allowlist |
+| src/cloud/store.rs | PostgreSQL snapshot persistence and tenant reads |
+| migrations/0001_cloud_read_model.sql | Cloud schema, FTS, and forced RLS |
 
 ## Documentation
 | Document | Path | Description |
@@ -60,6 +77,7 @@ ai-workspace/
 | Getting Started | docs/getting-started.md | Installation, setup, first steps |
 | CLI Reference | docs/cli.md | All commands and options |
 | MCP Server | docs/mcp-server.md | MCP tools and integration |
+| Cloud | docs/cloud.md | Sync, OAuth, PostgreSQL, hosted MCP |
 | Contributing | docs/contributing.md | Development setup, testing, pull requests |
 
 ## AI Context Files
