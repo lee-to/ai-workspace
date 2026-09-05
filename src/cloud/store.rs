@@ -106,7 +106,7 @@ impl CloudStore {
 
     async fn begin_tenant(&self, workspace_id: Uuid) -> Result<Transaction<'_, Postgres>> {
         let mut transaction = self.pool.begin().await?;
-        sqlx::query("SELECT set_config('app.workspace_id', $1, true)")
+        sqlx::query("SELECT set_config('app.workspace_id', $1, true), set_config('statement_timeout', '10s', true)")
             .bind(workspace_id.to_string())
             .execute(&mut *transaction)
             .await
@@ -602,7 +602,7 @@ mod tests {
 
         let replacement = CloudProjectSnapshot {
             notes: vec![],
-            ..snapshot
+            ..snapshot.clone()
         };
         let second = store
             .replace_project_snapshot(
@@ -627,29 +627,65 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        assert!(matches!(
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        let before_replay: String = sqlx::query_scalar(
+            "SELECT row_to_json(s)::text FROM cloud_project_snapshots s
+             WHERE workspace_id = $1::uuid AND project_slug = 'demo'",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+
+        // Replay A after B, including attempts to choose the server's revision.
+        for base_revision in [None, Some(1), Some(-1), Some(i64::MAX)] {
+            assert_eq!(
+                store
+                    .replace_project_snapshot(
+                        workspace_id,
+                        &workspace_slug,
+                        &snapshot,
+                        &"a".repeat(64),
+                        base_revision,
+                        false,
+                        "replay-user",
+                    )
+                    .await
+                    .unwrap(),
+                ReplaceSnapshotOutcome::Conflict(SnapshotStatus {
+                    revision: 2,
+                    snapshot_hash: "b".repeat(64),
+                })
+            );
+        }
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        let after_replay: String = sqlx::query_scalar(
+            "SELECT row_to_json(s)::text FROM cloud_project_snapshots s
+             WHERE workspace_id = $1::uuid AND project_slug = 'demo'",
+        )
+        .bind(workspace_id.to_string())
+        .fetch_one(&mut *transaction)
+        .await
+        .unwrap();
+        assert_eq!(after_replay, before_replay);
+        transaction.commit().await.unwrap();
+        assert!(
             store
-                .replace_project_snapshot(
-                    workspace_id,
-                    &workspace_slug,
-                    &replacement,
-                    &"c".repeat(64),
-                    Some(1),
-                    false,
-                    "fixture-user",
-                )
+                .search_documents(workspace_id, "unique-cloud-needle", Some("note"), 20)
                 .await
-                .unwrap(),
-            ReplaceSnapshotOutcome::Conflict(SnapshotStatus { revision: 2, .. })
-        ));
+                .unwrap()
+                .is_empty()
+        );
+
         assert_eq!(
             store
                 .replace_project_snapshot(
                     workspace_id,
                     &workspace_slug,
-                    &replacement,
-                    &"c".repeat(64),
-                    Some(1),
+                    &snapshot,
+                    &"a".repeat(64),
+                    Some(i64::MAX),
                     true,
                     "force-user",
                 )
@@ -657,7 +693,7 @@ mod tests {
                 .unwrap(),
             ReplaceSnapshotOutcome::Accepted {
                 revision: 3,
-                snapshot_hash: "c".repeat(64),
+                snapshot_hash: "a".repeat(64),
                 no_op: false,
             }
         );
@@ -679,6 +715,14 @@ mod tests {
         assert_eq!(audit.get::<String, _>("pushed_by"), "force-user");
         assert!(audit.get::<bool, _>("forced"));
         transaction.commit().await.unwrap();
+        assert_eq!(
+            store
+                .search_documents(workspace_id, "unique-cloud-needle", Some("note"), 20)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[tokio::test]

@@ -8,10 +8,11 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 const JWKS_TTL: Duration = Duration::from_secs(300);
+const JWKS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const JWKS_MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Clone)]
@@ -77,6 +78,7 @@ pub struct JwtValidator {
     config: AuthConfig,
     client: reqwest::Client,
     cache: Arc<RwLock<Option<CachedKeys>>>,
+    last_refresh_attempt: Arc<Mutex<Option<Instant>>>,
 }
 
 impl JwtValidator {
@@ -90,6 +92,7 @@ impl JwtValidator {
             config,
             client,
             cache: Arc::new(RwLock::new(None)),
+            last_refresh_attempt: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -154,7 +157,13 @@ impl JwtValidator {
     }
 
     async fn refresh_keys(&self) -> Result<()> {
-        let response = self
+        // Serialize refreshes and bound unknown-kid traffic, including failed attempts.
+        let mut last_attempt = self.last_refresh_attempt.lock().await;
+        if last_attempt.is_some_and(|attempt| attempt.elapsed() < JWKS_REFRESH_INTERVAL) {
+            return Ok(());
+        }
+        *last_attempt = Some(Instant::now());
+        let mut response = self
             .client
             .get(self.config.jwks_uri.clone())
             .send()
@@ -166,12 +175,16 @@ impl JwtValidator {
             })?
             .error_for_status()
             .context("JWKS endpoint returned an error")?;
-        let body = response
-            .bytes()
+        let mut body = Vec::new();
+        while let Some(chunk) = response
+            .chunk()
             .await
-            .context("Failed to read JWKS response")?;
-        if body.len() > JWKS_MAX_BYTES {
-            bail!("JWKS response exceeds {JWKS_MAX_BYTES} bytes");
+            .context("Failed to read JWKS response")?
+        {
+            if chunk.len() > JWKS_MAX_BYTES - body.len() {
+                bail!("JWKS response exceeds {JWKS_MAX_BYTES} bytes");
+            }
+            body.extend_from_slice(&chunk);
         }
         let set: JwkSet = serde_json::from_slice(&body).context("Invalid JWKS response")?;
         let keys = set
@@ -194,6 +207,139 @@ impl JwtValidator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+    use axum::routing::get;
+    use axum::{Json, Router};
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn oversized_jwks_is_rejected_before_response_finishes() {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (finish, finished) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 4096];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            // No final chunk: the validator must reject without waiting for EOF.
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                JWKS_MAX_BYTES + 1
+            )
+            .unwrap();
+            stream.write_all(&vec![b' '; JWKS_MAX_BYTES + 1]).unwrap();
+            finished.recv_timeout(Duration::from_secs(5)).unwrap();
+        });
+        let mut validator = JwtValidator::new(
+            AuthConfig::new(
+                "https://issuer.test",
+                "test",
+                &format!("http://{address}/jwks"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        validator.client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+        let error = validator.refresh_keys().await.unwrap_err();
+        finish.send(()).unwrap();
+        server.join().unwrap();
+        assert!(
+            error.to_string().contains("JWKS response exceeds"),
+            "{error:#}"
+        );
+        assert!(validator.cache.read().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn concurrent_and_repeated_jwks_misses_share_one_refresh() {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let provider = Arc::new(RwLock::new((StatusCode::OK, "known")));
+        let response = provider.clone();
+        let app = Router::new().route("/jwks", get(move || {
+            let counter = counter.clone();
+            let response = response.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let (status, key_id) = *response.read().await;
+                (status, Json(json!({"keys": [{"kty": "RSA", "kid": key_id, "n": "AQAB", "e": "AQAB"}]})))
+            }
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let validator = JwtValidator::new(
+            AuthConfig::new(
+                "https://issuer.test",
+                "test",
+                &format!("http://{address}/jwks"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+        // RS256 headers with different unknown kids; neither token has a valid signature.
+        let first = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InVua25vd24tYSJ9.e30.AAAA"
+                .parse()
+                .unwrap(),
+        )]);
+        let second = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InVua25vd24tYiJ9.e30.AAAA"
+                .parse()
+                .unwrap(),
+        )]);
+        let (first_result, second_result) = tokio::join!(
+            validator.authenticate(&first),
+            validator.authenticate(&second)
+        );
+        assert!(
+            first_result
+                .unwrap_err()
+                .to_string()
+                .contains("not trusted")
+        );
+        assert!(
+            second_result
+                .unwrap_err()
+                .to_string()
+                .contains("not trusted")
+        );
+        assert!(validator.authenticate(&first).await.is_err());
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(validator.cached_key("known").await.is_some());
+
+        // Rotation refreshes the complete key set after the short retry interval.
+        *provider.write().await = (StatusCode::OK, "rotated");
+        *validator.last_refresh_attempt.lock().await = Some(Instant::now() - JWKS_REFRESH_INTERVAL);
+        validator.refresh_keys().await.unwrap();
+        assert!(validator.cached_key("rotated").await.is_some());
+        assert!(validator.cached_key("known").await.is_none());
+
+        // Outages retain fresh cached keys, throttle retries, and never extend TTL.
+        *provider.write().await = (StatusCode::SERVICE_UNAVAILABLE, "rotated");
+        *validator.last_refresh_attempt.lock().await = Some(Instant::now() - JWKS_REFRESH_INTERVAL);
+        assert!(validator.refresh_keys().await.is_err());
+        assert!(validator.cached_key("rotated").await.is_some());
+        validator.refresh_keys().await.unwrap();
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+        validator.cache.write().await.as_mut().unwrap().loaded_at = Instant::now() - JWKS_TTL;
+        assert!(validator.cached_key("rotated").await.is_none());
+        *validator.last_refresh_attempt.lock().await = Some(Instant::now() - JWKS_REFRESH_INTERVAL);
+        assert!(validator.refresh_keys().await.is_err());
+        assert!(validator.cached_key("rotated").await.is_none());
+        assert_eq!(requests.load(Ordering::SeqCst), 4);
+        server.abort();
+    }
 
     #[test]
     fn auth_config_requires_https_and_claim_scope_is_exact() {

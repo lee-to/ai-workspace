@@ -720,6 +720,54 @@ mod tests {
     }
 
     #[test]
+    fn schema_contract_requires_v1_and_rejects_server_owned_fields() {
+        let minimal = json!({
+            "schema_version": 1,
+            "project": {"cloud_key": "project:api", "name": "API", "slug": "api"}
+        });
+        let snapshot: CloudProjectSnapshot = serde_json::from_value(minimal.clone()).unwrap();
+        snapshot.validate().unwrap();
+        assert_eq!(snapshot.counts(), CloudSnapshotCounts::default());
+
+        for version in [0, CLOUD_SNAPSHOT_SCHEMA_VERSION + 1] {
+            let mut unsupported = snapshot.clone();
+            unsupported.schema_version = version;
+            assert!(
+                unsupported
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Unsupported cloud snapshot schema version")
+            );
+        }
+        let mut missing_version = minimal.clone();
+        missing_version
+            .as_object_mut()
+            .unwrap()
+            .remove("schema_version");
+        assert!(serde_json::from_value::<CloudProjectSnapshot>(missing_version).is_err());
+
+        let request = json!({
+            "base_revision": null,
+            "force": false,
+            "snapshot_hash": super::super::snapshot::sha256_hex(&serde_json::to_vec(&snapshot).unwrap()),
+            "snapshot": minimal
+        });
+        for (field, value) in [
+            ("revision", json!(i64::MAX)),
+            ("created_at", json!("2099-01-01T00:00:00Z")),
+            ("updated_at", json!("2099-01-01T00:00:00Z")),
+        ] {
+            let mut envelope = request.clone();
+            envelope[field] = value.clone();
+            assert!(serde_json::from_value::<CloudPushRequest>(envelope).is_err());
+            let mut snapshot = request.clone();
+            snapshot["snapshot"][field] = value;
+            assert!(serde_json::from_value::<CloudPushRequest>(snapshot).is_err());
+        }
+    }
+
+    #[test]
     fn validation_rejects_unsafe_paths_and_missing_keys() {
         let mut unsafe_path = snapshot();
         unsafe_path.documents[0].relative_path = "/etc/passwd".into();

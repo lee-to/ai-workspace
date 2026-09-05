@@ -13,7 +13,7 @@ use axum::{Json, Router};
 use log::{error, info, warn};
 use serde_json::{Value, json};
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tower_http::timeout::TimeoutLayer;
 
 const MAX_CLOUD_REQUEST_BYTES: usize = MAX_CLOUD_SNAPSHOT_BYTES + 64 * 1024;
@@ -72,7 +72,11 @@ pub fn router(state: CloudHttpState) -> Router {
             "/api/v1/workspaces/{workspace_slug}/projects/{project_slug}/snapshot",
             put(push_snapshot),
         )
-        .route("/mcp", post(super::mcp::handle))
+        .route(
+            "/mcp",
+            post(super::mcp::handle)
+                .layer(DefaultBodyLimit::max(super::mcp::MAX_MCP_REQUEST_BYTES)),
+        )
         .layer(DefaultBodyLimit::max(MAX_CLOUD_REQUEST_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
@@ -134,6 +138,7 @@ async fn push_snapshot(
     headers: HeaderMap,
     Json(request): Json<CloudPushRequest>,
 ) -> Response {
+    let started = Instant::now();
     if validate_origin(&headers, &state.public_mcp_uri).is_err() {
         return cloud_error(
             StatusCode::FORBIDDEN,
@@ -153,6 +158,27 @@ async fn push_snapshot(
             );
         }
     };
+    let response =
+        push_authenticated(&state, &claims, &workspace_slug, &project_slug, request).await;
+    audit_request(
+        &claims,
+        started,
+        response.status(),
+        json!({
+            "operation": "snapshot_push", "scope": "project",
+            "project_sha256": sha256_hex(project_slug.as_bytes())
+        }),
+    );
+    response
+}
+
+async fn push_authenticated(
+    state: &CloudHttpState,
+    claims: &AccessClaims,
+    workspace_slug: &str,
+    project_slug: &str,
+    request: CloudPushRequest,
+) -> Response {
     if claims.require_scope("ai-workspace:push").is_err() {
         warn!(
             "[FIX:cloud-auth] cloud push rejected insufficient scope workspace_id={}",
@@ -161,9 +187,9 @@ async fn push_snapshot(
         return insufficient_scope_response(&state.public_mcp_uri, "ai-workspace:push");
     }
     let (counts, snapshot_hash) = match validate_push_request(
-        &claims,
-        &workspace_slug,
-        &project_slug,
+        claims,
+        workspace_slug,
+        project_slug,
         &request,
     ) {
         Ok(validated) => validated,
@@ -184,7 +210,7 @@ async fn push_snapshot(
         .store
         .replace_project_snapshot(
             claims.workspace_id,
-            &workspace_slug,
+            workspace_slug,
             &request.snapshot,
             &snapshot_hash,
             request.base_revision,
@@ -223,6 +249,20 @@ async fn push_snapshot(
             )
         }
     }
+}
+
+pub fn audit_request(claims: &AccessClaims, started: Instant, status: StatusCode, details: Value) {
+    info!(
+        "cloud audit {}",
+        json!({
+            "unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+            "subject_sha256": sha256_hex(claims.sub.as_bytes()),
+            "workspace_id": claims.workspace_id,
+            "status": status.as_u16(),
+            "duration_ms": started.elapsed().as_millis(),
+            "details": details
+        })
+    );
 }
 
 fn validate_push_request(
@@ -725,6 +765,23 @@ mod tests {
             StatusCode::UNSUPPORTED_MEDIA_TYPE
         );
 
+        for (length, oversized) in [
+            (super::super::mcp::MAX_MCP_REQUEST_BYTES, false),
+            (super::super::mcp::MAX_MCP_REQUEST_BYTES + 1, true),
+        ] {
+            let response = client
+                .post(format!("{base_url}/mcp"))
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(vec![b' '; length])
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status() == StatusCode::PAYLOAD_TOO_LARGE,
+                oversized
+            );
+        }
+
         let snapshot_url =
             format!("{base_url}/api/v1/workspaces/{workspace_slug}/projects/demo/snapshot");
 
@@ -825,6 +882,53 @@ mod tests {
         let forced: CloudPushResponse = forced_response.json().await.unwrap();
         assert_eq!(forced.revision, 2);
         assert!(!forced.no_op);
+
+        // A -> B -> exact original A must preserve B, including its server revision.
+        let replay = client
+            .put(&snapshot_url)
+            .bearer_auth(&token)
+            .json(&push)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(replay.status(), StatusCode::CONFLICT);
+        let replay: CloudPushError = replay.json().await.unwrap();
+        assert_eq!(replay.current_revision, Some(2));
+        assert_eq!(
+            replay.current_snapshot_hash,
+            Some(changed.snapshot_hash.clone())
+        );
+        let preserved = hosted_request(
+            &client,
+            &base_url,
+            &token,
+            "tools/call",
+            Some("workspace_read"),
+            super::super::mcp::PROTOCOL_VERSION,
+            json!({"name":"workspace_read", "arguments":{"document_key":"file:demo:README.md"}}),
+        )
+        .await;
+        assert_eq!(preserved.status(), StatusCode::OK);
+        assert_eq!(
+            preserved.json::<Value>().await.unwrap()["result"]["structuredContent"]["content"],
+            "cloudcontractmarker changed"
+        );
+
+        let excessive_query = hosted_request(
+            &client,
+            &base_url,
+            &token,
+            "tools/call",
+            Some("workspace_search_fulltext"),
+            super::super::mcp::PROTOCOL_VERSION,
+            json!({"name":"workspace_search_fulltext", "arguments":{"query":"x".repeat(1025)}}),
+        )
+        .await;
+        assert_eq!(excessive_query.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            excessive_query.json::<Value>().await.unwrap()["error"]["code"],
+            -32602
+        );
 
         let discovery = hosted_request(
             &client,

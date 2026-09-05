@@ -1,6 +1,7 @@
 use super::auth::AccessClaims;
 use super::http::{
-    CloudHttpState, insufficient_scope_response, unauthorized_response, validate_origin,
+    CloudHttpState, audit_request, insufficient_scope_response, unauthorized_response,
+    validate_origin,
 };
 use crate::mcp::protocol::{JsonRpcRequest, JsonRpcResponse, McpError};
 use anyhow::{Result, bail};
@@ -8,17 +9,21 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use log::{error, info, warn};
+use log::{error, warn};
 use serde_json::{Value, json};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
+pub const MAX_MCP_REQUEST_BYTES: usize = 64 * 1024;
+const MAX_MCP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+const MAX_SEARCH_QUERY_BYTES: usize = 1024;
 
 pub async fn handle(
     State(state): State<CloudHttpState>,
     headers: HeaderMap,
     Json(request): Json<JsonRpcRequest>,
 ) -> Response {
+    let started = Instant::now();
     if validate_origin(&headers, &state.public_mcp_uri).is_err() {
         return rpc_http_error(
             StatusCode::FORBIDDEN,
@@ -49,62 +54,124 @@ pub async fn handle(
             );
         }
     };
+    let audit = audit_details(&request);
     if claims.require_scope("ai-workspace:read").is_err() {
         warn!(
             "[FIX:cloud-auth] hosted MCP rejected insufficient scope workspace_id={}",
             claims.workspace_id
         );
-        return insufficient_scope_response(&state.public_mcp_uri, "ai-workspace:read");
+        let response = insufficient_scope_response(&state.public_mcp_uri, "ai-workspace:read");
+        audit_request(&claims, started, response.status(), audit);
+        return response;
     }
-    let started = Instant::now();
     let id = request.id.clone();
-    match dispatch(&state, &claims, &request).await {
-        Ok(result) => {
-            info!(
-                "hosted MCP request id={} method='{}' workspace_id={} status=ok duration_ms={}",
-                safe_id(&id),
-                request.method,
-                claims.workspace_id,
-                started.elapsed().as_millis()
-            );
-            Json(JsonRpcResponse::result(id, stamp(result))).into_response()
-        }
-        Err(error) => {
-            let message = error.to_string();
-            if message.starts_with("Unknown or unavailable hosted tool:") {
-                warn!(
-                    "hosted MCP unsafe or unknown tool rejected id={}",
-                    safe_id(&id)
-                );
-                rpc_http_error(
-                    StatusCode::BAD_REQUEST,
-                    id,
-                    McpError::invalid_params(&message),
-                )
-            } else if message.starts_with("Unsupported hosted MCP method:") {
-                rpc_http_error(
-                    StatusCode::NOT_FOUND,
-                    id,
-                    McpError::method_not_found(&message),
-                )
-            } else if message.starts_with("Tool argument")
-                || message.starts_with("Tool name is required")
-            {
-                rpc_http_error(
-                    StatusCode::BAD_REQUEST,
-                    id,
-                    McpError::invalid_params(&message),
-                )
-            } else {
-                error!("hosted MCP request failed id={}: {error}", safe_id(&id));
-                rpc_http_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    id,
-                    McpError::internal_error("Hosted MCP request failed"),
-                )
+    let dispatched =
+        tokio::time::timeout(Duration::from_secs(20), dispatch(&state, &claims, &request)).await;
+    let response = match dispatched {
+        Err(_) => rpc_http_error(
+            StatusCode::REQUEST_TIMEOUT,
+            id,
+            McpError::internal_error("Hosted MCP operation timed out"),
+        ),
+        Ok(result) => match result {
+            Ok(result) => result_response(id, result),
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("Unknown or unavailable hosted tool:") {
+                    warn!(
+                        "hosted MCP unsafe or unknown tool rejected id={}",
+                        safe_id(&id)
+                    );
+                    rpc_http_error(
+                        StatusCode::BAD_REQUEST,
+                        id,
+                        McpError::invalid_params(&message),
+                    )
+                } else if message.starts_with("Unsupported hosted MCP method:") {
+                    rpc_http_error(
+                        StatusCode::NOT_FOUND,
+                        id,
+                        McpError::method_not_found(&message),
+                    )
+                } else if message.starts_with("Tool argument")
+                    || message.starts_with("Tool name is required")
+                {
+                    rpc_http_error(
+                        StatusCode::BAD_REQUEST,
+                        id,
+                        McpError::invalid_params(&message),
+                    )
+                } else {
+                    error!("hosted MCP request failed id={}: {error}", safe_id(&id));
+                    rpc_http_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        id,
+                        McpError::internal_error("Hosted MCP request failed"),
+                    )
+                }
             }
+        },
+    };
+    audit_request(&claims, started, response.status(), audit);
+    response
+}
+
+fn audit_details(request: &JsonRpcRequest) -> Value {
+    let method = match request.method.as_str() {
+        "server/discover" | "tools/list" | "tools/call" => request.method.as_str(),
+        _ => "unknown",
+    };
+    let name = request
+        .params
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let tool = match name {
+        "workspace_context"
+        | "workspace_read"
+        | "workspace_search"
+        | "workspace_search_fulltext"
+        | "workspace_service_graph"
+        | "workspace_events"
+        | "workspace_event_details"
+            if method == "tools/call" =>
+        {
+            name
         }
+        _ => "none_or_unknown",
+    };
+    let key = match tool {
+        "workspace_read" => Some("document_key"),
+        "workspace_event_details" => Some("event_key"),
+        _ => None,
+    };
+    json!({
+        "operation": "mcp", "method": method, "tool": tool,
+        "scope": key.unwrap_or("workspace"),
+        "target_sha256": key.and_then(|key| request.params["arguments"][key].as_str())
+            .map(|value| super::snapshot::sha256_hex(value.as_bytes()))
+    })
+}
+
+fn result_response(id: Value, result: Value) -> Response {
+    // ponytail: wire-size cap; paginate store reads to bound collection aggregation memory.
+    let response = JsonRpcResponse::result(id.clone(), stamp(result));
+    let body = serde_json::to_vec(&response).expect("JSON value serializes");
+    if body.len() > MAX_MCP_RESPONSE_BYTES {
+        warn!("[FIX:cloud-limits] hosted MCP response exceeds byte limit");
+        return rpc_http_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            id,
+            McpError::invalid_params(
+                "Hosted MCP response exceeds 8 MiB; use search or an exact document/event key",
+            ),
+        );
     }
+    (
+        [(axum::http::header::CONTENT_TYPE, "application/json")],
+        body,
+    )
+        .into_response()
 }
 
 #[derive(Debug)]
@@ -266,11 +333,15 @@ async fn call_tool(state: &CloudHttpState, claims: &AccessClaims, params: &Value
 }
 
 fn required_string<'a>(value: &'a Value, name: &str) -> Result<&'a str> {
-    value
+    let value = value
         .get(name)
         .and_then(Value::as_str)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow::anyhow!("Tool argument {name} is required"))
+        .ok_or_else(|| anyhow::anyhow!("Tool argument {name} is required"))?;
+    if name == "query" && value.len() > MAX_SEARCH_QUERY_BYTES {
+        bail!("Tool argument {name} exceeds {MAX_SEARCH_QUERY_BYTES} bytes");
+    }
+    Ok(value)
 }
 
 fn limit(arguments: &Value) -> i64 {
@@ -320,7 +391,7 @@ fn tool_catalog() -> Value {
     let no_args = json!({"type":"object", "properties":{}, "additionalProperties":false});
     let query = json!({
         "type":"object",
-        "properties": {"query":{"type":"string","minLength":1}, "limit":{"type":"integer","minimum":1,"maximum":100}},
+        "properties": {"query":{"type":"string","minLength":1,"maxLength":1024,"description":"Maximum 1024 UTF-8 bytes"}, "limit":{"type":"integer","minimum":1,"maximum":100}},
         "required":["query"], "additionalProperties":false
     });
     json!({
@@ -382,6 +453,72 @@ mod tests {
         headers.insert("MCP-Protocol-Version", PROTOCOL_VERSION.parse().unwrap());
         headers.insert("Mcp-Method", method.parse().unwrap());
         headers
+    }
+
+    #[test]
+    fn tool_strings_reject_excessive_search_work() {
+        for key in ["document_key", "event_key"] {
+            assert!(required_string(&json!({key: "x".repeat(1025)}), key).is_ok());
+        }
+        assert!(required_string(&json!({"query": "x".repeat(1024)}), "query").is_ok());
+        assert!(required_string(&json!({"query": "x".repeat(1025)}), "query").is_err());
+        assert!(required_string(&json!({"query": "é".repeat(513)}), "query").is_err());
+    }
+
+    #[tokio::test]
+    async fn response_size_is_checked_after_json_escaping_and_metadata() {
+        let base = serde_json::to_vec(&JsonRpcResponse::result(
+            json!(1),
+            stamp(json!({"text": ""})),
+        ))
+        .unwrap()
+        .len();
+        let exact = result_response(
+            json!(1),
+            json!({"text": "x".repeat(MAX_MCP_RESPONSE_BYTES - base)}),
+        );
+        assert_eq!(exact.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(exact.into_body(), MAX_MCP_RESPONSE_BYTES)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), MAX_MCP_RESPONSE_BYTES);
+        for text in [
+            "x".repeat(MAX_MCP_RESPONSE_BYTES - base + 1),
+            "\"".repeat(MAX_MCP_RESPONSE_BYTES / 2),
+        ] {
+            let response = result_response(json!(1), json!({"text": text}));
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let body = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["id"], 1);
+            assert!(body["error"]["message"].as_str().unwrap().contains("8 MiB"));
+        }
+    }
+
+    #[test]
+    fn audit_records_scope_and_tool_without_raw_keys_queries_or_ids() {
+        let request = request(
+            "tools/call",
+            json!({
+                "name": "workspace_read",
+                "arguments": {"document_key": "file:demo:private.md", "query": "secret-query"}
+            }),
+        );
+        let details = audit_details(&request);
+        assert_eq!(details["tool"], "workspace_read");
+        assert_eq!(details["scope"], "document_key");
+        assert_eq!(
+            details["target_sha256"],
+            super::super::snapshot::sha256_hex(b"file:demo:private.md")
+        );
+        assert!(!details.to_string().contains("private.md"));
+        assert!(!details.to_string().contains("secret-query"));
+        let mut unknown = request;
+        unknown.method = "untrusted-method".into();
+        unknown.params["name"] = json!("untrusted-tool");
+        assert!(!audit_details(&unknown).to_string().contains("untrusted"));
     }
 
     #[test]

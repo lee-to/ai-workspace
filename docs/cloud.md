@@ -34,6 +34,12 @@ ai-workspace cloud push --include-markdown
 
 Only UTF-8 `.md` files within explicit shared file/directory scopes are eligible. Hidden paths, credential-like paths, symlink escapes, missing files, non-Markdown files, non-UTF-8 files, and files over 1 MiB are skipped. A snapshot is limited to 1,000 documents and 16 MiB of canonical JSON.
 
+### Snapshot compatibility
+
+`snapshot.schema_version` is mandatory. This server accepts exactly version `1`, independently of the CLI package version and MCP protocol version. Omitted collections default to empty; unknown fields are rejected. Breaking wire changes, including fields that older strict readers reject, require a new schema version. Future servers must explicitly retain a supported decoder for older clients or require a coordinated CLI/server upgrade; there is no implicit conversion or downgrade.
+
+An unsupported numeric schema version returns HTTP `400` with `code: "invalid_snapshot"` and an unsupported-version message. Missing fields or unknown fields fail JSON extraction with `422`. Neither changes stored data. Upgrade to a CLI/server pair supporting the same snapshot version before retrying.
+
 ### Revision conflicts
 
 Each accepted push stores the returned revision locally. A later push sends that revision as its optimistic concurrency base. A stale base returns `409` without replacing cloud data.
@@ -45,6 +51,10 @@ ai-workspace cloud push --force
 ```
 
 Force mode does not bypass authentication, workspace binding, validation, or PostgreSQL row-level security (RLS). The service records the subject and previous revision/hash.
+
+The server assigns the next revision under a transaction lock and writes its own database timestamps. Clients cannot supply the stored revision or timestamps. After A is replaced by B, replaying the original A request returns `409` and leaves B and its audit fields unchanged. A retry whose hash already matches the current snapshot is a harmless no-op.
+
+This is optimistic concurrency control. An authorized writer can intentionally restore older content by supplying the current `base_revision` or using `force`; the content hash is an integrity check, not a signature proving freshness. Protect write tokens accordingly.
 
 ## Run the Hosted Service
 
@@ -88,6 +98,13 @@ The service is an OAuth resource server; it does not issue or refresh tokens. A 
 ```
 
 Use `ai-workspace:push` for the snapshot endpoint and `ai-workspace:read` for hosted MCP. The workspace UUID and slug in the token are bound on first push and checked on every request.
+
+### JWKS lifecycle and revocation
+
+- Signing keys are cached for 300 seconds per server process. An unknown `kid` or expired cache triggers a refresh. Refreshes are serialized and start at most once every five seconds, including failed attempts, to bound random-key traffic. A newly rotated key may therefore require a retry after five seconds.
+- A successful refresh replaces the complete key set, including removal of retired keys. Publish new keys before issuing tokens with them and overlap old keys while their tokens remain valid.
+- JWKS HTTP requests time out after ten seconds and are limited to 256 KiB while reading. During an identity-provider outage, known keys in a fresh cache continue to work. Unknown keys and expired caches fail closed with `401`; failed refreshes never extend cache validity.
+- JWT signature, issuer, audience, expiration and optional `nbf` are checked on every request, with 60 seconds of clock leeway. Offline JWT validation does not detect individual token revocation or logout before expiration. Issue short-lived access tokens. Deploy gateway introspection or a revocation policy if immediate revocation is required; neither is built into v1. Removing a signing key takes effect on refresh, and cached keys expire after five minutes.
 
 ## PostgreSQL Setup
 
@@ -134,6 +151,32 @@ Supported methods are `server/discover`, `tools/list`, and `tools/call`. The hos
 | `workspace_event_details` | Read one exact `event_key` |
 
 Hosted calls cannot access local paths, run tree/grep, write files, or query CodeGraph. See [MCP Server](mcp-server.md) for the separate local stdio tool surface.
+
+### Request and query limits
+
+| Boundary | Behavior |
+|----------|----------|
+| MCP request body | 64 KiB maximum; larger requests return `413` |
+| Snapshot request body | 16 MiB + 64 KiB envelope allowance; canonical snapshot remains limited to 16 MiB |
+| HTTP handler | 30-second outer timeout (`408`); MCP dispatch also has a 20-second deadline |
+| PostgreSQL | Pool of ten connections, five-second acquisition timeout, ten-second statement timeout in tenant transactions |
+| Search queries | 1,024 UTF-8 bytes maximum; excessive queries return `400` / JSON-RPC `-32602`. Exact keys remain subject to the request-body limit |
+| Search results | Default 20, clamped to 1–100; indexed PostgreSQL full-text search, no regex or filesystem scanning |
+| MCP success response | 8 MiB including JSON escaping, metadata and both content representations; excessive results return `422` / JSON-RPC `-32602` with guidance to use search or exact keys |
+
+V1 does not support cursors or offset pagination. Searches return only their bounded top results; context, service graph and event lists are complete or fail the response-size check, never silently truncated. Use narrower search terms and exact document/event keys for large results. Collection reads currently aggregate the workspace before applying the response byte limit, so this is not a workspace-memory quota. Keep ingress concurrency and deployment memory bounded; add storage-level pagination before scaling to large workspaces.
+
+Rate limiting belongs to the ingress and is not enforced by the binary. Configure both unauthenticated source-IP limits and authenticated tenant/subject limits across all replicas, return `429` with `Retry-After`, and budget concurrent requests separately. Derive identity from verified claims, never arbitrary request headers. Choose quotas for the deployment's workload rather than treating the HTTP timeout as a rate limit.
+
+### Audit records
+
+At `RUST_LOG=info`, completed authenticated MCP and snapshot requests emit a `cloud audit` JSON record with UTC Unix milliseconds, a SHA-256 subject identifier, workspace UUID, scope, operation, HTTP result and duration. MCP records include the allowlisted method/tool and a hashed document/event target when applicable; pushes include a hashed project slug. Unknown method/tool input is replaced by a fixed label. Queries, raw resource keys, request IDs, tokens and content are not included in these audit records.
+
+The subject hash is a stable correlation identifier, not anonymization or an authorization credential. Operators can correlate it with the issuer's subject; protect and retain these logs according to deployment policy. Authentication and envelope failures have diagnostic logs rather than a trusted subject. Ingress access logs must cover malformed JSON/body rejections before the handlers, disconnected requests and requests cancelled by the outer timeout. Snapshot rows also retain the last push subject, previous revision/hash and force flag; they are not an append-only audit history.
+
+### Extension boundaries
+
+Storage, identity validation, HTTP access checks and hosted tools already live in separate `cloud::store`, `cloud::auth`, `cloud::http` and `cloud::mcp` modules. Keep these concrete boundaries for v1. Add storage/identity/access-policy traits or an event-stream interface when a second implementation or integration has concrete requirements; no unused extension interfaces are introduced here.
 
 ## Operations and Security
 
