@@ -244,7 +244,9 @@ fn status_error(status: StatusCode, body: &[u8], project_slug: &str) -> anyhow::
             anyhow::anyhow!("Cloud authentication failed; check AI_WORKSPACE_CLOUD_TOKEN")
         }
         StatusCode::FORBIDDEN => {
-            anyhow::anyhow!("Cloud token lacks access to the requested workspace")
+            anyhow::anyhow!(
+                "Cloud token lacks access to the requested workspace or required push scopes; --force also requires ai-workspace:push-force"
+            )
         }
         StatusCode::CONFLICT => {
             let revision = details.as_ref().and_then(|error| error.current_revision);

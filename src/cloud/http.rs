@@ -127,7 +127,7 @@ async fn protected_resource_metadata(State(state): State<CloudHttpState>) -> Jso
     Json(json!({
         "resource": state.public_mcp_uri,
         "authorization_servers": [state.issuer],
-        "scopes_supported": ["ai-workspace:read", "ai-workspace:push"],
+        "scopes_supported": ["ai-workspace:read", "ai-workspace:push", "ai-workspace:push-force"],
         "bearer_methods_supported": ["header"]
     }))
 }
@@ -153,7 +153,11 @@ async fn push_snapshot(
             warn!("[FIX:cloud-auth] cloud push authentication rejected: {error}");
             return unauthorized_response(
                 &state.public_mcp_uri,
-                "ai-workspace:push",
+                if request.force {
+                    "ai-workspace:push ai-workspace:push-force"
+                } else {
+                    "ai-workspace:push"
+                },
                 "Token validation failed",
             );
         }
@@ -179,12 +183,20 @@ async fn push_authenticated(
     project_slug: &str,
     request: CloudPushRequest,
 ) -> Response {
-    if claims.require_scope("ai-workspace:push").is_err() {
-        warn!(
-            "[FIX:cloud-auth] cloud push rejected insufficient scope workspace_id={}",
-            claims.workspace_id
-        );
-        return insufficient_scope_response(&state.public_mcp_uri, "ai-workspace:push");
+    for required in [
+        Some("ai-workspace:push"),
+        request.force.then_some("ai-workspace:push-force"),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if claims.require_scope(required).is_err() {
+            warn!(
+                "[FIX:cloud-auth] cloud push rejected insufficient scope workspace_id={} required={}",
+                claims.workspace_id, required
+            );
+            return insufficient_scope_response(&state.public_mcp_uri, required);
+        }
     }
     let (counts, snapshot_hash) = match validate_push_request(
         claims,
@@ -668,6 +680,23 @@ mod tests {
             .unwrap();
         assert_eq!(ready_response.status(), StatusCode::OK);
 
+        let metadata: Value = client
+            .get(format!("{base_url}/.well-known/oauth-protected-resource"))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            metadata["scopes_supported"],
+            json!([
+                "ai-workspace:read",
+                "ai-workspace:push",
+                "ai-workspace:push-force"
+            ])
+        );
+
         let list_request = json!({
             "jsonrpc": "2.0",
             "id": 1,
@@ -871,9 +900,64 @@ mod tests {
         );
 
         changed.force = true;
+        // Force permission is required even for an otherwise harmless no-op retry.
+        for (scope, missing_scope) in [
+            (
+                "ai-workspace:push ai-workspace:read",
+                "ai-workspace:push-force",
+            ),
+            (
+                "ai-workspace:push ai-workspace:push-force-extra",
+                "ai-workspace:push-force",
+            ),
+            ("ai-workspace:push-force", "ai-workspace:push"),
+        ] {
+            let restricted_token = test_token(workspace_id, &workspace_slug, scope);
+            for mut request in [push.clone(), changed.clone()] {
+                request.force = true;
+                let denied = client
+                    .put(&snapshot_url)
+                    .bearer_auth(&restricted_token)
+                    .json(&request)
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+                assert!(
+                    denied.headers()[axum::http::header::WWW_AUTHENTICATE]
+                        .to_str()
+                        .unwrap()
+                        .contains(&format!("scope=\"{missing_scope}\""))
+                );
+                assert_eq!(
+                    denied.json::<Value>().await.unwrap()["error"],
+                    "insufficient_scope"
+                );
+            }
+        }
+        let preserved = hosted_request(
+            &client,
+            &base_url,
+            &token,
+            "tools/call",
+            Some("workspace_read"),
+            super::super::mcp::PROTOCOL_VERSION,
+            json!({"name":"workspace_read", "arguments":{"document_key":"file:demo:README.md"}}),
+        )
+        .await;
+        assert_eq!(preserved.status(), StatusCode::OK);
+        assert_eq!(
+            preserved.json::<Value>().await.unwrap()["result"]["structuredContent"]["content"],
+            "cloudcontractmarker"
+        );
+        let force_token = test_token(
+            workspace_id,
+            &workspace_slug,
+            "ai-workspace:push ai-workspace:push-force",
+        );
         let forced_response = client
             .put(&snapshot_url)
-            .bearer_auth(&token)
+            .bearer_auth(&force_token)
             .json(&changed)
             .send()
             .await
@@ -1100,6 +1184,58 @@ mod tests {
         assert_eq!(
             cross_tenant.json::<Value>().await.unwrap()["result"]["structuredContent"],
             json!([])
+        );
+
+        changed.snapshot.project.name =
+            "x".repeat(super::super::store::MAX_CLOUD_CONTEXT_BYTES as usize);
+        changed.snapshot_hash = sha256_hex(&serde_json::to_vec(&changed.snapshot).unwrap());
+        let large_push = client
+            .put(&snapshot_url)
+            .bearer_auth(&force_token)
+            .json(&changed)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(large_push.status(), StatusCode::OK);
+        for tool in [
+            "workspace_context",
+            "workspace_service_graph",
+            "workspace_events",
+        ] {
+            let limited = hosted_request(
+                &client,
+                &base_url,
+                &token,
+                "tools/call",
+                Some(tool),
+                super::super::mcp::PROTOCOL_VERSION,
+                json!({"name":tool,"arguments":{}}),
+            )
+            .await;
+            assert_eq!(limited.status(), StatusCode::UNPROCESSABLE_ENTITY);
+            let error: Value = limited.json().await.unwrap();
+            assert_eq!(error["error"]["code"], -32602);
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("use search")
+            );
+        }
+        let exact_read = hosted_request(
+            &client,
+            &base_url,
+            &token,
+            "tools/call",
+            Some("workspace_read"),
+            super::super::mcp::PROTOCOL_VERSION,
+            json!({"name":"workspace_read", "arguments":{"document_key":"file:demo:README.md"}}),
+        )
+        .await;
+        assert_eq!(exact_read.status(), StatusCode::OK);
+        assert_eq!(
+            exact_read.json::<Value>().await.unwrap()["result"]["structuredContent"]["content"],
+            "cloudcontractmarker changed"
         );
 
         cloud_server.abort();

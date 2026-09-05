@@ -50,11 +50,11 @@ Inspect the competing change before overwriting it. If replacement is intentiona
 ai-workspace cloud push --force
 ```
 
-Force mode does not bypass authentication, workspace binding, validation, or PostgreSQL row-level security (RLS). The service records the subject and previous revision/hash.
+Force mode requires both `ai-workspace:push` and the separate `ai-workspace:push-force` scope, including retries that would be no-ops. Without either permission the server returns `403 insufficient_scope` and advertises the missing scope in `WWW-Authenticate`, before accessing storage. Grant the extra scope only to identities permitted to override conflicts. Force does not bypass authentication, workspace binding, validation, or PostgreSQL row-level security (RLS). The service records the subject and previous revision/hash.
 
 The server assigns the next revision under a transaction lock and writes its own database timestamps. Clients cannot supply the stored revision or timestamps. After A is replaced by B, replaying the original A request returns `409` and leaves B and its audit fields unchanged. A retry whose hash already matches the current snapshot is a harmless no-op.
 
-This is optimistic concurrency control. An authorized writer can intentionally restore older content by supplying the current `base_revision` or using `force`; the content hash is an integrity check, not a signature proving freshness. Protect write tokens accordingly.
+This is optimistic concurrency control. A writer can intentionally restore older content by supplying the current `base_revision`; bypassing a stale base with `force` requires the additional scope. The content hash is an integrity check, not a signature proving freshness. Protect write tokens accordingly.
 
 ## Run the Hosted Service
 
@@ -97,13 +97,13 @@ The service is an OAuth resource server; it does not issue or refresh tokens. A 
 }
 ```
 
-Use `ai-workspace:push` for the snapshot endpoint and `ai-workspace:read` for hosted MCP. The workspace UUID and slug in the token are bound on first push and checked on every request.
+Use `ai-workspace:push` for the snapshot endpoint and `ai-workspace:read` for hosted MCP. For `--force`, request `ai-workspace:push-force` in addition to `ai-workspace:push`; it does not imply ordinary push access. Existing push tokens must gain the extra scope before they can override conflicts. All three scopes are advertised in the protected-resource metadata. The workspace UUID and slug in the token are bound on first push and checked on every request.
 
 ### JWKS lifecycle and revocation
 
 - Signing keys are cached for 300 seconds per server process. An unknown `kid` or expired cache triggers a refresh. Refreshes are serialized and start at most once every five seconds, including failed attempts, to bound random-key traffic. A newly rotated key may therefore require a retry after five seconds.
 - A successful refresh replaces the complete key set, including removal of retired keys. Publish new keys before issuing tokens with them and overlap old keys while their tokens remain valid.
-- JWKS HTTP requests time out after ten seconds and are limited to 256 KiB while reading. During an identity-provider outage, known keys in a fresh cache continue to work. Unknown keys and expired caches fail closed with `401`; failed refreshes never extend cache validity.
+- JWKS HTTP requests time out after ten seconds and are limited to 256 KiB while reading. During an identity-provider outage, known keys in a fresh cache continue to work. Unknown keys and expired caches fail closed with `401`; failed refreshes never extend cache validity. An old cache may remain allocated after an error, but every key lookup checks its original load time: after 300 seconds even a known `kid` is rejected, including during the refresh cooldown. There is no stale-key fallback.
 - JWT signature, issuer, audience, expiration and optional `nbf` are checked on every request, with 60 seconds of clock leeway. Offline JWT validation does not detect individual token revocation or logout before expiration. Issue short-lived access tokens. Deploy gateway introspection or a revocation policy if immediate revocation is required; neither is built into v1. Removing a signing key takes effect on refresh, and cached keys expire after five minutes.
 
 ## PostgreSQL Setup
@@ -126,6 +126,8 @@ GRANT SELECT, INSERT, UPDATE, DELETE
 ```
 
 The service refuses to start with an unsafe runtime role. Every tenant transaction sets a transaction-local workspace context, and all three cloud tables have forced RLS policies.
+
+The store revalidates each snapshot's schema, contents and canonical serialized size, and verifies its hash, before opening a write transaction. Direct internal callers therefore cannot bypass the HTTP/builder checks. Snapshot replacement uses a 64-bit advisory-lock hash of workspace UUID and project slug. A hash collision can make unrelated pushes wait or hit the statement timeout; it cannot select another project's data or bypass RLS because SQL predicates still use the full identifiers. This contention risk is accepted; splitting the key into two 32-bit hashes would not increase the total key space.
 
 ## Hosted MCP
 
@@ -162,9 +164,10 @@ Hosted calls cannot access local paths, run tree/grep, write files, or query Cod
 | PostgreSQL | Pool of ten connections, five-second acquisition timeout, ten-second statement timeout in tenant transactions |
 | Search queries | 1,024 UTF-8 bytes maximum; excessive queries return `400` / JSON-RPC `-32602`. Exact keys remain subject to the request-body limit |
 | Search results | Default 20, clamped to 1–100; indexed PostgreSQL full-text search, no regex or filesystem scanning |
+| Workspace collection reads | At most 100 projects and 4 MiB of PostgreSQL snapshot JSON text, checked in one SQL statement before returning payloads to the application. Applies to context, service graph and event lists; over-limit workspaces return `422` / JSON-RPC `-32602` |
 | MCP success response | 8 MiB including JSON escaping, metadata and both content representations; excessive results return `422` / JSON-RPC `-32602` with guidance to use search or exact keys |
 
-V1 does not support cursors or offset pagination. Searches return only their bounded top results; context, service graph and event lists are complete or fail the response-size check, never silently truncated. Use narrower search terms and exact document/event keys for large results. Collection reads currently aggregate the workspace before applying the response byte limit, so this is not a workspace-memory quota. Keep ingress concurrency and deployment memory bounded; add storage-level pagination before scaling to large workspaces.
+V1 does not support cursors or offset pagination. Searches return only their bounded top results; context, service graph and event lists are complete or fail the storage budget, never silently truncated. The SQL query examines at most 101 ordered project rows and suppresses snapshot payloads when either budget is exceeded. Deserialized values and MCP's two content representations still add bounded application overhead, and the final 8 MiB response cap remains in force. Use narrower search terms and exact document/event keys for over-limit workspaces. Keep ingress concurrency and deployment memory bounded; add pagination when larger complete collection reads are needed.
 
 Rate limiting belongs to the ingress and is not enforced by the binary. Configure both unauthenticated source-IP limits and authenticated tenant/subject limits across all replicas, return `429` with `Retry-After`, and budget concurrent requests separately. Derive identity from verified claims, never arbitrary request headers. Choose quotas for the deployment's workload rather than treating the HTTP timeout as a rate limit.
 

@@ -8,6 +8,23 @@ use sqlx::{PgPool, Postgres, Row, Transaction};
 use std::time::Instant;
 use uuid::Uuid;
 
+pub const MAX_CLOUD_CONTEXT_PROJECTS: i64 = 100;
+pub const MAX_CLOUD_CONTEXT_BYTES: i64 = 4 * 1024 * 1024;
+
+#[derive(Debug)]
+pub struct ContextLimitExceeded;
+
+impl std::fmt::Display for ContextLimitExceeded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Cloud workspace context exceeds {MAX_CLOUD_CONTEXT_PROJECTS} projects or {MAX_CLOUD_CONTEXT_BYTES} bytes"
+        )
+    }
+}
+
+impl std::error::Error for ContextLimitExceeded {}
+
 #[derive(Clone)]
 pub struct CloudStore {
     pool: PgPool,
@@ -126,8 +143,14 @@ impl CloudStore {
         subject: &str,
     ) -> Result<ReplaceSnapshotOutcome> {
         let started = Instant::now();
+        snapshot.validate()?;
+        let snapshot_json = serde_json::to_string(snapshot)?;
+        if super::snapshot::sha256_hex(snapshot_json.as_bytes()) != snapshot_hash {
+            bail!("Snapshot hash does not match payload");
+        }
         let project_slug = &snapshot.project.slug;
         let mut transaction = self.begin_tenant(workspace_id).await?;
+        // Hash collisions only serialize unrelated projects; tenant and row checks remain exact.
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!("{workspace_id}:{project_slug}"))
             .execute(&mut *transaction)
@@ -214,7 +237,6 @@ impl CloudStore {
         }
 
         let revision = current.as_ref().map_or(1, |status| status.revision + 1);
-        let snapshot_json = serde_json::to_value(snapshot)?;
         sqlx::query(
             "INSERT INTO cloud_project_snapshots (
                 workspace_id, project_slug, project_name, snapshot, revision,
@@ -234,7 +256,7 @@ impl CloudStore {
         .bind(workspace_id.to_string())
         .bind(project_slug)
         .bind(&snapshot.project.name)
-        .bind(snapshot_json.to_string())
+        .bind(snapshot_json)
         .bind(revision)
         .bind(snapshot_hash)
         .bind(subject)
@@ -340,18 +362,29 @@ impl CloudStore {
 
     pub async fn workspace_context(&self, workspace_id: Uuid) -> Result<Vec<Value>> {
         let mut transaction = self.begin_tenant(workspace_id).await?;
-        let values: Vec<String> = sqlx::query_scalar(
-            "SELECT snapshot::text
-             FROM cloud_project_snapshots
-             WHERE workspace_id = $1::uuid
+        let values: Vec<Option<String>> = sqlx::query_scalar(
+            "SELECT CASE WHEN count(*) OVER () <= $2
+                         AND sum(octet_length(snapshot::text)) OVER () <= $3
+                    THEN snapshot::text END
+             FROM (
+                 SELECT snapshot, project_slug FROM cloud_project_snapshots
+                 WHERE workspace_id = $1::uuid
+                 ORDER BY project_slug LIMIT $2 + 1
+             ) bounded
              ORDER BY project_slug",
         )
         .bind(workspace_id.to_string())
+        .bind(MAX_CLOUD_CONTEXT_PROJECTS)
+        .bind(MAX_CLOUD_CONTEXT_BYTES)
         .fetch_all(&mut *transaction)
         .await?;
         transaction.commit().await?;
+        if values.iter().any(Option::is_none) {
+            return Err(ContextLimitExceeded.into());
+        }
         values
             .into_iter()
+            .flatten()
             .map(|value| serde_json::from_str(&value).context("Invalid stored cloud snapshot"))
             .collect()
     }
@@ -435,22 +468,25 @@ impl CloudStore {
     }
 
     pub async fn events(&self, workspace_id: Uuid) -> Result<Vec<Value>> {
-        let mut transaction = self.begin_tenant(workspace_id).await?;
-        let events: Vec<String> = sqlx::query_scalar(
-            "SELECT event::text
-             FROM cloud_project_snapshots snapshot,
-                  LATERAL jsonb_array_elements(snapshot.snapshot->'events') event
-             WHERE workspace_id = $1::uuid
-             ORDER BY event->>'created_at' DESC, event->>'cloud_key'",
-        )
-        .bind(workspace_id.to_string())
-        .fetch_all(&mut *transaction)
-        .await?;
-        transaction.commit().await?;
-        events
-            .into_iter()
-            .map(|event| serde_json::from_str(&event).context("Invalid stored cloud event"))
-            .collect()
+        let snapshots = self.workspace_context(workspace_id).await?;
+        let mut events = snapshots
+            .iter()
+            .flat_map(|snapshot| {
+                snapshot
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        events.sort_by(|left, right| {
+            right["created_at"]
+                .as_str()
+                .cmp(&left["created_at"].as_str())
+                .then_with(|| left["cloud_key"].as_str().cmp(&right["cloud_key"].as_str()))
+        });
+        Ok(events)
     }
 
     pub async fn event_details(
@@ -495,6 +531,72 @@ mod tests {
         CloudProjectSnapshot,
     };
 
+    fn snapshot_hash(snapshot: &CloudProjectSnapshot) -> String {
+        crate::cloud::snapshot::sha256_hex(&serde_json::to_vec(snapshot).unwrap())
+    }
+
+    #[tokio::test]
+    async fn store_rejects_invalid_snapshot_before_database_access() {
+        let store = CloudStore {
+            pool: PgPoolOptions::new()
+                .acquire_timeout(std::time::Duration::from_millis(50))
+                .connect_lazy("postgres://unused:unused@127.0.0.1:1/unused")
+                .unwrap(),
+        };
+        let mut snapshot: CloudProjectSnapshot = serde_json::from_value(json!({
+            "schema_version": 0,
+            "project": {"cloud_key": "project:demo", "name": "Demo", "slug": "demo"}
+        }))
+        .unwrap();
+        let error = store
+            .replace_project_snapshot(
+                Uuid::new_v4(),
+                "team",
+                &snapshot,
+                &snapshot_hash(&snapshot),
+                None,
+                false,
+                "user",
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("Unsupported cloud snapshot schema version")
+        );
+
+        snapshot.schema_version = CLOUD_SNAPSHOT_SCHEMA_VERSION;
+        let error = store
+            .replace_project_snapshot(
+                Uuid::new_v4(),
+                "team",
+                &snapshot,
+                &"a".repeat(64),
+                None,
+                false,
+                "user",
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Snapshot hash does not match payload");
+
+        snapshot.project.name = "x".repeat(super::super::models::MAX_CLOUD_SNAPSHOT_BYTES);
+        let error = store
+            .replace_project_snapshot(
+                Uuid::new_v4(),
+                "team",
+                &snapshot,
+                &snapshot_hash(&snapshot),
+                None,
+                true,
+                "user",
+            )
+            .await
+            .unwrap_err();
+        assert!(error.to_string().starts_with("Cloud snapshot exceeds"));
+    }
+
     #[test]
     fn migration_forces_rls_and_pins_simple_text_search() {
         let sql = include_str!("../../migrations/0001_cloud_read_model.sql");
@@ -506,6 +608,124 @@ mod tests {
             assert!(sql.contains(&format!("ALTER TABLE {table} FORCE ROW LEVEL SECURITY")));
         }
         assert!(sql.contains("'simple'::regconfig"));
+    }
+
+    #[tokio::test]
+    async fn postgres_workspace_context_limits() {
+        let Ok(database_url) = std::env::var("AI_WORKSPACE_CLOUD_TEST_DATABASE_URL") else {
+            return;
+        };
+        let store = CloudStore::connect(&database_url).await.unwrap();
+        let workspace_id = Uuid::new_v4();
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        sqlx::query(
+            "INSERT INTO cloud_workspaces (workspace_id, workspace_slug) VALUES ($1::uuid, $2)",
+        )
+        .bind(workspace_id.to_string())
+        .bind(format!("bounds-{}", workspace_id.simple()))
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO cloud_project_snapshots
+                (workspace_id, project_slug, project_name, snapshot, revision, snapshot_hash, pushed_by)
+             SELECT $1::uuid, 'p' || n, 'Project',
+                jsonb_build_object('schema_version', 1, 'project', jsonb_build_object(
+                    'cloud_key', 'project:p' || n, 'slug', 'p' || n, 'name', 'Project'),
+                    'events', '[]'::jsonb, 'service_links', '[]'::jsonb),
+                1, repeat('a', 64), 'fixture'
+             FROM generate_series(1, 100) n",
+        )
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        sqlx::query(
+            "UPDATE cloud_project_snapshots SET snapshot = jsonb_set(snapshot, '{events}',
+                CASE project_slug
+                    WHEN 'p1' THEN '[{\"cloud_key\":\"z\",\"created_at\":\"2026-01-01\"},
+                                     {\"cloud_key\":\"a\",\"created_at\":\"2026-01-01\"}]'::jsonb
+                    ELSE '[{\"cloud_key\":\"new\",\"created_at\":\"2026-01-02\"}]'::jsonb END)
+             WHERE workspace_id = $1::uuid AND project_slug IN ('p1', 'p100')",
+        )
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            store.workspace_context(workspace_id).await.unwrap().len(),
+            100
+        );
+        let events = store.events(workspace_id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["cloud_key"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["new", "a", "z"]
+        );
+
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        sqlx::query(
+            "INSERT INTO cloud_project_snapshots
+                (workspace_id, project_slug, project_name, snapshot, revision, snapshot_hash, pushed_by)
+             SELECT workspace_id, 'extra', project_name, snapshot, revision, snapshot_hash, pushed_by
+             FROM cloud_project_snapshots WHERE workspace_id = $1::uuid AND project_slug = 'p1'",
+        )
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        for result in [
+            store.workspace_context(workspace_id).await,
+            store.service_graph(workspace_id).await,
+            store.events(workspace_id).await,
+        ] {
+            assert!(result.unwrap_err().is::<ContextLimitExceeded>());
+        }
+
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        sqlx::query("DELETE FROM cloud_project_snapshots WHERE workspace_id = $1::uuid AND project_slug != 'p1'")
+            .bind(workspace_id.to_string())
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE cloud_project_snapshots SET snapshot = jsonb_set(snapshot, '{project,name}',
+                to_jsonb(repeat('x', 4194304 - octet_length(snapshot::text) + length(snapshot->'project'->>'name'))))
+             WHERE workspace_id = $1::uuid",
+        )
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        assert_eq!(
+            store.workspace_context(workspace_id).await.unwrap().len(),
+            1
+        );
+        assert!(store.service_graph(workspace_id).await.unwrap().is_empty());
+        assert_eq!(store.events(workspace_id).await.unwrap().len(), 2);
+
+        let mut transaction = store.begin_tenant(workspace_id).await.unwrap();
+        sqlx::query(
+            "UPDATE cloud_project_snapshots SET snapshot = jsonb_set(snapshot, '{project,name}',
+                to_jsonb((snapshot->'project'->>'name') || 'x')) WHERE workspace_id = $1::uuid",
+        )
+        .bind(workspace_id.to_string())
+        .execute(&mut *transaction)
+        .await
+        .unwrap();
+        transaction.commit().await.unwrap();
+        for result in [
+            store.workspace_context(workspace_id).await,
+            store.service_graph(workspace_id).await,
+            store.events(workspace_id).await,
+        ] {
+            assert!(result.unwrap_err().is::<ContextLimitExceeded>());
+        }
     }
 
     #[tokio::test]
@@ -521,7 +741,7 @@ mod tests {
             name: "Demo".into(),
             slug: "demo".into(),
         };
-        let snapshot = CloudProjectSnapshot {
+        let mut snapshot = CloudProjectSnapshot {
             schema_version: CLOUD_SNAPSHOT_SCHEMA_VERSION,
             project: project.clone(),
             groups: vec![],
@@ -539,12 +759,26 @@ mod tests {
             dependencies: vec![],
             events: vec![],
         };
+        let note = &mut snapshot.notes[0];
+        let fingerprint = crate::cloud::snapshot::sha256_hex(
+            &crate::cloud::models::note_fingerprint_input(
+                &note.project_slug,
+                note.scope,
+                None,
+                note.label.as_deref(),
+                &note.content,
+            )
+            .unwrap(),
+        );
+        note.cloud_key =
+            crate::cloud::models::keys::note("demo", note.scope, &fingerprint, 0).unwrap();
+        let initial_hash = snapshot_hash(&snapshot);
         let first = store
             .replace_project_snapshot(
                 workspace_id,
                 &workspace_slug,
                 &snapshot,
-                &"a".repeat(64),
+                &initial_hash,
                 None,
                 false,
                 "fixture-user",
@@ -565,7 +799,7 @@ mod tests {
                     workspace_id,
                     &workspace_slug,
                     &snapshot,
-                    &"a".repeat(64),
+                    &initial_hash,
                     None,
                     false,
                     "retry-user",
@@ -574,7 +808,7 @@ mod tests {
                 .unwrap(),
             ReplaceSnapshotOutcome::Accepted {
                 revision: 1,
-                snapshot_hash: "a".repeat(64),
+                snapshot_hash: initial_hash.clone(),
                 no_op: true,
             }
         );
@@ -604,12 +838,13 @@ mod tests {
             notes: vec![],
             ..snapshot.clone()
         };
+        let replacement_hash = snapshot_hash(&replacement);
         let second = store
             .replace_project_snapshot(
                 workspace_id,
                 &workspace_slug,
                 &replacement,
-                &"b".repeat(64),
+                &replacement_hash,
                 Some(1),
                 false,
                 "fixture-user",
@@ -646,7 +881,7 @@ mod tests {
                         workspace_id,
                         &workspace_slug,
                         &snapshot,
-                        &"a".repeat(64),
+                        &initial_hash,
                         base_revision,
                         false,
                         "replay-user",
@@ -655,7 +890,7 @@ mod tests {
                     .unwrap(),
                 ReplaceSnapshotOutcome::Conflict(SnapshotStatus {
                     revision: 2,
-                    snapshot_hash: "b".repeat(64),
+                    snapshot_hash: replacement_hash.clone(),
                 })
             );
         }
@@ -684,7 +919,7 @@ mod tests {
                     workspace_id,
                     &workspace_slug,
                     &snapshot,
-                    &"a".repeat(64),
+                    &initial_hash,
                     Some(i64::MAX),
                     true,
                     "force-user",
@@ -693,7 +928,7 @@ mod tests {
                 .unwrap(),
             ReplaceSnapshotOutcome::Accepted {
                 revision: 3,
-                snapshot_hash: "a".repeat(64),
+                snapshot_hash: initial_hash,
                 no_op: false,
             }
         );
@@ -710,7 +945,7 @@ mod tests {
         assert_eq!(audit.get::<Option<i64>, _>("previous_revision"), Some(2));
         assert_eq!(
             audit.get::<Option<String>, _>("previous_snapshot_hash"),
-            Some("b".repeat(64))
+            Some(replacement_hash)
         );
         assert_eq!(audit.get::<String, _>("pushed_by"), "force-user");
         assert!(audit.get::<bool, _>("forced"));
@@ -749,8 +984,10 @@ mod tests {
             events: vec![],
         };
 
-        let first_a_hash = "d".repeat(64);
-        let first_b_hash = "e".repeat(64);
+        let first_a_hash = snapshot_hash(&snapshot);
+        let mut first_b_snapshot = snapshot.clone();
+        first_b_snapshot.project.name = "First B".into();
+        let first_b_hash = snapshot_hash(&first_b_snapshot);
         let first_a = store.replace_project_snapshot(
             workspace_id,
             &workspace_slug,
@@ -763,7 +1000,7 @@ mod tests {
         let first_b = store.replace_project_snapshot(
             workspace_id,
             &workspace_slug,
-            &snapshot,
+            &first_b_snapshot,
             &first_b_hash,
             None,
             false,
@@ -786,12 +1023,16 @@ mod tests {
             1
         );
 
-        let next_a_hash = "f".repeat(64);
-        let next_b_hash = "0".repeat(64);
+        let mut next_a_snapshot = snapshot.clone();
+        next_a_snapshot.project.name = "Next A".into();
+        let next_a_hash = snapshot_hash(&next_a_snapshot);
+        let mut next_b_snapshot = snapshot.clone();
+        next_b_snapshot.project.name = "Next B".into();
+        let next_b_hash = snapshot_hash(&next_b_snapshot);
         let next_a = store.replace_project_snapshot(
             workspace_id,
             &workspace_slug,
-            &snapshot,
+            &next_a_snapshot,
             &next_a_hash,
             Some(1),
             false,
@@ -800,7 +1041,7 @@ mod tests {
         let next_b = store.replace_project_snapshot(
             workspace_id,
             &workspace_slug,
-            &snapshot,
+            &next_b_snapshot,
             &next_b_hash,
             Some(1),
             false,

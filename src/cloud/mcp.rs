@@ -77,7 +77,19 @@ pub async fn handle(
             Ok(result) => result_response(id, result),
             Err(error) => {
                 let message = error.to_string();
-                if message.starts_with("Unknown or unavailable hosted tool:") {
+                if error.is::<super::store::ContextLimitExceeded>() {
+                    warn!(
+                        "[FIX:cloud-context] hosted MCP collection exceeds storage budget workspace_id={}",
+                        claims.workspace_id
+                    );
+                    rpc_http_error(
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        id,
+                        McpError::invalid_params(&format!(
+                            "{message}; use search or an exact document/event key"
+                        )),
+                    )
+                } else if message.starts_with("Unknown or unavailable hosted tool:") {
                     warn!(
                         "hosted MCP unsafe or unknown tool rejected id={}",
                         safe_id(&id)
@@ -154,7 +166,6 @@ fn audit_details(request: &JsonRpcRequest) -> Value {
 }
 
 fn result_response(id: Value, result: Value) -> Response {
-    // ponytail: wire-size cap; paginate store reads to bound collection aggregation memory.
     let response = JsonRpcResponse::result(id.clone(), stamp(result));
     let body = serde_json::to_vec(&response).expect("JSON value serializes");
     if body.len() > MAX_MCP_RESPONSE_BYTES {

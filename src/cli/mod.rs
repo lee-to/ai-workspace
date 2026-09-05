@@ -341,7 +341,7 @@ pub enum CloudCommand {
         /// Include safe UTF-8 Markdown from shared file/directory scopes
         #[arg(long)]
         include_markdown: bool,
-        /// Replace a stale cloud revision explicitly
+        /// Replace a stale cloud revision (also requires ai-workspace:push-force)
         #[arg(long)]
         force: bool,
         /// Cloud service base URL (or AI_WORKSPACE_CLOUD_URL)

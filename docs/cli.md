@@ -470,7 +470,7 @@ AI_WORKSPACE_CLOUD_TOKEN="$(security find-generic-password -w -s ai-workspace-cl
 | Option | Description |
 |--------|-------------|
 | `--include-markdown` | Include eligible Markdown from explicit shared scopes |
-| `--force` | Replace a stale revision intentionally |
+| `--force` | Replace a stale revision intentionally; requires both `ai-workspace:push` and `ai-workspace:push-force` |
 | `--url <url>` | Cloud base URL; overrides `AI_WORKSPACE_CLOUD_URL` |
 | `--workspace <slug>` | Workspace slug; overrides `AI_WORKSPACE_CLOUD_WORKSPACE` |
 

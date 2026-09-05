@@ -332,12 +332,61 @@ mod tests {
         assert!(validator.cached_key("rotated").await.is_some());
         validator.refresh_keys().await.unwrap();
         assert_eq!(requests.load(Ordering::SeqCst), 3);
-        validator.cache.write().await.as_mut().unwrap().loaded_at = Instant::now() - JWKS_TTL;
+
+        // This known kid reaches signature validation only while its cached key is fresh.
+        // The deliberately unsigned token distinguishes key lookup from signature rejection.
+        let rotated = HeaderMap::from_iter([(
+            axum::http::header::AUTHORIZATION,
+            "Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6InJvdGF0ZWQifQ.e30.AAAA"
+                .parse()
+                .unwrap(),
+        )]);
+        assert_eq!(
+            validator
+                .authenticate(&rotated)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "Bearer token validation failed"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+
+        let expired_at = Instant::now() - JWKS_TTL;
+        validator.cache.write().await.as_mut().unwrap().loaded_at = expired_at;
         assert!(validator.cached_key("rotated").await.is_none());
+        assert_eq!(
+            validator
+                .authenticate(&rotated)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "JWT key ID is not trusted"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 3);
+
         *validator.last_refresh_attempt.lock().await = Some(Instant::now() - JWKS_REFRESH_INTERVAL);
-        assert!(validator.refresh_keys().await.is_err());
+        assert_eq!(
+            validator
+                .authenticate(&rotated)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "JWKS endpoint returned an error"
+        );
+        assert_eq!(
+            validator
+                .authenticate(&rotated)
+                .await
+                .unwrap_err()
+                .to_string(),
+            "JWT key ID is not trusted"
+        );
         assert!(validator.cached_key("rotated").await.is_none());
         assert_eq!(requests.load(Ordering::SeqCst), 4);
+        assert_eq!(
+            validator.cache.read().await.as_ref().unwrap().loaded_at,
+            expired_at
+        );
         server.abort();
     }
 
