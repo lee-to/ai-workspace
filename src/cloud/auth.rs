@@ -148,6 +148,8 @@ impl JwtValidator {
     }
 
     async fn cached_key(&self, key_id: &str) -> Option<Jwk> {
+        // Fail closed after TTL: a retained key is unusable until a successful refresh.
+        // Refresh errors and the retry cooldown never extend its original lifetime.
         let cache = self.cache.read().await;
         cache.as_ref().and_then(|cache| {
             (cache.loaded_at.elapsed() < JWKS_TTL)

@@ -52,6 +52,8 @@ ai-workspace cloud push --force
 
 Force mode requires both `ai-workspace:push` and the separate `ai-workspace:push-force` scope, including retries that would be no-ops. Without either permission the server returns `403 insufficient_scope` and advertises the missing scope in `WWW-Authenticate`, before accessing storage. Grant the extra scope only to identities permitted to override conflicts. Force does not bypass authentication, workspace binding, validation, or PostgreSQL row-level security (RLS). The service records the subject and previous revision/hash.
 
+Authorization is enforced by `cloud::http::push_authenticated`, the only production caller of `CloudStore::replace_project_snapshot`. The store's `force: bool` controls concurrency after authorization; it does not grant permission. Any future entry point calling the store directly must enforce the same scope checks first.
+
 The server assigns the next revision under a transaction lock and writes its own database timestamps. Clients cannot supply the stored revision or timestamps. After A is replaced by B, replaying the original A request returns `409` and leaves B and its audit fields unchanged. A retry whose hash already matches the current snapshot is a harmless no-op.
 
 This is optimistic concurrency control. A writer can intentionally restore older content by supplying the current `base_revision`; bypassing a stale base with `force` requires the additional scope. The content hash is an integrity check, not a signature proving freshness. Protect write tokens accordingly.

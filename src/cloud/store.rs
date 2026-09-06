@@ -131,6 +131,10 @@ impl CloudStore {
         Ok(transaction)
     }
 
+    /// Persist an already-authorized push. The HTTP caller (`push_authenticated`)
+    /// requires `ai-workspace:push` and, for `force`, `ai-workspace:push-force`
+    /// before calling this method, including for no-op retries. Internal callers
+    /// must enforce the same policy; `force` is not an authorization credential.
     #[allow(clippy::too_many_arguments)]
     pub async fn replace_project_snapshot(
         &self,
