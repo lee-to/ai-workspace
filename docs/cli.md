@@ -37,9 +37,11 @@ Commands that work from any directory (no project required):
 - `reindex`
 - `codegraph reindex/sync/status/search --project <id-or-slug>`
 - `serve`
+- `cloud serve`
 - `update`
 
 `serve --scope current-project` must be started from a registered project directory so the current project can be resolved.
+`cloud push` must be started inside the project being synchronized.
 
 ## Commands
 
@@ -456,6 +458,34 @@ ai-workspace serve --project api
 
 Scope can also be configured with `AI_WORKSPACE_SCOPE`, `AI_WORKSPACE_SCOPE_GROUP`, and `AI_WORKSPACE_SCOPE_PROJECT`. CLI scope flags override env vars. See [MCP Server](mcp-server.md) for scope behavior and available tools.
 
+### `cloud push`
+
+Push the current project's versioned snapshot to the configured cloud service.
+
+```bash
+AI_WORKSPACE_CLOUD_TOKEN="$(security find-generic-password -w -s ai-workspace-cloud)" \
+  ai-workspace cloud push --url https://workspace.example.com --workspace platform
+```
+
+| Option | Description |
+|--------|-------------|
+| `--include-markdown` | Include eligible Markdown from explicit shared scopes |
+| `--force` | Replace a stale revision intentionally; requires both `ai-workspace:push` and `ai-workspace:push-force` |
+| `--url <url>` | Cloud base URL; overrides `AI_WORKSPACE_CLOUD_URL` |
+| `--workspace <slug>` | Workspace slug; overrides `AI_WORKSPACE_CLOUD_WORKSPACE` |
+
+The bearer token is accepted only through `AI_WORKSPACE_CLOUD_TOKEN`, never as a command argument. See [Cloud](cloud.md) for snapshot limits and conflict behavior.
+
+### `cloud serve`
+
+Start the hosted snapshot API and read-only HTTP MCP service:
+
+```bash
+RUST_LOG=info ai-workspace cloud serve --bind 127.0.0.1:8080
+```
+
+Hosted configuration comes from `AI_WORKSPACE_CLOUD_*` environment variables. This command does not read the local project config or open SQLite. See [Cloud](cloud.md) for the complete deployment configuration.
+
 ### `update`
 
 Update ai-workspace to the latest version.
@@ -472,3 +502,4 @@ If you're already on the latest version, it prints a message and exits without c
 
 - [Getting Started](getting-started.md) — Installation and first steps
 - [MCP Server](mcp-server.md) — MCP tools exposed by `serve`
+- [Cloud](cloud.md) — Cloud commands and hosted service deployment

@@ -1,5 +1,5 @@
 {
-  "version": "2.11.0",
+  "version": "2.19.0",
   "agents": [
     {
       "id": "claude",
@@ -29,8 +29,135 @@
         "aif-rules-check",
         "aif-security-checklist",
         "aif-skill-generator",
-        "aif-verify"
+        "aif-verify",
+        "aif-archive",
+        "aif-distillation",
+        "aif-qa-check",
+        "aif-transfer",
+        "aif-warmup"
       ],
+      "managedSkills": {
+        "aif": {
+          "sourceHash": "afad68e3c5547b5d91031d928aeb6aeeb944d3bcaf74ed44e661d5b5bb984e68",
+          "installedHash": "04d5d7ff46524db694895c77f6091a263a324e938c102fb8edc50a394cfd518d"
+        },
+        "aif-architecture": {
+          "sourceHash": "353dde39a033fb291468058e8a4f85622cc7b40d9e8736bd6a2ff325656ee694",
+          "installedHash": "72f7c8c3a18d65d509f45e3e735f37767e5c09a981537dd1a8932808414ade49"
+        },
+        "aif-best-practices": {
+          "sourceHash": "761ccf625c0276b19282d426037279a3438602087e56d2c52af5156a8e5be245",
+          "installedHash": "8d789b6db0c0f63b181a1d9e9ff786449cf777a6ce73c7234de3e03938ed2ded"
+        },
+        "aif-build-automation": {
+          "sourceHash": "b9ded6f66620b7c8c2ed78b7dbf35de27f768c3cca0a53453c449d10ebae064b",
+          "installedHash": "8f61ca2afe7f8d7ae4d9f4aeb3ef56f5cd0ed8eedd7f21493728e1fd61d34533"
+        },
+        "aif-ci": {
+          "sourceHash": "37abfac4b6e5ab15cd6fd5c3d6d6a22436448675ff9263ac6d443bbcd438aa94",
+          "installedHash": "513e211ed5cd443eafbe9c26d910ca41c059c29f8a5ad4566b2bc24038643f24"
+        },
+        "aif-commit": {
+          "sourceHash": "3b58bfa7f11a04a9ed8e66bced8593b4b256f2c9880a5a3f5450783a5938f43c",
+          "installedHash": "84280ed7b62f3117cd5078ae2ee767ba8baa28a86d585712f1df8671f55118d6"
+        },
+        "aif-dockerize": {
+          "sourceHash": "8e24073d2388601114e8bba95a402bc43c9bcd9896c238aff785ff930f5e35db",
+          "installedHash": "088415cc5cfcb1f636338ff029cc273f6e401a8425bfc18edb9ad78a8b7fae83"
+        },
+        "aif-docs": {
+          "sourceHash": "489958faf586f83a96048366e766851b81d909222d082dedb5e8b7de8966fbc8",
+          "installedHash": "dc965114650f40ab2cade4f0e4d882934170a8574b9299351bd4286ab3e4a83b"
+        },
+        "aif-evolve": {
+          "sourceHash": "9f4f0bcbd0427c5522d58c531e516cd0bb9e2392fa03436fbb3b226f02036168",
+          "installedHash": "6850c55deb88d23f6bc8ceeac3ce6a83a1dab9a80dee6b372792d30267afdeee"
+        },
+        "aif-explore": {
+          "sourceHash": "e27c048c1062cb4e7ecadc76aa723e6778f243c5f9995ca2c95dd16555d251c2",
+          "installedHash": "676691688f6f0022c12f668f7be520e60a8e0fb1240a575ab0ab0542486dd15e"
+        },
+        "aif-fix": {
+          "sourceHash": "5d12c66a46118653115e78f0ae0bea47e5485395cd3ff4583fa61b1ee5febfc0",
+          "installedHash": "b15ee19dff6cfbe4fd9be78841310fd1577fb298f628a8bbec5169a05c71cf86"
+        },
+        "aif-grounded": {
+          "sourceHash": "96eb67434f47d51e655dc3923ca847231d1f80a5a91c75f91e9a509d31a50680",
+          "installedHash": "11a25f6e08c468e798a77ee28f8ed62c881c2c161f02761d9cc54ed946ddcc9f"
+        },
+        "aif-implement": {
+          "sourceHash": "2cf32e39785a5e5f6d04c9a3e082bf9dae9ba5e335ddc636f6fecd278b2d4168",
+          "installedHash": "8a31b8f34d759875c9771c41edebdc2411262daf09936f7d2fda61d38f014538"
+        },
+        "aif-improve": {
+          "sourceHash": "fe99df1bb688ee27d741bee1cf27c0a1bf9ffe189d0811fd5ee8bebabb891ec8",
+          "installedHash": "d33e30eb76a2e23230dfe17d6022b934f9fda648a13090fbed37f1679298b6b5"
+        },
+        "aif-loop": {
+          "sourceHash": "37faa09931d1a585f442ce765d439eb534503d3bd8b3f48746811e9e5d3016cb",
+          "installedHash": "6a87b49b950dd7f2ccf4b5f80841e655a26031f82f5bf411328903ee52834ff5"
+        },
+        "aif-plan": {
+          "sourceHash": "d2a28a2e8380ba94fba56d8cfd3563f7b361411292acbfe08068f23d2b4b9874",
+          "installedHash": "5f813833e7a8b55870056fd19948d7cd7b27e37be6d2cd8edb5de88c01de12ac"
+        },
+        "aif-qa": {
+          "sourceHash": "d806c10e4091c907a69378e4ab5f0aafa6dc3765b2f935fd1dbc2dc0b8067bb4",
+          "installedHash": "4c83461b0885d4548f37d1ceaaa8e77818d1a05980a6d80ef8609fe724e44703"
+        },
+        "aif-reference": {
+          "sourceHash": "3c74ce7280f1a1a5be50aeaef008dfd42482fb30461f3e1adef4ea107f1dd103",
+          "installedHash": "374d523bc861302641e5ecdb9f90536f6603596865537f9838897667a5e9926c"
+        },
+        "aif-review": {
+          "sourceHash": "08d73b13a25a0a3d460782e2e4db9d799a76002d60c13336bcb643add70075a9",
+          "installedHash": "8bc5c27122d6652b62937455faccf5b716f03f1bffcb3409aee1d6600245aeda"
+        },
+        "aif-roadmap": {
+          "sourceHash": "b35fb5f4f39d943ee1ca74b242729b512c058a1bafed2403c804c39afbeaf723",
+          "installedHash": "e7f4abcc448462cb68dc4e6646f05fe3c8e88b9f8e0f0bb76e0face8d6dea78d"
+        },
+        "aif-rules": {
+          "sourceHash": "c3e6a5cd0b3fa600d082b27409dc2bf489dbb73ee6e134fa0878ef98ca16e33f",
+          "installedHash": "5899d06906b32c3892752e38a73ad32c22fe51cb66576280959587ea2caf8ad3"
+        },
+        "aif-rules-check": {
+          "sourceHash": "6d6e801aa771e81c481b251682853e878b0999dfbe6411d5a1f123bb2938c161",
+          "installedHash": "e56f6efb3670b88293d200a9fd1da71ab8265fe2bf7b586af296d114a97ccf73"
+        },
+        "aif-security-checklist": {
+          "sourceHash": "0a074e8e6c9122cf4474bfdbd7e898e8abf623a4c5ccbee3e5f5fecdf4fa7479",
+          "installedHash": "9bf97c3dace2a9ffb5e9c9ecce0911cbf9f320c08bf0b415c1f01df841462830"
+        },
+        "aif-skill-generator": {
+          "sourceHash": "d2df9f33ccdd800e2c7eb13ab07182ea18c08100fd018bf30c3cb530e8ee5a24",
+          "installedHash": "a3aa6f86065f6979f0624d6889af39b20f84d92a890f1c6f1966d15324c44d3e"
+        },
+        "aif-verify": {
+          "sourceHash": "be4d089f6acbbb77544969cb75d4ecc29d1ce85aac2eba1b1138bc9fc026f922",
+          "installedHash": "3f4d6f1af58794ac677544013d5ddda7a7eae444d873617893460245551cafbd"
+        },
+        "aif-archive": {
+          "sourceHash": "a2b867ac90cf6dec15fec079b37fe6c7a2bf89ae18e7dc867ee4c55cdde22307",
+          "installedHash": "d69322a7baad997cf87fd0200488238062de4496e3480b55a6fda31f82d91454"
+        },
+        "aif-distillation": {
+          "sourceHash": "79b3d98ea7cdfa91cbe3ddfd70348999ebe04284f07e0224f4450badef6ec43d",
+          "installedHash": "8f5c1e63e371ddf840e325add083f129ed3d18d919b4a4158b61f41272cb559c"
+        },
+        "aif-qa-check": {
+          "sourceHash": "38c93c72d324d352432a95eb68834d67863a9a55f4fbb6c363da24809708d260",
+          "installedHash": "e709997975ddfe0d9bee82156ae3e7fe0567771c70776c6b3c677f162375cd85"
+        },
+        "aif-transfer": {
+          "sourceHash": "fcb57fef72d2874e37a1ef31f772c5b685ce47af8dea1e2919677f40f5b1a4b3",
+          "installedHash": "5dab671df0d027ff906a715ff2abc291fcbfd1a3aa2f1e1b1c2a40da30ee9a3e"
+        },
+        "aif-warmup": {
+          "sourceHash": "3dbdcd24aed3dff6350cbc6693eaf0efb3a979b3cf894e1f05cd297dbf1ef15e",
+          "installedHash": "dd31dae2b1d4caf4c4a7f52184d6ffd1e5df26be3da7d45758967539da51a98c"
+        }
+      },
       "agentsDir": ".claude/agents",
       "installedAgentFiles": [
         "best-practices-sidecar.md",
@@ -131,115 +258,6 @@
           "sourcePath": "security-sidecar.md"
         }
       },
-      "mcp": {
-        "github": false,
-        "filesystem": false,
-        "postgres": false,
-        "chromeDevtools": false,
-        "playwright": false
-      },
-      "managedSkills": {
-        "aif": {
-          "sourceHash": "97131d6132d22d5577d76f681a4c68b6cd0013bd8b2a0f0e86a90f36d2e667e3",
-          "installedHash": "761f1df2812fc77a8bc5c4e15355b87ce967d332cbb00e473a6b4d8bf0ccda85"
-        },
-        "aif-architecture": {
-          "sourceHash": "4d934b9b4872cbd79d47c8eb415c750e1015129653d264ac81f92da9ecb9d4f9",
-          "installedHash": "911394e4f8494acea75883cf0df4423c1ade47582b00f37ee2363cc1d5c894a4"
-        },
-        "aif-best-practices": {
-          "sourceHash": "761ccf625c0276b19282d426037279a3438602087e56d2c52af5156a8e5be245",
-          "installedHash": "8d789b6db0c0f63b181a1d9e9ff786449cf777a6ce73c7234de3e03938ed2ded"
-        },
-        "aif-build-automation": {
-          "sourceHash": "02005d1767c28b807dcb5307965acc0231fd9fddb3318b88853ad6d136d23ab5",
-          "installedHash": "5341fd4acf65b3f3de7f5b8fbe382d64913aa602bea885ac51aae728efeb65cd"
-        },
-        "aif-ci": {
-          "sourceHash": "37abfac4b6e5ab15cd6fd5c3d6d6a22436448675ff9263ac6d443bbcd438aa94",
-          "installedHash": "513e211ed5cd443eafbe9c26d910ca41c059c29f8a5ad4566b2bc24038643f24"
-        },
-        "aif-commit": {
-          "sourceHash": "7a8fb81b2adabbe1203bd326cc8cf445d46ae2a1bd1c2ddf3769c211af3512c3",
-          "installedHash": "d37aa4dea966c837abebba2ba3a2c18be70d805772580cf5385030156b9bd376"
-        },
-        "aif-dockerize": {
-          "sourceHash": "2cd2ec0a6e942270ef0b1105de8e521ee29d99483e3c8e17281c5b293461c68f",
-          "installedHash": "8a337abe764e4dc13ca54d0d708997066bdf28556e964f4e7beaf92ab9ac31ed"
-        },
-        "aif-docs": {
-          "sourceHash": "489958faf586f83a96048366e766851b81d909222d082dedb5e8b7de8966fbc8",
-          "installedHash": "dc965114650f40ab2cade4f0e4d882934170a8574b9299351bd4286ab3e4a83b"
-        },
-        "aif-evolve": {
-          "sourceHash": "9f4f0bcbd0427c5522d58c531e516cd0bb9e2392fa03436fbb3b226f02036168",
-          "installedHash": "6850c55deb88d23f6bc8ceeac3ce6a83a1dab9a80dee6b372792d30267afdeee"
-        },
-        "aif-explore": {
-          "sourceHash": "0e903e45de0f74b08a137145f8898201b1bbd826281b3ee629ea854353b94f69",
-          "installedHash": "bf289d00626ede144455a2900abb3fde92118bbdc6d2e66f030d68da71a95ace"
-        },
-        "aif-fix": {
-          "sourceHash": "4e668661c8963f3144732c97ca09cd52993fb99fc48ebe32f6a9c019d4948f97",
-          "installedHash": "4916814daed8cf3aa5c7bd02b7569dab76a029127d130ab3cb1aa65f67b5d676"
-        },
-        "aif-grounded": {
-          "sourceHash": "96eb67434f47d51e655dc3923ca847231d1f80a5a91c75f91e9a509d31a50680",
-          "installedHash": "11a25f6e08c468e798a77ee28f8ed62c881c2c161f02761d9cc54ed946ddcc9f"
-        },
-        "aif-implement": {
-          "sourceHash": "331218895d987dcaee2e9ec486f50d508c8b5511effb3b32ef5af76c9db00b7d",
-          "installedHash": "4639a1a2602dea48baf1d366c74019864232b7f0092120f9df7f5ab12152cbb4"
-        },
-        "aif-improve": {
-          "sourceHash": "bcad15befd3b623c16c3ab9829916c058378693c6c5c9b6b8411ebe7369dce2e",
-          "installedHash": "a197bc16e9aa5173f512fefab855e869cf1f67166286b38a342a856fa76640c1"
-        },
-        "aif-loop": {
-          "sourceHash": "7b4cde8be1e6cedbfb0f0504abac233e0d578c6147288012b265ef5d2e6be274",
-          "installedHash": "688bfaee782bd10bf3bec648ca3e185a83038a340f95b19e512e044719cf504b"
-        },
-        "aif-plan": {
-          "sourceHash": "aa4f3dc1c5af76c28d2f666d526986ab8ec823aa97f295341355254813028608",
-          "installedHash": "9f04b30a3f1bde25bfb26586e4026d4204836246a5c8506ed5e6ecf2040dfc0b"
-        },
-        "aif-qa": {
-          "sourceHash": "f1da4fc4a1669f143470f5171b0ed9129c8eb853fd8a9cf0868cecd080468f7d",
-          "installedHash": "483c556b150499b8e69a93caa766e0bc963d8584afd596bd315f130adaf6f924"
-        },
-        "aif-reference": {
-          "sourceHash": "3a191dc096ecfe54c99862ff80752f4600b38c8fd162326843f0ab037ec9f83c",
-          "installedHash": "591aa61dc683137dbf0270c9a263eeae696ff20e11ca126fb55554c5635ca7dc"
-        },
-        "aif-review": {
-          "sourceHash": "db81c84d3d191a2b6a8a984ba54cf04c0b1f6d179cfb69a16d8b291d8cb4fdc7",
-          "installedHash": "d21b8d204ba27db4269fa3a36558fdc6199f704b68359123dcd5ac588639d45b"
-        },
-        "aif-roadmap": {
-          "sourceHash": "ac51300d582ad9a9c92750187d64c9f37824082c491c3ab08caf81c56b44deb0",
-          "installedHash": "8dc239b47a285993f440ab86ac453b7bcd868e258075ea58aa4d427fea07d2e3"
-        },
-        "aif-rules": {
-          "sourceHash": "fd5ba45156b4b9aca5410dc83c63af1bacffd81d67a19da7ce08703f28a4c59e",
-          "installedHash": "b068ce38f96c29a4d0a3306bd4c531b3cea4a69ca9c6c463f3ca48df7cdcefef"
-        },
-        "aif-rules-check": {
-          "sourceHash": "b793810b56d956d54439beafa3aed72b1704631545dc2432f527f11a61b6748c",
-          "installedHash": "3e088b9f189e9ed559c9306cf8e2b0cfd10969659c848cccfa33347d2dac045d"
-        },
-        "aif-security-checklist": {
-          "sourceHash": "6825d53d5ed74c87a441914086eb78dcd1c3473575a3119ddb442076c775c556",
-          "installedHash": "2404f888eeba3c4120ff53dfc8f836bf05ef612dc2432eb717db87f5a3cfd62b"
-        },
-        "aif-skill-generator": {
-          "sourceHash": "8d1e9073a50af8ea736247d649ea554a67edc36e837c37ab059a92c877b8453a",
-          "installedHash": "5a59b5f40fe3b39fe5c764164298bb96fe389cfa4f091f8bbc2e76a1f389ba41"
-        },
-        "aif-verify": {
-          "sourceHash": "ca70f931df4a2e0f20c831c015d3d3f48d35fc5784343d4091119189445a36d4",
-          "installedHash": "83e2afec0f002c1d796df2136ffb0ac3e46aa92b7c391a773d39fb95aaaa6f6e"
-        }
-      },
       "managedAgentFiles": {
         "best-practices-sidecar.md": {
           "sourceHash": "d6299d586c6b05d554fcf18cba600616b37acc7992b3bd60be1cf3d2d51571d6",
@@ -254,12 +272,12 @@
           "installedHash": "f71dd1b0a2e87995db15ca3c23f601a8b6cef8a189af27230552b08d693c5057"
         },
         "implement-coordinator.md": {
-          "sourceHash": "27219b57408a74922308875000494fb15a02d7956b4a687264a813f6854206ce",
-          "installedHash": "27219b57408a74922308875000494fb15a02d7956b4a687264a813f6854206ce"
+          "sourceHash": "0d7c8803a2d49bdcd6183274d9dbcbc5436f368be83859ecd69f7d6487ba9c09",
+          "installedHash": "0d7c8803a2d49bdcd6183274d9dbcbc5436f368be83859ecd69f7d6487ba9c09"
         },
         "implement-worker.md": {
-          "sourceHash": "d35bb37c781f3a7cd06615c05aaf496c9a1c089cb52ec55516231dc8f703f3b8",
-          "installedHash": "d35bb37c781f3a7cd06615c05aaf496c9a1c089cb52ec55516231dc8f703f3b8"
+          "sourceHash": "6de0d0d9d8d21d7d22dca7001f4bad14595080ffaa52b808af6ec26bb0eb7427",
+          "installedHash": "6de0d0d9d8d21d7d22dca7001f4bad14595080ffaa52b808af6ec26bb0eb7427"
         },
         "loop-critic.md": {
           "sourceHash": "92bd4234ccbc6bccd3270c63ae5dc64624b68152ca24f3cb54d9682f78faeea1",
@@ -274,8 +292,8 @@
           "installedHash": "86f5a8665930110cac6a2bfe380fa5b3d26127e692b0375f73b278549e6b98d4"
         },
         "loop-orchestrator.md": {
-          "sourceHash": "4a6c04a5049153bac55efe272bb18a4a3567b9013b7a82b81e4b174ed3cdc0ce",
-          "installedHash": "4a6c04a5049153bac55efe272bb18a4a3567b9013b7a82b81e4b174ed3cdc0ce"
+          "sourceHash": "f0aa77d61eb2d70ead379aa5431485f8b2c4f0b79394dd673bbdbd5229a85270",
+          "installedHash": "f0aa77d61eb2d70ead379aa5431485f8b2c4f0b79394dd673bbdbd5229a85270"
         },
         "loop-perf-prep.md": {
           "sourceHash": "6a6571d6d5cefce62ef2847e51205acbe92f0f83287f007ae9f670a3d336eb7f",
@@ -298,12 +316,12 @@
           "installedHash": "f86d07fe3193f0c3e6adf280eee0ea1bb0196e982d16cf12dff947a292baa7ff"
         },
         "plan-coordinator.md": {
-          "sourceHash": "a58e125a05179ef681538c935ee4363f30d818c0e816304a1ee16f3c19efcbb0",
-          "installedHash": "a58e125a05179ef681538c935ee4363f30d818c0e816304a1ee16f3c19efcbb0"
+          "sourceHash": "747911afc10a0183909c757f97c24b04e800055b0f55ee290321b336507bf76e",
+          "installedHash": "747911afc10a0183909c757f97c24b04e800055b0f55ee290321b336507bf76e"
         },
         "plan-polisher.md": {
-          "sourceHash": "2829017069b521e07da341df79e3c63110d9bd010d021363b638f829d62e441c",
-          "installedHash": "2829017069b521e07da341df79e3c63110d9bd010d021363b638f829d62e441c"
+          "sourceHash": "85f5508200d92d5957dadbfddc5a891db343dfec09ff191776fe9f57181de936",
+          "installedHash": "85f5508200d92d5957dadbfddc5a891db343dfec09ff191776fe9f57181de936"
         },
         "review-sidecar.md": {
           "sourceHash": "362856f185785d84629ddf947e7015003c766b1caf272b6df6bd25c3516bcc95",
@@ -317,6 +335,16 @@
           "sourceHash": "515635e77f18bf95fce1cbe979c4e515b03f37274a201b669d17cbdc9e2a6906",
           "installedHash": "515635e77f18bf95fce1cbe979c4e515b03f37274a201b669d17cbdc9e2a6906"
         }
+      },
+      "configFiles": [],
+      "installedConfigFiles": [],
+      "managedConfigFiles": {},
+      "mcp": {
+        "github": false,
+        "filesystem": false,
+        "postgres": false,
+        "chromeDevtools": false,
+        "playwright": false
       }
     },
     {
@@ -347,46 +375,41 @@
         "aif-rules-check",
         "aif-security-checklist",
         "aif-skill-generator",
-        "aif-verify"
+        "aif-verify",
+        "aif-archive",
+        "aif-distillation",
+        "aif-qa-check",
+        "aif-transfer",
+        "aif-warmup"
       ],
-      "agentsDir": ".codex/agents",
-      "installedAgentFiles": [],
-      "agentFileSources": {},
-      "mcp": {
-        "github": false,
-        "filesystem": false,
-        "postgres": false,
-        "chromeDevtools": false,
-        "playwright": false
-      },
       "managedSkills": {
         "aif": {
-          "sourceHash": "97131d6132d22d5577d76f681a4c68b6cd0013bd8b2a0f0e86a90f36d2e667e3",
-          "installedHash": "a68b0797f06250b777d95930253cea1545bdd1cbc345227d8192ada24e72198d"
+          "sourceHash": "afad68e3c5547b5d91031d928aeb6aeeb944d3bcaf74ed44e661d5b5bb984e68",
+          "installedHash": "7ad25181186455de8c2aaf19dda3efdc312ffb67328076684cd7a3b6ef2f8283"
         },
         "aif-architecture": {
-          "sourceHash": "4d934b9b4872cbd79d47c8eb415c750e1015129653d264ac81f92da9ecb9d4f9",
-          "installedHash": "f8175c3dc3bcfc1b61e5023991dd33430b282a03fe82bf1470b740a11469037b"
+          "sourceHash": "353dde39a033fb291468058e8a4f85622cc7b40d9e8736bd6a2ff325656ee694",
+          "installedHash": "8a5fcdb74807cd6bb055cdb04f5f666bf90e927397424d6a955d8f63ffcd6b1e"
         },
         "aif-best-practices": {
           "sourceHash": "761ccf625c0276b19282d426037279a3438602087e56d2c52af5156a8e5be245",
           "installedHash": "a48a57376449825ad99843e1350271ea9d0a0652e54943f624bca5e451e329ad"
         },
         "aif-build-automation": {
-          "sourceHash": "02005d1767c28b807dcb5307965acc0231fd9fddb3318b88853ad6d136d23ab5",
-          "installedHash": "05dfa58f10395030490da4ec216b1c0fa90fb78c5afd764d07b9c7940de2b93e"
+          "sourceHash": "b9ded6f66620b7c8c2ed78b7dbf35de27f768c3cca0a53453c449d10ebae064b",
+          "installedHash": "ad69ef695a1a9f192080458aa7804198b99cdd40dc657eac372c33e7e3d0931a"
         },
         "aif-ci": {
           "sourceHash": "37abfac4b6e5ab15cd6fd5c3d6d6a22436448675ff9263ac6d443bbcd438aa94",
           "installedHash": "3849c3df2a7640048e658251f776e1ab26ca8b82509d2c2f8f7f7c49061748da"
         },
         "aif-commit": {
-          "sourceHash": "7a8fb81b2adabbe1203bd326cc8cf445d46ae2a1bd1c2ddf3769c211af3512c3",
-          "installedHash": "3d21520644282c068e4310a3d5bccb409503ddaf9a472d1f5c51eacc0c837867"
+          "sourceHash": "3b58bfa7f11a04a9ed8e66bced8593b4b256f2c9880a5a3f5450783a5938f43c",
+          "installedHash": "0971f24cd51dd54b7211ef1dba5b5a940b9558584de0a6b6f5fdb7e3155c4977"
         },
         "aif-dockerize": {
-          "sourceHash": "2cd2ec0a6e942270ef0b1105de8e521ee29d99483e3c8e17281c5b293461c68f",
-          "installedHash": "a97675c9f7a30cff6f4a8f25e933d04d549c52692a2148cb9d3c51c27ac5a12a"
+          "sourceHash": "8e24073d2388601114e8bba95a402bc43c9bcd9896c238aff785ff930f5e35db",
+          "installedHash": "5554b014b5ae075ff704a48a3dc771cffd857e5a8ddeac7c67e0f5903daab439"
         },
         "aif-docs": {
           "sourceHash": "489958faf586f83a96048366e766851b81d909222d082dedb5e8b7de8966fbc8",
@@ -397,71 +420,197 @@
           "installedHash": "ee9fba1094e133fcf3da7a34687a5b8a758898d1b2e54efe9a8a28c48e5472f4"
         },
         "aif-explore": {
-          "sourceHash": "0e903e45de0f74b08a137145f8898201b1bbd826281b3ee629ea854353b94f69",
-          "installedHash": "b9adc1c8611f716e6c6d6439266b6f41fb796fff4e459a72c69b190982b5172e"
+          "sourceHash": "e27c048c1062cb4e7ecadc76aa723e6778f243c5f9995ca2c95dd16555d251c2",
+          "installedHash": "0022ddac21d7792518d96f86ddf6a7a1d507100441d0e850323d420ddee87e31"
         },
         "aif-fix": {
-          "sourceHash": "4e668661c8963f3144732c97ca09cd52993fb99fc48ebe32f6a9c019d4948f97",
-          "installedHash": "9289e4bf30859ce4cb4371d65e3356209db43ec420f2bf84cd7035a73c6ee37b"
+          "sourceHash": "5d12c66a46118653115e78f0ae0bea47e5485395cd3ff4583fa61b1ee5febfc0",
+          "installedHash": "b2a35b71a33237a940372bf34cd1d8b51a5afde4ecad4444cc058db762a8a23d"
         },
         "aif-grounded": {
           "sourceHash": "96eb67434f47d51e655dc3923ca847231d1f80a5a91c75f91e9a509d31a50680",
           "installedHash": "29d4b5cb4ddb8ae44e69a8cac8db561baed8c16872a74f8f516acb2fdb199db7"
         },
         "aif-implement": {
-          "sourceHash": "331218895d987dcaee2e9ec486f50d508c8b5511effb3b32ef5af76c9db00b7d",
-          "installedHash": "a4bfbf295a319e527ef5016e8a624de8e849b7747aaf0d56be1102f14da5bc67"
+          "sourceHash": "2cf32e39785a5e5f6d04c9a3e082bf9dae9ba5e335ddc636f6fecd278b2d4168",
+          "installedHash": "cb20c93147bc8b51fd45b2975a0870d747067e977f4f07c6b18d7d84c5438e08"
         },
         "aif-improve": {
-          "sourceHash": "bcad15befd3b623c16c3ab9829916c058378693c6c5c9b6b8411ebe7369dce2e",
-          "installedHash": "6fd911be10dcb59f55187953b8ba6bfef5110cb49a7042583b8cba240c423c7b"
+          "sourceHash": "fe99df1bb688ee27d741bee1cf27c0a1bf9ffe189d0811fd5ee8bebabb891ec8",
+          "installedHash": "d3c916883e912b062f37300e711f39c889b0693492b1c53743d485a18d275752"
         },
         "aif-loop": {
-          "sourceHash": "7b4cde8be1e6cedbfb0f0504abac233e0d578c6147288012b265ef5d2e6be274",
-          "installedHash": "679f31ab7465ec92d4957d6fb9ba12a14dea131aee73258fff33f57e80c54eb5"
+          "sourceHash": "37faa09931d1a585f442ce765d439eb534503d3bd8b3f48746811e9e5d3016cb",
+          "installedHash": "fdf8d107174d25855899f6c0a4d38086a124ee11d199d72d37dadcb7436f5a1c"
         },
         "aif-plan": {
-          "sourceHash": "aa4f3dc1c5af76c28d2f666d526986ab8ec823aa97f295341355254813028608",
-          "installedHash": "9fca20220eaee504f85bb3a143ca96491414c246876b67608807e244398319d6"
+          "sourceHash": "d2a28a2e8380ba94fba56d8cfd3563f7b361411292acbfe08068f23d2b4b9874",
+          "installedHash": "6a335dd5f65c8cd14c48fbee588259477b2c4439f711d1df62516210465b453f"
         },
         "aif-qa": {
-          "sourceHash": "f1da4fc4a1669f143470f5171b0ed9129c8eb853fd8a9cf0868cecd080468f7d",
-          "installedHash": "2334540df511ed05a4456320dfa90a3f8e68862a988d6881aa2c13ebcaa22275"
+          "sourceHash": "d806c10e4091c907a69378e4ab5f0aafa6dc3765b2f935fd1dbc2dc0b8067bb4",
+          "installedHash": "9ca5747c3350dec5757ea80c88d528b0accf64291435d478ba66a6a0f986475a"
         },
         "aif-reference": {
-          "sourceHash": "3a191dc096ecfe54c99862ff80752f4600b38c8fd162326843f0ab037ec9f83c",
-          "installedHash": "9eeef50168ec604a2096557da10009776dd786bd367b5200dcfb7b154b3784f0"
+          "sourceHash": "3c74ce7280f1a1a5be50aeaef008dfd42482fb30461f3e1adef4ea107f1dd103",
+          "installedHash": "4bf8bcaf5514d73a1c23030fa6b6bf009218f2be8806ada3a82fcdecf6d97837"
         },
         "aif-review": {
-          "sourceHash": "db81c84d3d191a2b6a8a984ba54cf04c0b1f6d179cfb69a16d8b291d8cb4fdc7",
-          "installedHash": "545c7920eaa5089838d0faaacff0753dcdeeffa0917c6bb15bf25ae32455378a"
+          "sourceHash": "08d73b13a25a0a3d460782e2e4db9d799a76002d60c13336bcb643add70075a9",
+          "installedHash": "ea11cf1e5475bbfa2386fe2c960595020da3b19af5ebb38e4dcd5819f043866c"
         },
         "aif-roadmap": {
-          "sourceHash": "ac51300d582ad9a9c92750187d64c9f37824082c491c3ab08caf81c56b44deb0",
-          "installedHash": "bc2f0d21d49fadd9a3ad44a050b9d280f25549a4ca4e97002d08bb0493cd3d82"
+          "sourceHash": "b35fb5f4f39d943ee1ca74b242729b512c058a1bafed2403c804c39afbeaf723",
+          "installedHash": "edf89c1c5fbedb1c02b7fc323b6c5f0278fa58c726a31d671828e8ab6b64aa64"
         },
         "aif-rules": {
-          "sourceHash": "fd5ba45156b4b9aca5410dc83c63af1bacffd81d67a19da7ce08703f28a4c59e",
-          "installedHash": "f95f2274cea247034b56a7a7d6200b77a745bed13f73048bc6525fbe6eaec158"
+          "sourceHash": "c3e6a5cd0b3fa600d082b27409dc2bf489dbb73ee6e134fa0878ef98ca16e33f",
+          "installedHash": "0f83048224e6fbad163e608281722a08e042944f53c05af2693b5f7f124c8b8c"
         },
         "aif-rules-check": {
-          "sourceHash": "b793810b56d956d54439beafa3aed72b1704631545dc2432f527f11a61b6748c",
-          "installedHash": "92daffd7b5f803200b6dd33b20932e9834ad9f37868f73360fd743b767639a03"
+          "sourceHash": "6d6e801aa771e81c481b251682853e878b0999dfbe6411d5a1f123bb2938c161",
+          "installedHash": "8ab01f64fb1a6543d99b4e4bf065b8265672a6edb17dc0e5cf73d8b011139a85"
         },
         "aif-security-checklist": {
-          "sourceHash": "6825d53d5ed74c87a441914086eb78dcd1c3473575a3119ddb442076c775c556",
-          "installedHash": "435191b36b4a01db54b7ba82e0718ad12cad3c61481c02d041676e40e7e3036b"
+          "sourceHash": "0a074e8e6c9122cf4474bfdbd7e898e8abf623a4c5ccbee3e5f5fecdf4fa7479",
+          "installedHash": "fb720725cefdfed172a2814a9a5f5910698b6be74292ecfaae800e15ccada3f3"
         },
         "aif-skill-generator": {
-          "sourceHash": "8d1e9073a50af8ea736247d649ea554a67edc36e837c37ab059a92c877b8453a",
-          "installedHash": "ec5c562cbc8a13093e198f0cf9b0dbbd879d46d4a5653b44b59983541b3e6664"
+          "sourceHash": "d2df9f33ccdd800e2c7eb13ab07182ea18c08100fd018bf30c3cb530e8ee5a24",
+          "installedHash": "fa35ac02662c56250e6cf76297aee54795daf34bab8ac443a4180162a8618c41"
         },
         "aif-verify": {
-          "sourceHash": "ca70f931df4a2e0f20c831c015d3d3f48d35fc5784343d4091119189445a36d4",
-          "installedHash": "2a203218a8e29c681939b6e8e29c5127480f2a0e2a8bc40a247102d2a3c99249"
+          "sourceHash": "be4d089f6acbbb77544969cb75d4ecc29d1ce85aac2eba1b1138bc9fc026f922",
+          "installedHash": "1224a7e58a1398cfbe35c00e0286c5dc6106157104838b35669c290556792079"
+        },
+        "aif-archive": {
+          "sourceHash": "a2b867ac90cf6dec15fec079b37fe6c7a2bf89ae18e7dc867ee4c55cdde22307",
+          "installedHash": "1a66c75b762a83cfbd537fc6c8c1286d2c3954eeeec88543221d27104d503f23"
+        },
+        "aif-distillation": {
+          "sourceHash": "79b3d98ea7cdfa91cbe3ddfd70348999ebe04284f07e0224f4450badef6ec43d",
+          "installedHash": "d0e43152027918cee6121f9db72a2655bb5648206ffe3868324029aa99cdd5bb"
+        },
+        "aif-qa-check": {
+          "sourceHash": "38c93c72d324d352432a95eb68834d67863a9a55f4fbb6c363da24809708d260",
+          "installedHash": "0e992b82fbaac1e88a82e0dcd925063bb69eca479ddecce48c727d2a60eaddf9"
+        },
+        "aif-transfer": {
+          "sourceHash": "fcb57fef72d2874e37a1ef31f772c5b685ce47af8dea1e2919677f40f5b1a4b3",
+          "installedHash": "e4b90278aa3cb8d1a1c6471fa3a204ea3cd058703188380f65946bcc4c8fb4f1"
+        },
+        "aif-warmup": {
+          "sourceHash": "3dbdcd24aed3dff6350cbc6693eaf0efb3a979b3cf894e1f05cd297dbf1ef15e",
+          "installedHash": "dd31dae2b1d4caf4c4a7f52184d6ffd1e5df26be3da7d45758967539da51a98c"
         }
       },
-      "managedAgentFiles": {}
+      "agentsDir": ".codex/agents",
+      "installedAgentFiles": [
+        "best-practices-sidecar.toml",
+        "commit-preparer.toml",
+        "docs-auditor.toml",
+        "implement-coordinator.toml",
+        "implement-worker.toml",
+        "plan-coordinator.toml",
+        "plan-polisher.toml",
+        "review-sidecar.toml",
+        "security-sidecar.toml"
+      ],
+      "agentFileSources": {
+        "best-practices-sidecar.toml": {
+          "kind": "bundled",
+          "sourcePath": "best-practices-sidecar.toml"
+        },
+        "commit-preparer.toml": {
+          "kind": "bundled",
+          "sourcePath": "commit-preparer.toml"
+        },
+        "docs-auditor.toml": {
+          "kind": "bundled",
+          "sourcePath": "docs-auditor.toml"
+        },
+        "implement-coordinator.toml": {
+          "kind": "bundled",
+          "sourcePath": "implement-coordinator.toml"
+        },
+        "implement-worker.toml": {
+          "kind": "bundled",
+          "sourcePath": "implement-worker.toml"
+        },
+        "plan-coordinator.toml": {
+          "kind": "bundled",
+          "sourcePath": "plan-coordinator.toml"
+        },
+        "plan-polisher.toml": {
+          "kind": "bundled",
+          "sourcePath": "plan-polisher.toml"
+        },
+        "review-sidecar.toml": {
+          "kind": "bundled",
+          "sourcePath": "review-sidecar.toml"
+        },
+        "security-sidecar.toml": {
+          "kind": "bundled",
+          "sourcePath": "security-sidecar.toml"
+        }
+      },
+      "managedAgentFiles": {
+        "best-practices-sidecar.toml": {
+          "sourceHash": "c352dee7412f759088e4cf8f681aa7d1ec5ffd284058f0ebb83ca85b111e3e75",
+          "installedHash": "c352dee7412f759088e4cf8f681aa7d1ec5ffd284058f0ebb83ca85b111e3e75"
+        },
+        "commit-preparer.toml": {
+          "sourceHash": "506fab4ac509a2f75376772fd9fe761482d52fd6fc5c3015bbff23f1878531c1",
+          "installedHash": "506fab4ac509a2f75376772fd9fe761482d52fd6fc5c3015bbff23f1878531c1"
+        },
+        "docs-auditor.toml": {
+          "sourceHash": "77f837d1002a2d55a88b5f62c498c8bf1d52fbef0faefc1fe8219b539028dd78",
+          "installedHash": "77f837d1002a2d55a88b5f62c498c8bf1d52fbef0faefc1fe8219b539028dd78"
+        },
+        "implement-coordinator.toml": {
+          "sourceHash": "5200df7e5140262dbd86f340509d31c4ed3c4ccfd968fe31d4fcdf9266f9b4f4",
+          "installedHash": "5200df7e5140262dbd86f340509d31c4ed3c4ccfd968fe31d4fcdf9266f9b4f4"
+        },
+        "implement-worker.toml": {
+          "sourceHash": "eb52712488070bcdf6cddf52e866b8667ae905a5f8a4c5752f99d6e3e3ae958a",
+          "installedHash": "eb52712488070bcdf6cddf52e866b8667ae905a5f8a4c5752f99d6e3e3ae958a"
+        },
+        "plan-coordinator.toml": {
+          "sourceHash": "033d16c6824d642ce5afa6018ffd15009ca8530ca9fff7aaf7f32f983fc2604e",
+          "installedHash": "033d16c6824d642ce5afa6018ffd15009ca8530ca9fff7aaf7f32f983fc2604e"
+        },
+        "plan-polisher.toml": {
+          "sourceHash": "4ea796da6b25edaa5dd984c82c39d62b06c6ef29f2bbf4112ddbd50995848cf2",
+          "installedHash": "4ea796da6b25edaa5dd984c82c39d62b06c6ef29f2bbf4112ddbd50995848cf2"
+        },
+        "review-sidecar.toml": {
+          "sourceHash": "9e889e3c344dbbb2fc92277f09b3182d86de00e8b9d02bbdc0c84feef0713c8b",
+          "installedHash": "9e889e3c344dbbb2fc92277f09b3182d86de00e8b9d02bbdc0c84feef0713c8b"
+        },
+        "security-sidecar.toml": {
+          "sourceHash": "43e3e470f6392439b1db9747b145bf02fd2c4b190abf225647eee2d1363bdd1b",
+          "installedHash": "43e3e470f6392439b1db9747b145bf02fd2c4b190abf225647eee2d1363bdd1b"
+        }
+      },
+      "configFiles": [
+        "config.toml"
+      ],
+      "installedConfigFiles": [
+        "config.toml"
+      ],
+      "managedConfigFiles": {
+        "config.toml": {
+          "sourceHash": "a319bb56fbbf8e629ff5bf51e6ab78dc1226fa80985b73bcfa2b97cc7d460099",
+          "installedHash": "a319bb56fbbf8e629ff5bf51e6ab78dc1226fa80985b73bcfa2b97cc7d460099"
+        }
+      },
+      "mcp": {
+        "github": false,
+        "filesystem": false,
+        "postgres": false,
+        "chromeDevtools": false,
+        "playwright": false
+      }
     }
   ],
   "extensions": []

@@ -25,7 +25,15 @@ env_logger = "0.11"
 log = "0.4"
 dirs = "6"
 anyhow = "1"
+axum = "0.8"
 ignore = "0.4"
+jsonwebtoken = { version = "10", default-features = false, features = ["aws_lc_rs"] }
 regex = "1"
-self_update = { version = "0.44", default-features = false, features = ["archive-tar", "archive-zip", "compression-flate2", "compression-zip-deflate", "ureq", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
+sha2 = "0.10"
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
+self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate", "github", "ureq", "rustls"] }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tower-http = { version = "0.6", features = ["timeout"] }
+uuid = { version = "1", features = ["serde", "v4"] }

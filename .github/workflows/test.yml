@@ -23,3 +23,38 @@ jobs:
         with:
           cache-bin: false
       - run: cargo test
+
+  cloud-postgres:
+    name: Cloud PostgreSQL integration
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_DB: cloud_test
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d cloud_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      AI_WORKSPACE_CLOUD_TEST_ADMIN_DATABASE_URL: postgres://postgres:postgres@localhost:5432/cloud_test
+      AI_WORKSPACE_CLOUD_TEST_DATABASE_URL: postgres://cloud_runtime:runtime@localhost:5432/cloud_test
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
+      - name: Apply cloud migration as owner
+        run: psql "$AI_WORKSPACE_CLOUD_TEST_ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -f migrations/0001_cloud_read_model.sql
+      - name: Create restricted runtime role
+        run: psql "$AI_WORKSPACE_CLOUD_TEST_ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "CREATE ROLE cloud_runtime LOGIN PASSWORD 'runtime' NOSUPERUSER NOBYPASSRLS"
+      - name: Grant runtime schema access
+        run: psql "$AI_WORKSPACE_CLOUD_TEST_ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO cloud_runtime"
+      - name: Grant runtime table access
+        run: psql "$AI_WORKSPACE_CLOUD_TEST_ADMIN_DATABASE_URL" -v ON_ERROR_STOP=1 -c "GRANT SELECT, INSERT, UPDATE, DELETE ON cloud_workspaces, cloud_project_snapshots, cloud_documents TO cloud_runtime"
+      - run: cargo test

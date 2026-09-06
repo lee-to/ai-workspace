@@ -335,6 +335,31 @@ pub enum CodeGraphCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum CloudCommand {
+    /// Push the current project's synchronized snapshot
+    Push {
+        /// Include safe UTF-8 Markdown from shared file/directory scopes
+        #[arg(long)]
+        include_markdown: bool,
+        /// Replace a stale cloud revision (also requires ai-workspace:push-force)
+        #[arg(long)]
+        force: bool,
+        /// Cloud service base URL (or AI_WORKSPACE_CLOUD_URL)
+        #[arg(long)]
+        url: Option<String>,
+        /// Cloud workspace slug (or AI_WORKSPACE_CLOUD_WORKSPACE)
+        #[arg(long)]
+        workspace: Option<String>,
+    },
+    /// Start the hosted read-only MCP and snapshot service
+    Serve {
+        /// Listen address (or AI_WORKSPACE_CLOUD_BIND; default 127.0.0.1:8080)
+        #[arg(long)]
+        bind: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize current directory as a project
     Init {
@@ -468,6 +493,11 @@ pub enum Command {
     Codegraph {
         #[command(subcommand)]
         command: CodeGraphCommand,
+    },
+    /// Synchronize with or run the hosted cloud service
+    Cloud {
+        #[command(subcommand)]
+        command: CloudCommand,
     },
 }
 
@@ -1512,6 +1542,10 @@ fn apply_ai_factory_preset(
 }
 
 pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
+    let cmd = match cmd {
+        Command::Cloud { command } => return run_cloud(command),
+        cmd => cmd,
+    };
     let config_path_override = normalize_config_override(config_path_override)?;
 
     match cmd {
@@ -2476,7 +2510,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 .build()?
                 .update()?;
 
-            if status.updated() {
+            if status.is_updated() {
                 print_success(format!("Updated to v{}", status.version()));
             } else {
                 print_info(format!("Already up to date (v{})", current));
@@ -2742,5 +2776,75 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 }
             }
         }
+        Command::Cloud { .. } => unreachable!("cloud commands return before local dispatch"),
     }
+}
+
+fn run_cloud(command: CloudCommand) -> Result<()> {
+    match command {
+        CloudCommand::Push {
+            include_markdown,
+            force,
+            url,
+            workspace,
+        } => {
+            let url = url
+                .or_else(|| env::var("AI_WORKSPACE_CLOUD_URL").ok())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Cloud URL is required (--url or AI_WORKSPACE_CLOUD_URL)")
+                })?;
+            let workspace = workspace
+                .or_else(|| env::var("AI_WORKSPACE_CLOUD_WORKSPACE").ok())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cloud workspace is required (--workspace or AI_WORKSPACE_CLOUD_WORKSPACE)"
+                    )
+                })?;
+            let token = required_cloud_env("AI_WORKSPACE_CLOUD_TOKEN")?;
+            let config = crate::cloud::client::CloudClientConfig::new(&url, &workspace, &token)?;
+            let db = Db::open_default()?;
+            let project = require_project(&db)?;
+            if force {
+                warn!("cloud push force enabled project_slug='{}'", project.slug);
+            }
+            let snapshot =
+                crate::cloud::snapshot::build_project_snapshot(&db, &project, include_markdown)?;
+            let bytes = snapshot.serialized_bytes;
+            let response = crate::cloud::client::push_snapshot(&db, &config, &snapshot, force)?;
+            print_success(format!(
+                "Cloud snapshot {} at revision {} ({bytes} bytes)",
+                if response.no_op {
+                    "unchanged"
+                } else {
+                    "pushed"
+                },
+                response.revision
+            ));
+            Ok(())
+        }
+        CloudCommand::Serve { bind } => {
+            let bind = bind
+                .or_else(|| env::var("AI_WORKSPACE_CLOUD_BIND").ok())
+                .unwrap_or_else(|| "127.0.0.1:8080".into());
+            let config = crate::cloud::http::CloudServerConfig::new(
+                &bind,
+                &required_cloud_env("AI_WORKSPACE_CLOUD_PUBLIC_MCP_URI")?,
+                &required_cloud_env("AI_WORKSPACE_CLOUD_DATABASE_URL")?,
+                &required_cloud_env("AI_WORKSPACE_CLOUD_OIDC_ISSUER")?,
+                &required_cloud_env("AI_WORKSPACE_CLOUD_OIDC_AUDIENCE")?,
+                &required_cloud_env("AI_WORKSPACE_CLOUD_OIDC_JWKS_URI")?,
+            )?;
+            info!("starting cloud service bind={}", config.bind);
+            tokio::runtime::Runtime::new()?.block_on(crate::cloud::http::serve(config))
+        }
+    }
+}
+
+fn required_cloud_env(name: &str) -> Result<String> {
+    env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("{name} is required"))
 }

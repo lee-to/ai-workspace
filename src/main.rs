@@ -1,4 +1,5 @@
 mod cli;
+mod cloud;
 mod codegraph;
 mod db;
 mod indexer;
@@ -34,4 +35,36 @@ fn main() -> Result<()> {
     debug!("Parsed command: {:?}", app.command);
 
     cli::run(app.command, app.config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_cloud_push_without_a_token_argument() {
+        let app = App::try_parse_from([
+            "ai-workspace",
+            "cloud",
+            "push",
+            "--include-markdown",
+            "--url",
+            "https://cloud.example",
+            "--workspace",
+            "team",
+        ])
+        .unwrap();
+        assert!(matches!(
+            app.command,
+            cli::Command::Cloud {
+                command: cli::CloudCommand::Push {
+                    include_markdown: true,
+                    ..
+                }
+            }
+        ));
+        assert!(
+            App::try_parse_from(["ai-workspace", "cloud", "push", "--token", "secret"]).is_err()
+        );
+    }
 }

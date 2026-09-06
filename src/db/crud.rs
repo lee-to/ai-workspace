@@ -59,6 +59,16 @@ pub struct Db {
     conn: Connection,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudSyncState {
+    pub endpoint: String,
+    pub workspace_slug: String,
+    pub project_slug: String,
+    pub revision: i64,
+    pub snapshot_hash: String,
+    pub updated_at: String,
+}
+
 pub struct ValidatedProjectPath {
     pub rel_path: String,
     pub canonical_path: PathBuf,
@@ -178,6 +188,74 @@ impl Db {
     pub fn open_default() -> Result<Self> {
         let path = default_db_path()?;
         Self::open(&path)
+    }
+
+    pub fn get_cloud_sync_state(
+        &self,
+        endpoint: &str,
+        workspace_slug: &str,
+        project_slug: &str,
+    ) -> Result<Option<CloudSyncState>> {
+        debug!(
+            "Looking up cloud sync state endpoint_key_len={} workspace_slug='{}' project_slug='{}'",
+            endpoint.len(),
+            workspace_slug,
+            project_slug
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT endpoint, workspace_slug, project_slug, revision, snapshot_hash, updated_at
+             FROM cloud_sync_state
+             WHERE endpoint = ?1 AND workspace_slug = ?2 AND project_slug = ?3",
+        )?;
+        let mut rows = stmt.query_map(params![endpoint, workspace_slug, project_slug], |row| {
+            Ok(CloudSyncState {
+                endpoint: row.get(0)?,
+                workspace_slug: row.get(1)?,
+                project_slug: row.get(2)?,
+                revision: row.get(3)?,
+                snapshot_hash: row.get(4)?,
+                updated_at: row.get(5)?,
+            })
+        })?;
+        match rows.next() {
+            Some(row) => Ok(Some(row?)),
+            None => Ok(None),
+        }
+    }
+
+    pub fn save_cloud_sync_state(
+        &self,
+        endpoint: &str,
+        workspace_slug: &str,
+        project_slug: &str,
+        revision: i64,
+        snapshot_hash: &str,
+    ) -> Result<()> {
+        debug!(
+            "Saving cloud sync state endpoint_key_len={} workspace_slug='{}' project_slug='{}' revision={} hash_prefix='{}'",
+            endpoint.len(),
+            workspace_slug,
+            project_slug,
+            revision,
+            &snapshot_hash[..snapshot_hash.len().min(12)]
+        );
+        self.conn.execute(
+            "INSERT INTO cloud_sync_state (
+                endpoint, workspace_slug, project_slug, revision, snapshot_hash
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(endpoint, workspace_slug, project_slug) DO UPDATE SET
+                revision = excluded.revision,
+                snapshot_hash = excluded.snapshot_hash,
+                updated_at = datetime('now')",
+            params![
+                endpoint,
+                workspace_slug,
+                project_slug,
+                revision,
+                snapshot_hash
+            ],
+        )?;
+        Ok(())
     }
 
     // --- Projects ---
@@ -1903,6 +1981,20 @@ impl Db {
         let mut stmt = self.conn.prepare(
             "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
              FROM shared_items WHERE project_id = ?1 ORDER BY created_at",
+        )?;
+        self.map_shared_items(&mut stmt, params![project_id])
+    }
+
+    pub fn get_shared_items_owned_by_project(&self, project_id: i64) -> Result<Vec<SharedItem>> {
+        debug!(
+            "Getting project-owned shared items for project {}",
+            project_id
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT id, kind, path, content, label, project_id, group_id, created_by_project_id, created_at, updated_at
+             FROM shared_items
+             WHERE project_id = ?1 OR created_by_project_id = ?1
+             ORDER BY created_at, id",
         )?;
         self.map_shared_items(&mut stmt, params![project_id])
     }

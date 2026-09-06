@@ -35,6 +35,7 @@ ai-workspace --help
 | **Shared item** | A file, directory, or note made available to group members |
 | **Scope** | Visibility level of a note: `project` (private) or `group` (shared) |
 | **Label** | An optional human-readable tag on a shared item |
+| **Cloud snapshot** | An explicit, versioned copy pushed to the optional hosted service |
 
 ## Scopes & Visibility
 
@@ -179,12 +180,27 @@ RUST_LOG=debug ai-workspace status
 RUST_LOG=info ai-workspace serve
 ```
 
+## Optional Cloud Sync
+
+Local commands and `ai-workspace serve` stay offline. To share curated context through the hosted read-only MCP service, configure a cloud endpoint and push the current project explicitly:
+
+```bash
+export AI_WORKSPACE_CLOUD_URL=https://workspace.example.com
+export AI_WORKSPACE_CLOUD_WORKSPACE=platform
+export AI_WORKSPACE_CLOUD_TOKEN="$(security find-generic-password -w -s ai-workspace-cloud)"
+ai-workspace cloud push
+```
+
+Markdown content is excluded unless you add `--include-markdown`. See [Cloud](cloud.md) for consent rules, deployment, authentication, and limits.
+
 ## Next Steps
 
 - [CLI Reference](cli.md) — All commands and options
 - [MCP Server](mcp-server.md) — Integrate with AI coding tools
+- [Cloud](cloud.md) — Optional synchronization and hosted MCP
 
 ## See Also
 
 - [CLI Reference](cli.md) — Complete command documentation
 - [MCP Server](mcp-server.md) — MCP tools and integration guide
+- [Cloud](cloud.md) — Optional synchronization and hosted MCP

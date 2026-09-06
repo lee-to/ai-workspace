@@ -1,4 +1,4 @@
-[← CLI Reference](cli.md) · [Back to README](../README.md) · [Contributing →](contributing.md)
+[← CLI Reference](cli.md) · [Back to README](../README.md) · [Cloud →](cloud.md)
 
 # MCP Server
 
@@ -7,6 +7,8 @@ The MCP server exposes shared workspace context to AI agents via JSON-RPC over s
 ```bash
 ai-workspace serve
 ```
+
+This is the full local tool surface backed by SQLite and local files. The optional hosted service uses authenticated HTTP, PostgreSQL snapshots, and a separate positive allowlist of seven read-only tools; see [Cloud](cloud.md).
 
 ## Configuration
 
@@ -435,3 +437,4 @@ Tool-level errors return a successful JSON-RPC response with `isError: true` in 
 
 - [CLI Reference](cli.md) — CLI commands for managing projects and shared items
 - [Getting Started](getting-started.md) — Installation and setup
+- [Cloud](cloud.md) — Hosted read-only MCP and snapshot synchronization

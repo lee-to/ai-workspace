@@ -8,6 +8,8 @@ AI Workspace fixes that. It's a lightweight CLI + [MCP server](https://modelcont
 
 It also includes a local Rust-only CodeGraph MVP: registered projects can index shared Rust source scopes into SQLite as files, symbols, and call relationships, then expose that structure to agents through CLI and MCP tools.
 
+For teams that need the same curated context away from a developer machine, optional [cloud synchronization](docs/cloud.md) pushes explicit project snapshots to PostgreSQL and exposes a separate seven-tool, read-only hosted MCP endpoint.
+
 ## How it works
 
 ```
@@ -214,6 +216,8 @@ The agent will automatically call the right MCP tools (`workspace_context`, `wor
 | `reindex` | Rebuild the full-text index for all shared `.md` files |
 | `codegraph reindex/sync/status/search` | Build and inspect a local Rust-only code graph |
 | `serve [--scope ...] [--group ...] [--project ...]` | Start the MCP server, optionally scoped to a project or group |
+| `cloud push [--include-markdown] [--force]` | Push the current project's explicit cloud snapshot |
+| `cloud serve [--bind <address>]` | Start the hosted snapshot and read-only MCP service |
 | `update` | Update to the latest version |
 
 ## Team Sharing
@@ -292,6 +296,7 @@ AI_WORKSPACE_CONFIG=.ai/ai-workspace.json ai-workspace init
 | [Getting Started](docs/getting-started.md) | Concepts, scopes, visibility rules, data storage |
 | [CLI Reference](docs/cli.md) | All commands and options in detail |
 | [MCP Server](docs/mcp-server.md) | MCP tools, protocol, and integration guide |
+| [Cloud](docs/cloud.md) | Snapshot sync, OAuth/OIDC, PostgreSQL, hosted MCP |
 | [Contributing](docs/contributing.md) | Development setup, testing, pull requests |
 
 ## Installation

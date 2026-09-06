@@ -1,4 +1,4 @@
-[← MCP Server](mcp-server.md) · [Back to README](../README.md)
+[← Cloud](cloud.md) · [Back to README](../README.md)
 
 # Contributing
 
@@ -74,3 +74,4 @@ By contributing, you agree that your contributions will be licensed under the MI
 
 - [Getting Started](getting-started.md) — Installation and setup
 - [CLI Reference](cli.md) — Commands available for local development
+- [Cloud](cloud.md) — PostgreSQL integration-test setup and hosted boundaries

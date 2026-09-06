@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::models::normalize_project_slug;
 
-const CURRENT_SCHEMA_VERSION: i64 = 6;
+const CURRENT_SCHEMA_VERSION: i64 = 7;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -97,6 +97,10 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
         6 => {
             debug!("Migration v6: add Rust code graph tables");
             ensure_codegraph_schema_objects(conn)
+        }
+        7 => {
+            debug!("Migration v7: add cloud sync revision state");
+            ensure_cloud_sync_state_schema(conn)
         }
         _ => {
             error!("No migration registered for schema version {}", version);
@@ -559,6 +563,24 @@ fn ensure_codegraph_schema_objects(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_cloud_sync_state_schema(conn: &Connection) -> Result<()> {
+    execute_schema_step(
+        conn,
+        "cloud sync revision state",
+        "
+        CREATE TABLE IF NOT EXISTS cloud_sync_state (
+            endpoint TEXT NOT NULL,
+            workspace_slug TEXT NOT NULL,
+            project_slug TEXT NOT NULL,
+            revision INTEGER NOT NULL CHECK (revision > 0),
+            snapshot_hash TEXT NOT NULL,
+            updated_at DATETIME NOT NULL DEFAULT (datetime('now')),
+            PRIMARY KEY (endpoint, workspace_slug, project_slug)
+        );
+        ",
+    )
+}
+
 fn migrate_to_event_groups(conn: &Connection) -> Result<()> {
     execute_schema_step(
         conn,
@@ -616,6 +638,7 @@ mod tests {
         assert!(tables.contains(&"code_nodes".to_string()));
         assert!(tables.contains(&"code_edges".to_string()));
         assert!(tables.contains(&"code_unresolved_refs".to_string()));
+        assert!(tables.contains(&"cloud_sync_state".to_string()));
     }
 
     #[test]
@@ -710,7 +733,7 @@ mod tests {
             INSERT INTO projects (id, name, slug, path)
             VALUES (1, 'Legacy API', NULL, '/tmp/legacy-api');
 
-            PRAGMA user_version = 6;
+            PRAGMA user_version = 7;
             ",
         )
         .unwrap();
@@ -738,8 +761,8 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 6);
+        assert_eq!(version, 7);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
     }
 
     #[test]
@@ -811,7 +834,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
 
         let group_ids = conn
             .prepare("SELECT group_id FROM event_groups WHERE event_id = 42 ORDER BY group_id")
