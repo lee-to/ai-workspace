@@ -1,6 +1,6 @@
 [package]
 name = "ai-workspace"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2024"
 rust-version = "1.88"
 authors = ["Danil Shutsky <thecutcode@gmail.com>"]

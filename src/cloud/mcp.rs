@@ -9,11 +9,12 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use log::{error, warn};
+use log::{debug, error, warn};
 use serde_json::{Value, json};
 use std::time::{Duration, Instant};
 
 pub const PROTOCOL_VERSION: &str = "2026-07-28";
+const STREAMABLE_VERSIONS: &[&str] = &["2025-11-25", "2025-06-18"];
 pub const MAX_MCP_REQUEST_BYTES: usize = 64 * 1024;
 const MAX_MCP_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_SEARCH_QUERY_BYTES: usize = 1024;
@@ -31,18 +32,28 @@ pub async fn handle(
             McpError::invalid_params("Invalid Origin"),
         );
     }
-    if let Err(error) = validate_envelope(&headers, &request) {
-        warn!("[FIX:cloud-protocol] hosted MCP envelope rejected: {error}");
-        let rpc_error = match error {
-            EnvelopeError::InvalidRequest(message) => McpError::invalid_request(&message),
-            EnvelopeError::InvalidParams(message) => McpError::invalid_params(&message),
-            EnvelopeError::HeaderMismatch(message) => McpError::header_mismatch(&message),
-            EnvelopeError::UnsupportedVersion(requested) => {
-                McpError::unsupported_protocol_version(&requested, &[PROTOCOL_VERSION])
-            }
-        };
-        return rpc_http_error(StatusCode::BAD_REQUEST, request.id, rpc_error);
-    }
+    let dialect = match validate_envelope(&headers, &request) {
+        Ok(dialect) => dialect,
+        Err(error) => {
+            warn!("[FIX:cloud-protocol] hosted MCP envelope rejected: {error}");
+            let rpc_error = match error {
+                EnvelopeError::InvalidRequest(message) => McpError::invalid_request(&message),
+                EnvelopeError::InvalidParams(message) => McpError::invalid_params(&message),
+                EnvelopeError::HeaderMismatch(message) => McpError::header_mismatch(&message),
+                EnvelopeError::UnsupportedVersion(requested) => {
+                    McpError::unsupported_protocol_version(
+                        &requested,
+                        &[
+                            PROTOCOL_VERSION,
+                            STREAMABLE_VERSIONS[0],
+                            STREAMABLE_VERSIONS[1],
+                        ],
+                    )
+                }
+            };
+            return rpc_http_error(StatusCode::BAD_REQUEST, request.id, rpc_error);
+        }
+    };
     let claims = match state.auth.authenticate(&headers).await {
         Ok(claims) => claims,
         Err(error) => {
@@ -64,9 +75,18 @@ pub async fn handle(
         audit_request(&claims, started, response.status(), audit);
         return response;
     }
+    if matches!(dialect, ProtocolDialect::Streamable(_)) && request.id.is_null() {
+        debug!("[FIX:cloud-streamable] authenticated notification accepted");
+        let response = StatusCode::ACCEPTED.into_response();
+        audit_request(&claims, started, response.status(), audit);
+        return response;
+    }
     let id = request.id.clone();
-    let dispatched =
-        tokio::time::timeout(Duration::from_secs(20), dispatch(&state, &claims, &request)).await;
+    let dispatched = tokio::time::timeout(
+        Duration::from_secs(20),
+        dispatch(&state, &claims, &request, dialect),
+    )
+    .await;
     let response = match dispatched {
         Err(_) => rpc_http_error(
             StatusCode::REQUEST_TIMEOUT,
@@ -74,7 +94,7 @@ pub async fn handle(
             McpError::internal_error("Hosted MCP operation timed out"),
         ),
         Ok(result) => match result {
-            Ok(result) => result_response(id, result),
+            Ok(result) => result_response(id, result, dialect),
             Err(error) => {
                 let message = error.to_string();
                 if error.is::<super::store::ContextLimitExceeded>() {
@@ -130,7 +150,12 @@ pub async fn handle(
 
 fn audit_details(request: &JsonRpcRequest) -> Value {
     let method = match request.method.as_str() {
-        "server/discover" | "tools/list" | "tools/call" => request.method.as_str(),
+        "server/discover"
+        | "initialize"
+        | "notifications/initialized"
+        | "ping"
+        | "tools/list"
+        | "tools/call" => request.method.as_str(),
         _ => "unknown",
     };
     let name = request
@@ -165,8 +190,17 @@ fn audit_details(request: &JsonRpcRequest) -> Value {
     })
 }
 
-fn result_response(id: Value, result: Value) -> Response {
-    let response = JsonRpcResponse::result(id.clone(), stamp(result));
+fn result_response(id: Value, mut result: Value, dialect: ProtocolDialect) -> Response {
+    if matches!(dialect, ProtocolDialect::Modern) {
+        result = stamp(result);
+    } else if result
+        .get("structuredContent")
+        .is_some_and(|value| !value.is_object())
+    {
+        // Standard clients require structuredContent to be an object; text retains arrays.
+        result.as_object_mut().unwrap().remove("structuredContent");
+    }
+    let response = JsonRpcResponse::result(id.clone(), result);
     let body = serde_json::to_vec(&response).expect("JSON value serializes");
     if body.len() > MAX_MCP_RESPONSE_BYTES {
         warn!("[FIX:cloud-limits] hosted MCP response exceeds byte limit");
@@ -193,6 +227,12 @@ enum EnvelopeError {
     UnsupportedVersion(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProtocolDialect {
+    Modern,
+    Streamable(&'static str),
+}
+
 impl std::fmt::Display for EnvelopeError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -209,9 +249,31 @@ impl std::fmt::Display for EnvelopeError {
 fn validate_envelope(
     headers: &HeaderMap,
     request: &JsonRpcRequest,
-) -> std::result::Result<(), EnvelopeError> {
+) -> std::result::Result<ProtocolDialect, EnvelopeError> {
     if request.jsonrpc.as_deref() != Some("2.0") {
         return Err(EnvelopeError::InvalidRequest("jsonrpc must be 2.0".into()));
+    }
+    let modern = headers
+        .get("MCP-Protocol-Version")
+        .is_some_and(|v| v == PROTOCOL_VERSION)
+        || headers.contains_key("Mcp-Method")
+        || headers.contains_key("Mcp-Name")
+        || request
+            .params
+            .get("_meta")
+            .and_then(Value::as_object)
+            .is_some_and(|meta| {
+                meta.keys().any(|key| {
+                    matches!(
+                        key.as_str(),
+                        "io.modelcontextprotocol/protocolVersion"
+                            | "io.modelcontextprotocol/clientCapabilities"
+                            | "io.modelcontextprotocol/clientInfo"
+                    )
+                })
+            });
+    if !modern {
+        return validate_streamable(headers, request);
     }
     let header_version = required_header(headers, "MCP-Protocol-Version")?;
     if required_header(headers, "Mcp-Method")? != request.method {
@@ -270,15 +332,99 @@ fn validate_envelope(
             ));
         }
     }
-    Ok(())
+    Ok(ProtocolDialect::Modern)
+}
+
+fn validate_streamable(
+    headers: &HeaderMap,
+    request: &JsonRpcRequest,
+) -> std::result::Result<ProtocolDialect, EnvelopeError> {
+    let header_version = if headers.contains_key("MCP-Protocol-Version") {
+        let version = required_header(headers, "MCP-Protocol-Version")?;
+        Some(
+            *STREAMABLE_VERSIONS
+                .iter()
+                .find(|supported| **supported == version)
+                .ok_or_else(|| EnvelopeError::UnsupportedVersion(version.into()))?,
+        )
+    } else {
+        None
+    };
+    if !request.params.is_null() && !request.params.is_object() {
+        return Err(EnvelopeError::InvalidParams(
+            "params must be an object".into(),
+        ));
+    }
+    let notification = request.method.starts_with("notifications/");
+    if notification != request.id.is_null()
+        || (!request.id.is_null()
+            && !request.id.is_string()
+            && !request.id.is_i64()
+            && !request.id.is_u64())
+    {
+        return Err(EnvelopeError::InvalidRequest(
+            "Requests require a string or integer id; notifications must omit id".into(),
+        ));
+    }
+    if request.method == "initialize" {
+        let requested = request
+            .params
+            .get("protocolVersion")
+            .and_then(Value::as_str)
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| {
+                EnvelopeError::InvalidParams("initialize requires protocolVersion".into())
+            })?;
+        if header_version.is_some_and(|version| version != requested) {
+            return Err(EnvelopeError::HeaderMismatch(
+                "Header and initialization protocol versions do not match".into(),
+            ));
+        }
+        let client = &request.params["clientInfo"];
+        if !request
+            .params
+            .get("capabilities")
+            .is_some_and(Value::is_object)
+            || client.get("name").and_then(Value::as_str).is_none()
+            || client.get("version").and_then(Value::as_str).is_none()
+        {
+            return Err(EnvelopeError::InvalidParams(
+                "initialize requires capabilities and clientInfo name/version".into(),
+            ));
+        }
+        let version = STREAMABLE_VERSIONS
+            .iter()
+            .find(|version| **version == requested)
+            .copied()
+            .unwrap_or(STREAMABLE_VERSIONS[0]);
+        return Ok(ProtocolDialect::Streamable(version));
+    }
+    // Older single-message clients can omit the version header. No batches or sessions.
+    Ok(ProtocolDialect::Streamable(
+        header_version.unwrap_or("2025-03-26"),
+    ))
 }
 
 async fn dispatch(
     state: &CloudHttpState,
     claims: &AccessClaims,
     request: &JsonRpcRequest,
+    dialect: ProtocolDialect,
 ) -> Result<Value> {
     match request.method.as_str() {
+        "initialize" if matches!(dialect, ProtocolDialect::Streamable(_)) => {
+            let ProtocolDialect::Streamable(version) = dialect else {
+                unreachable!()
+            };
+            debug!("[FIX:cloud-streamable] initialized protocol_version={version}");
+            Ok(json!({
+                "protocolVersion": version,
+                "capabilities": {"tools": {}},
+                "serverInfo": server_info(),
+                "instructions": "Read synchronized workspace context. Hosted tools never access local files or execute commands."
+            }))
+        }
+        "ping" if matches!(dialect, ProtocolDialect::Streamable(_)) => Ok(json!({})),
         "server/discover" => Ok(discovery()),
         "tools/list" => Ok(tool_catalog()),
         "tools/call" => call_tool(state, claims, &request.params).await,
@@ -487,6 +633,7 @@ mod tests {
         let exact = result_response(
             json!(1),
             json!({"text": "x".repeat(MAX_MCP_RESPONSE_BYTES - base)}),
+            ProtocolDialect::Modern,
         );
         assert_eq!(exact.status(), StatusCode::OK);
         let body = axum::body::to_bytes(exact.into_body(), MAX_MCP_RESPONSE_BYTES)
@@ -497,7 +644,8 @@ mod tests {
             "x".repeat(MAX_MCP_RESPONSE_BYTES - base + 1),
             "\"".repeat(MAX_MCP_RESPONSE_BYTES / 2),
         ] {
-            let response = result_response(json!(1), json!({"text": text}));
+            let response =
+                result_response(json!(1), json!({"text": text}), ProtocolDialect::Modern);
             assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
             let body = axum::body::to_bytes(response.into_body(), 1024)
                 .await
@@ -549,6 +697,127 @@ mod tests {
         assert!(validate_envelope(&headers, &request).is_ok());
         headers.insert("Mcp-Name", "project_file_write".parse().unwrap());
         assert!(validate_envelope(&headers, &request).is_err());
+    }
+
+    #[test]
+    fn streamable_lifecycle_accepts_standard_clients_without_modern_metadata() {
+        for version in STREAMABLE_VERSIONS {
+            let initialize = request(
+                "initialize",
+                json!({
+                    "protocolVersion": version, "capabilities": {},
+                    "clientInfo": {"name": "codex", "version": "0.153.2"}
+                }),
+            );
+            assert_eq!(
+                validate_envelope(&HeaderMap::new(), &initialize).unwrap(),
+                ProtocolDialect::Streamable(version)
+            );
+            let mut headers = HeaderMap::new();
+            headers.insert("MCP-Protocol-Version", version.parse().unwrap());
+            for method in ["tools/list", "ping"] {
+                assert!(validate_envelope(&headers, &request(method, Value::Null)).is_ok());
+            }
+            let initialized: JsonRpcRequest = serde_json::from_value(json!({
+                "jsonrpc": "2.0", "method": "notifications/initialized"
+            }))
+            .unwrap();
+            assert!(validate_envelope(&headers, &initialized).is_ok());
+            assert!(
+                validate_envelope(&headers, &request("notifications/initialized", Value::Null))
+                    .is_err()
+            );
+        }
+        let initialize = request(
+            "initialize",
+            json!({
+                "protocolVersion": "2099-01-01", "capabilities": {},
+                "clientInfo": {"name": "codex", "version": "0.153.2"}
+            }),
+        );
+        assert_eq!(
+            validate_envelope(&HeaderMap::new(), &initialize).unwrap(),
+            ProtocolDialect::Streamable("2025-11-25")
+        );
+        assert!(validate_envelope(&HeaderMap::new(), &request("tools/list", Value::Null)).is_ok());
+    }
+
+    #[test]
+    fn streamable_validation_rejects_malformed_messages_and_modern_downgrades() {
+        let valid = json!({
+            "protocolVersion": "2025-11-25", "capabilities": {},
+            "clientInfo": {"name": "codex", "version": "0.153.2"}
+        });
+        for key in ["protocolVersion", "capabilities", "clientInfo"] {
+            let mut params = valid.clone();
+            params.as_object_mut().unwrap().remove(key);
+            assert!(validate_envelope(&HeaderMap::new(), &request("initialize", params)).is_err());
+        }
+        for id in [Value::Null, json!(true), json!([]), json!(1.5)] {
+            let mut call = request("tools/call", json!({"name": "workspace_context"}));
+            call.id = id;
+            assert!(validate_envelope(&HeaderMap::new(), &call).is_err());
+        }
+        let mut call = request("tools/list", Value::Null);
+        call.jsonrpc = None;
+        assert!(validate_envelope(&HeaderMap::new(), &call).is_err());
+        let call = request("tools/list", json!({}));
+        for (header, value) in [
+            ("MCP-Protocol-Version", "2099-01-01"),
+            ("MCP-Protocol-Version", PROTOCOL_VERSION),
+            ("Mcp-Method", "tools/list"),
+            ("Mcp-Name", "workspace_context"),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert!(validate_envelope(&headers, &call).is_err());
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert("MCP-Protocol-Version", "2025-06-18".parse().unwrap());
+        assert!(validate_envelope(&headers, &request("initialize", valid)).is_err());
+        for key in [
+            "io.modelcontextprotocol/protocolVersion",
+            "io.modelcontextprotocol/clientCapabilities",
+        ] {
+            assert!(
+                validate_envelope(
+                    &headers,
+                    &request("tools/list", json!({"_meta": {key: PROTOCOL_VERSION}}))
+                )
+                .is_err()
+            );
+        }
+        assert!(validate_envelope(&headers, &request("tools/list", json!([]))).is_err());
+    }
+
+    #[tokio::test]
+    async fn streamable_results_keep_array_text_without_invalid_structured_content() {
+        for value in [json!([{"key":"document"}]), json!({"key":"document"})] {
+            let response = result_response(
+                json!(42),
+                call_result(value.clone()),
+                ProtocolDialect::Streamable("2025-11-25"),
+            );
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["id"], 42);
+            assert_eq!(
+                serde_json::from_str::<Value>(
+                    body["result"]["content"][0]["text"].as_str().unwrap()
+                )
+                .unwrap(),
+                value
+            );
+            assert_eq!(
+                body["result"].get("structuredContent").is_some(),
+                value.is_object()
+            );
+            assert!(body["result"].get("_meta").is_none());
+            assert!(body["result"].get("resultType").is_none());
+        }
     }
 
     #[test]

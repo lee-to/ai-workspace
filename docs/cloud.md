@@ -133,7 +133,9 @@ The store revalidates each snapshot's schema, contents and canonical serialized 
 
 ## Hosted MCP
 
-Send JSON-RPC requests to `POST /mcp` with:
+Codex and other standard Streamable HTTP clients connect to `POST /mcp` with a Bearer token. The server supports `2025-11-25` and `2025-06-18`: `initialize` negotiates the version, `notifications/initialized` returns an empty `202`, and `tools/list`, `tools/call`, and `ping` use ordinary JSON-RPC. Initialization does not require protocol headers; subsequent requests include `MCP-Protocol-Version`. No session ID or SSE connection is needed (`GET /mcp` returns `405`). Older single-message requests without a version header are accepted; JSON-RPC batches are not supported.
+
+The separate `2026-07-28` request format remains available. Send requests with:
 
 - `Authorization: Bearer ...`
 - `Content-Type: application/json`
@@ -142,7 +144,7 @@ Send JSON-RPC requests to `POST /mcp` with:
 - `Mcp-Name` matching the tool name for `tools/call`
 - `params._meta["io.modelcontextprotocol/protocolVersion"]` set to `2026-07-28`
 
-Supported methods are `server/discover`, `tools/list`, and `tools/call`. The hosted catalog is intentionally limited:
+This format supports `server/discover`, `tools/list`, and `tools/call`, and requires client capabilities in `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Its matching headers and metadata remain mandatory; malformed modern requests cannot fall back to the standard format. Both formats use the same authentication, tenant isolation, and hosted catalog:
 
 | Tool | Purpose |
 |------|---------|

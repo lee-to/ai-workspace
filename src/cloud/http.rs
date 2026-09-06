@@ -767,6 +767,99 @@ mod tests {
             "ai-workspace:push ai-workspace:read",
         );
 
+        // Real Codex uses the standard initialize handshake, without modern headers/_meta.
+        let initialize = json!({
+            "jsonrpc": "2.0", "id": 42, "method": "initialize",
+            "params": {"protocolVersion": "2025-11-25", "capabilities": {},
+                "clientInfo": {"name": "codex", "version": "0.153.2"}}
+        });
+        let initialized = json!({"jsonrpc":"2.0", "method":"notifications/initialized"});
+        let push_only_token = test_token(workspace_id, &workspace_slug, "ai-workspace:push");
+        for body in [&initialize, &initialized] {
+            let unauthorized = client
+                .post(format!("{base_url}/mcp"))
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+            let forbidden = client
+                .post(format!("{base_url}/mcp"))
+                .bearer_auth(&push_only_token)
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+            let bad_origin = client
+                .post(format!("{base_url}/mcp"))
+                .bearer_auth(&token)
+                .header("Origin", "https://attacker.example")
+                .json(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(bad_origin.status(), StatusCode::FORBIDDEN);
+        }
+        for version in ["2025-11-25", "2025-06-18"] {
+            let mut initialize = initialize.clone();
+            initialize["params"]["protocolVersion"] = json!(version);
+            let response = client
+                .post(format!("{base_url}/mcp"))
+                .bearer_auth(&token)
+                .header("Accept", "application/json, text/event-stream")
+                .json(&initialize)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(response.headers().get("MCP-Session-Id").is_none());
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(body["id"], 42);
+            assert_eq!(body["result"]["protocolVersion"], version);
+            assert_eq!(body["result"]["capabilities"], json!({"tools":{}}));
+            assert_eq!(body["result"]["serverInfo"]["name"], "ai-workspace-cloud");
+            assert!(body["result"].get("_meta").is_none());
+            let response = client
+                .post(format!("{base_url}/mcp"))
+                .bearer_auth(&token)
+                .header("MCP-Protocol-Version", version)
+                .json(&initialized)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert!(response.bytes().await.unwrap().is_empty());
+            for method in ["tools/list", "ping"] {
+                let response = client
+                    .post(format!("{base_url}/mcp"))
+                    .bearer_auth(&token)
+                    .header("MCP-Protocol-Version", version)
+                    .json(&json!({"jsonrpc":"2.0", "id":43, "method":method}))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value = response.json().await.unwrap();
+                assert_eq!(body["id"], 43);
+                if method == "tools/list" {
+                    assert_eq!(body["result"]["tools"].as_array().unwrap().len(), 7);
+                } else {
+                    assert_eq!(body["result"], json!({}));
+                }
+            }
+        }
+        assert_eq!(
+            client
+                .get(format!("{base_url}/mcp"))
+                .bearer_auth(&token)
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::METHOD_NOT_ALLOWED
+        );
+
         let invalid_origin = client
             .post(format!("{base_url}/mcp"))
             .bearer_auth(&token)
@@ -1102,7 +1195,11 @@ mod tests {
         assert_eq!(unsupported["error"]["code"], -32022);
         assert_eq!(
             unsupported["error"]["data"]["supported"],
-            json!([super::super::mcp::PROTOCOL_VERSION])
+            json!([
+                super::super::mcp::PROTOCOL_VERSION,
+                "2025-11-25",
+                "2025-06-18"
+            ])
         );
 
         let unknown_method = hosted_request(
@@ -1167,6 +1264,35 @@ mod tests {
             &other_workspace_slug,
             "ai-workspace:read",
         );
+        for version in ["2025-11-25", "2025-06-18"] {
+            for (call_token, contains_document) in [(&token, true), (&other_token, false)] {
+                let response = client.post(format!("{base_url}/mcp"))
+                    .bearer_auth(call_token).header("MCP-Protocol-Version", version)
+                    .json(&json!({"jsonrpc":"2.0", "id":44, "method":"tools/call",
+                        "params":{"name":"workspace_search_fulltext", "arguments":{"query":"cloudcontractmarker"}}}))
+                    .send().await.unwrap();
+                assert_eq!(response.status(), StatusCode::OK);
+                let body: Value = response.json().await.unwrap();
+                let text = body["result"]["content"][0]["text"].as_str().unwrap();
+                assert_eq!(text.contains("cloudcontractmarker"), contains_document);
+                assert!(body["result"].get("structuredContent").is_none());
+                assert!(body["result"].get("resultType").is_none());
+            }
+            let forbidden_tool = client
+                .post(format!("{base_url}/mcp"))
+                .bearer_auth(&token)
+                .header("MCP-Protocol-Version", version)
+                .json(&json!({"jsonrpc":"2.0", "id":45, "method":"tools/call",
+                    "params":{"name":"project_file_write", "arguments":{}}}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(forbidden_tool.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(
+                forbidden_tool.json::<Value>().await.unwrap()["error"]["code"],
+                -32602
+            );
+        }
         let cross_tenant = hosted_request(
             &client,
             &base_url,
