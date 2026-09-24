@@ -10,6 +10,68 @@ ai-workspace serve
 
 This is the full local tool surface backed by SQLite and local files. The optional hosted service uses authenticated HTTP, PostgreSQL snapshots, and a separate positive allowlist of seven read-only tools; see [Cloud](cloud.md).
 
+## Event resource subscriptions
+
+The local stdio server advertises `resources.subscribe: true` alongside tools.
+`resources/list` returns JSON resources within the configured MCP scope:
+
+| URI | Contents |
+|-----|----------|
+| `workspace://events` | Visible event history, including closed events |
+| `workspace://projects/<slug>/events` | Open events affecting that project (the same inbox as `workspace_events` with `project`) |
+
+Use the exact URI from `resources/list`. A client subscribes once, then reads the
+resource initially and whenever the server sends an update:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"resources/subscribe","params":{"uri":"workspace://projects/billing-api/events"}}
+```
+
+The server responds with an empty result. After an event changes the inbox, it
+sends this notification without requiring another client request:
+
+```json
+{"jsonrpc":"2.0","method":"notifications/resources/updated","params":{"uri":"workspace://projects/billing-api/events"}}
+```
+
+Retrieve the current JSON array with `resources/read` using the same `uri`.
+`resources/unsubscribe` stops notifications for that URI. Subscriptions are per
+connection (maximum 128); reconnecting requires subscribing and reading again.
+`resources/templates/list` returns an empty list. Resource-list change
+notifications are not advertised; use `resources/list` again to discover newly
+registered projects.
+
+The server checks SQLite commits from other connections once per second while
+subscriptions exist, so events created, closed, or removed by a separate CLI
+process are detected. It compares the scoped resource contents and sends no
+notification for unrelated changes. Updates can be coalesced: this is a resource
+invalidation signal, not a delivery receipt for each individual event. If a
+subscribed project is destroyed, its resource is invalidated once and the
+subscription is removed; reading that URI then fails.
+
+The MCP client must implement subscriptions and decide whether an update should
+refresh context or start an agent turn. Server support alone does not make an
+agent run automatically. Clients that only support tools can continue calling
+`workspace_events`. See [Cloud event subscriptions](cloud.md#event-subscriptions)
+for the separate hosted protocol.
+
+### Client compatibility
+
+MCP tool support does not imply resource-subscription support. In particular,
+do not assume that registering this server automatically wakes Codex or Claude:
+
+- Codex tracks resource subscription support separately in
+  [openai/codex#16159](https://github.com/openai/codex/issues/16159).
+  Until the client supports subscribing and forwarding updates, use
+  `workspace_events` or a client-side integration that schedules agent turns.
+- Claude Code documents push delivery into a running session through its
+  [Channels extension](https://code.claude.com/docs/en/channels), which is a
+  separate, explicitly enabled client-specific mechanism. This server exposes
+  standard resource notifications, not `notifications/claude/channel`.
+
+The automated tests verify MCP wire behavior with a subscribing client; they do
+not claim automatic event delivery into either product's conversation UI.
+
 ## Configuration
 
 ### MCP server scope

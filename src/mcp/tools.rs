@@ -162,7 +162,7 @@ impl McpScope {
         Self::Global
     }
 
-    fn allows_project(&self, project_id: i64) -> bool {
+    pub(super) fn allows_project(&self, project_id: i64) -> bool {
         match self {
             Self::Global => true,
             Self::Group { project_ids, .. } => project_ids.contains(&project_id),
@@ -2613,7 +2613,7 @@ fn workspace_events_scoped(
     tool_result(id, text)
 }
 
-fn workspace_event_visible(
+pub(super) fn workspace_event_visible(
     db: &Db,
     scope: &McpScope,
     event: &crate::models::WorkspaceEvent,
@@ -3237,7 +3237,7 @@ fn codegraph_context(
     tool_result(id, text)
 }
 
-fn event_json(db: &Db, event: &crate::models::WorkspaceEvent) -> serde_json::Value {
+pub(super) fn event_json(db: &Db, event: &crate::models::WorkspaceEvent) -> serde_json::Value {
     let group_ids = match db.list_event_group_ids(event.id) {
         Ok(group_ids) => group_ids,
         Err(e) => {

@@ -5,3 +5,4 @@ pub(crate) mod mcp;
 pub(crate) mod models;
 pub(crate) mod snapshot;
 pub(crate) mod store;
+pub(crate) mod subscriptions;

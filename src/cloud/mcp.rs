@@ -82,10 +82,16 @@ pub async fn handle(
         return response;
     }
     let id = request.id.clone();
-    let dispatched = tokio::time::timeout(
-        Duration::from_secs(20),
-        dispatch(&state, &claims, &request, dialect),
-    )
+    let dispatched = tokio::time::timeout(Duration::from_secs(20), async {
+        if request.method == "subscriptions/listen" && matches!(dialect, ProtocolDialect::Modern) {
+            super::subscriptions::listen(&state.store, &claims, &request, &state.public_mcp_uri)
+                .await
+        } else {
+            dispatch(&state, &claims, &request, dialect)
+                .await
+                .map(|result| result_response(request.id.clone(), result, dialect))
+        }
+    })
     .await;
     let response = match dispatched {
         Err(_) => rpc_http_error(
@@ -94,7 +100,7 @@ pub async fn handle(
             McpError::internal_error("Hosted MCP operation timed out"),
         ),
         Ok(result) => match result {
-            Ok(result) => result_response(id, result, dialect),
+            Ok(response) => response,
             Err(error) => {
                 let message = error.to_string();
                 if error.is::<super::store::ContextLimitExceeded>() {
@@ -127,6 +133,8 @@ pub async fn handle(
                     )
                 } else if message.starts_with("Tool argument")
                     || message.starts_with("Tool name is required")
+                    || message.starts_with("Resource argument")
+                    || message.starts_with("Subscription ")
                 {
                     rpc_http_error(
                         StatusCode::BAD_REQUEST,
@@ -154,6 +162,10 @@ fn audit_details(request: &JsonRpcRequest) -> Value {
         | "initialize"
         | "notifications/initialized"
         | "ping"
+        | "resources/list"
+        | "resources/templates/list"
+        | "resources/read"
+        | "subscriptions/listen"
         | "tools/list"
         | "tools/call" => request.method.as_str(),
         _ => "unknown",
@@ -419,7 +431,7 @@ async fn dispatch(
             debug!("[FIX:cloud-streamable] initialized protocol_version={version}");
             Ok(json!({
                 "protocolVersion": version,
-                "capabilities": {"tools": {}},
+                "capabilities": {"tools": {}, "resources": {}},
                 "serverInfo": server_info(),
                 "instructions": "Read synchronized workspace context. Hosted tools never access local files or execute commands."
             }))
@@ -428,6 +440,25 @@ async fn dispatch(
         "server/discover" => Ok(discovery()),
         "tools/list" => Ok(tool_catalog()),
         "tools/call" => call_tool(state, claims, &request.params).await,
+        "resources/list" => {
+            if request.params.get("cursor").is_some() {
+                bail!("Resource argument cursor is not supported");
+            }
+            Ok(super::subscriptions::resource_catalog())
+        }
+        "resources/templates/list" => {
+            Ok(json!({"resourceTemplates": [], "ttlMs": 300_000, "cacheScope": "private"}))
+        }
+        "resources/read" => {
+            super::subscriptions::validate_uri(&request.params)?;
+            let mut result = crate::mcp::resources::contents(
+                crate::mcp::resources::EVENTS_URI,
+                &json!(state.store.events(claims.workspace_id).await?),
+            );
+            result["ttlMs"] = json!(0);
+            result["cacheScope"] = json!("private");
+            Ok(result)
+        }
         method => bail!("Unsupported hosted MCP method: {method}"),
     }
 }
@@ -536,7 +567,7 @@ fn server_info() -> Value {
 fn discovery() -> Value {
     json!({
         "supportedVersions": [PROTOCOL_VERSION],
-        "capabilities": { "tools": {} },
+        "capabilities": { "tools": {}, "resources": {"subscribe": true} },
         "instructions": "Read synchronized workspace context. Hosted tools never access local files or execute commands.",
         "ttlMs": 300_000,
         "cacheScope": "private",
@@ -580,7 +611,7 @@ fn required_header<'a>(
         .ok_or_else(|| EnvelopeError::HeaderMismatch(format!("Missing or invalid {name} header")))
 }
 
-fn rpc_http_error(status: StatusCode, id: Value, error: McpError) -> Response {
+pub(super) fn rpc_http_error(status: StatusCode, id: Value, error: McpError) -> Response {
     (status, Json(JsonRpcResponse::error(id, error))).into_response()
 }
 

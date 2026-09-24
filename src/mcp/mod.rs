@@ -1,9 +1,12 @@
 pub(crate) mod protocol;
+pub(crate) mod resources;
 mod tools;
 
 use anyhow::Result;
 use log::{debug, error, info};
 use std::io::{self, BufRead, Write};
+use std::sync::mpsc::{self, RecvTimeoutError};
+use std::time::{Duration, Instant};
 
 use protocol::{JsonRpcRequest, JsonRpcResponse, McpError};
 
@@ -21,11 +24,36 @@ When changed Rust code should be discoverable through codegraph_* tools, run or 
 pub fn serve(scope: McpScope) -> Result<()> {
     info!("MCP server starting (stdio transport)");
 
-    let stdin = io::stdin();
+    let db = crate::db::Db::open_default()?;
+    let mut resources = resources::EventResources::default();
+    // A bounded reader lets the writer deliver updates while the client is idle.
+    // Only this main thread writes stdout, so responses and notifications cannot interleave.
+    let (sender, receiver) = mpsc::sync_channel(128);
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if sender.send(line).is_err() {
+                break;
+            }
+        }
+    });
     let mut stdout = io::stdout();
+    let interval = Duration::from_secs(1);
+    let mut next_poll = Instant::now() + interval;
 
-    for line in stdin.lock().lines() {
-        let line = line?;
+    loop {
+        if Instant::now() >= next_poll {
+            for notification in resources.poll(&db, &scope) {
+                writeln!(stdout, "{notification}")?;
+            }
+            stdout.flush()?;
+            next_poll = Instant::now() + interval;
+        }
+        let line = match receiver.recv_timeout(next_poll.saturating_duration_since(Instant::now()))
+        {
+            Ok(line) => line?,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         if line.trim().is_empty() {
             continue;
         }
@@ -33,6 +61,9 @@ pub fn serve(scope: McpScope) -> Result<()> {
         debug!("Received: {}", line);
 
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
+            Ok(req) if req.method.starts_with("resources/") => {
+                Some(resources.handle(&req, &db, &scope))
+            }
             Ok(req) => handle_request_with_scope(req, &scope),
             Err(e) => {
                 error!("Failed to parse request: {}", e);
@@ -89,7 +120,8 @@ fn handle_initialize(id: serde_json::Value) -> JsonRpcResponse {
         serde_json::json!({
             "protocolVersion": "2024-11-05",
             "capabilities": {
-                "tools": {}
+                "tools": {},
+                "resources": {"subscribe": true}
             },
             "serverInfo": {
                 "name": "ai-workspace",
