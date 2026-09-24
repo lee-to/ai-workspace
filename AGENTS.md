@@ -31,6 +31,7 @@ ai-workspace/
 │   │   ├── mcp.rs          # Hosted read-only MCP adapter
 │   │   ├── models.rs       # Versioned cloud wire records
 │   │   ├── snapshot.rs     # Deterministic local snapshot builder
+│   │   ├── subscriptions.rs # Authenticated modern MCP event SSE subscriptions
 │   │   └── store.rs        # PostgreSQL tenant read model
 │   ├── cli/
 │   │   └── mod.rs          # CLI subcommands and handlers
@@ -41,6 +42,7 @@ ai-workspace/
 │   └── mcp/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
 │       ├── protocol.rs     # JSON-RPC types (request, response, error)
+│       ├── resources.rs    # Scoped event resources and local subscriptions
 │       └── tools.rs        # MCP tool implementations (workspace, project, service, event, codegraph tools)
 ├── migrations/
 │   └── 0001_cloud_read_model.sql # PostgreSQL JSONB/FTS tables and forced RLS
@@ -50,6 +52,7 @@ ai-workspace/
 │   ├── cloud_server.rs     # Cloud CLI/server boundary tests
 │   ├── fts_search.rs       # FTS5 fulltext search integration tests
 │   ├── mcp_http_tests.rs   # Hosted/local MCP compatibility tests
+│   ├── mcp_subscriptions.rs # Live stdio event notification integration tests
 │   └── mcp_tests.rs        # MCP protocol integration tests
 └── .ai-factory/
     └── DESCRIPTION.md      # Project specification and tech stack

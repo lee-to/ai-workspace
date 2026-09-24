@@ -493,6 +493,26 @@ impl CloudStore {
         Ok(events)
     }
 
+    /// Small, tenant-scoped change detector for event subscriptions, including
+    /// commits made by a different HTTP server instance. Payloads are only read
+    /// when this ordered revision vector changes.
+    pub async fn event_snapshot_versions(&self, workspace_id: Uuid) -> Result<Vec<(String, i64)>> {
+        let mut transaction = self.begin_tenant(workspace_id).await?;
+        let versions: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT project_slug, revision FROM cloud_project_snapshots
+             WHERE workspace_id = $1::uuid ORDER BY project_slug LIMIT $2",
+        )
+        .bind(workspace_id.to_string())
+        .bind(MAX_CLOUD_CONTEXT_PROJECTS + 1)
+        .fetch_all(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        if versions.len() > MAX_CLOUD_CONTEXT_PROJECTS as usize {
+            return Err(ContextLimitExceeded.into());
+        }
+        Ok(versions)
+    }
+
     pub async fn event_details(
         &self,
         workspace_id: Uuid,

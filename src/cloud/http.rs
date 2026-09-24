@@ -775,6 +775,45 @@ mod tests {
         });
         let initialized = json!({"jsonrpc":"2.0", "method":"notifications/initialized"});
         let push_only_token = test_token(workspace_id, &workspace_slug, "ai-workspace:push");
+        let subscription = json!({
+            "jsonrpc": "2.0", "id": "watch", "method": "subscriptions/listen",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": super::super::mcp::PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                },
+                "notifications": {"resourceSubscriptions": ["workspace://events"]}
+            }
+        });
+        for (bearer, expected) in [
+            (None, StatusCode::UNAUTHORIZED),
+            (Some(&push_only_token), StatusCode::FORBIDDEN),
+            (Some(&token), StatusCode::OK),
+        ] {
+            let mut request = client
+                .post(format!("{base_url}/mcp"))
+                .header("MCP-Protocol-Version", super::super::mcp::PROTOCOL_VERSION)
+                .header("Mcp-Method", "subscriptions/listen")
+                .header("Accept", "application/json, text/event-stream")
+                .json(&subscription);
+            if let Some(bearer) = bearer {
+                request = request.bearer_auth(bearer);
+            }
+            let mut response = request.send().await.unwrap();
+            assert_eq!(response.status(), expected);
+            if expected == StatusCode::OK {
+                assert_eq!(response.headers()["content-type"], "text/event-stream");
+                let bytes = tokio::time::timeout(Duration::from_secs(5), response.chunk())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    String::from_utf8_lossy(&bytes)
+                        .contains("notifications/subscriptions/acknowledged")
+                );
+            }
+        }
         for body in [&initialize, &initialized] {
             let unauthorized = client
                 .post(format!("{base_url}/mcp"))
@@ -817,7 +856,10 @@ mod tests {
             let body: Value = response.json().await.unwrap();
             assert_eq!(body["id"], 42);
             assert_eq!(body["result"]["protocolVersion"], version);
-            assert_eq!(body["result"]["capabilities"], json!({"tools":{}}));
+            assert_eq!(
+                body["result"]["capabilities"],
+                json!({"tools":{}, "resources":{}})
+            );
             assert_eq!(body["result"]["serverInfo"]["name"], "ai-workspace-cloud");
             assert!(body["result"].get("_meta").is_none());
             let response = client

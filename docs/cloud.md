@@ -144,7 +144,7 @@ The separate `2026-07-28` request format remains available. Send requests with:
 - `Mcp-Name` matching the tool name for `tools/call`
 - `params._meta["io.modelcontextprotocol/protocolVersion"]` set to `2026-07-28`
 
-This format supports `server/discover`, `tools/list`, and `tools/call`, and requires client capabilities in `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Its matching headers and metadata remain mandatory; malformed modern requests cannot fall back to the standard format. Both formats use the same authentication, tenant isolation, and hosted catalog:
+This format supports `server/discover`, `tools/list`, `tools/call`, resource reads, and `subscriptions/listen`, and requires client capabilities in `params._meta["io.modelcontextprotocol/clientCapabilities"]`. Its matching headers and metadata remain mandatory; malformed modern requests cannot fall back to the standard format. Both formats use the same authentication, tenant isolation, and hosted catalog:
 
 | Tool | Purpose |
 |------|---------|
@@ -157,6 +157,69 @@ This format supports `server/discover`, `tools/list`, and `tools/call`, and requ
 | `workspace_event_details` | Read one exact `event_key` |
 
 Hosted calls cannot access local paths, run tree/grep, write files, or query CodeGraph. See [MCP Server](mcp-server.md) for the separate local stdio tool surface.
+
+### Event subscriptions
+
+Both HTTP protocol formats expose `resources/list` and `resources/read` for
+`workspace://events`: the synchronized event history of the workspace identified
+by the Bearer token. The resource has the same records as `workspace_events`,
+including targets, artifacts, and closed events. Resource reads are private and
+have `ttlMs: 0`. `resources/templates/list` returns an empty list.
+
+Push notifications require the **2026-07-28** format. `server/discover` advertises
+`resources.subscribe: true`. Send `POST /mcp` with the modern headers above,
+`Mcp-Method: subscriptions/listen`, and `Accept: application/json, text/event-stream`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": "events-watch",
+  "method": "subscriptions/listen",
+  "params": {
+    "_meta": {
+      "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+      "io.modelcontextprotocol/clientCapabilities": {}
+    },
+    "notifications": {
+      "resourceSubscriptions": ["workspace://events"]
+    }
+  }
+}
+```
+
+The response is an SSE stream. Its first message is
+`notifications/subscriptions/acknowledged`, confirming the honored filter.
+Subsequent `notifications/resources/updated` messages contain the resource URI
+and `params._meta["io.modelcontextprotocol/subscriptionId"]: "events-watch"`.
+Only resource updates are supported; requested list-change notifications are
+omitted from the acknowledgment. Unknown resource URIs are rejected.
+
+After acknowledgment, read the resource and reread it on each update. Closing
+the HTTP response cancels the subscription. Streams end at token expiration or
+after five minutes, whichever comes first; the server sends a final result when
+ending normally. Reconnect with a valid token, resubscribe, and reread. Streams
+send keepalive comments every 15 seconds. Configure the reverse proxy to allow
+SSE streaming without buffering.
+
+The server checks tenant snapshot revisions once per second, including commits
+made by other replicas, and reads the bounded event collection only after a
+revision changes. Notifications are sent only when event contents change. Local
+events appear here only after a cloud push. Notifications may be coalesced and
+are not replayed; the database remains the source of truth. A database failure
+or collection-budget violation terminates the stream with a JSON-RPC error.
+
+There are at most 64 active subscriptions per server process (`429` when full).
+Authentication, read scope, and Origin checks apply before opening a stream;
+workspace identity always comes from the token. The ordinary request timeouts
+cover stream setup, not the lifetime of its response body. Each subsequent
+database check has a 20-second deadline, capped by stream/token expiration.
+
+The `2025-11-25`/`2025-06-18` HTTP mode advertises resources without subscription
+support: `resources/subscribe` and a GET SSE endpoint are not implemented.
+Clients using those versions can read events on demand. Local stdio supports
+the legacy subscription RPC separately. In every mode, the host application
+must decide how an update reaches the agent; the server cannot start an agent
+turn by itself.
 
 ### Request and query limits
 
@@ -178,6 +241,9 @@ Rate limiting belongs to the ingress and is not enforced by the binary. Configur
 ### Audit records
 
 At `RUST_LOG=info`, completed authenticated MCP and snapshot requests emit a `cloud audit` JSON record with UTC Unix milliseconds, a SHA-256 subject identifier, workspace UUID, scope, operation, HTTP result and duration. MCP records include the allowlisted method/tool and a hashed document/event target when applicable; pushes include a hashed project slug. Unknown method/tool input is replaced by a fixed label. Queries, raw resource keys, request IDs, tokens and content are not included in these audit records.
+
+For `subscriptions/listen`, the audit record describes stream setup; its duration
+does not include the lifetime of the SSE response body.
 
 The subject hash is a stable correlation identifier, not anonymization or an authorization credential. Operators can correlate it with the issuer's subject; protect and retain these logs according to deployment policy. Authentication and envelope failures have diagnostic logs rather than a trusted subject. Ingress access logs must cover malformed JSON/body rejections before the handlers, disconnected requests and requests cancelled by the outer timeout. Snapshot rows also retain the last push subject, previous revision/hash and force flag; they are not an append-only audit history.
 

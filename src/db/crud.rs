@@ -190,6 +190,13 @@ impl Db {
         Self::open(&path)
     }
 
+    /// Changes committed by other connections, compared on the same connection.
+    pub fn data_version(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))?)
+    }
+
     pub fn get_cloud_sync_state(
         &self,
         endpoint: &str,
