@@ -41,8 +41,11 @@ pub fn serve(scope: McpScope) -> Result<()> {
     let mut next_poll = Instant::now() + interval;
 
     loop {
+        // Refresh before polling resources or serving the next request. Do not
+        // continue with a stale authorization snapshot if the database fails.
+        let current_scope = scope.refreshed(&db)?;
         if Instant::now() >= next_poll {
-            for notification in resources.poll(&db, &scope) {
+            for notification in resources.poll(&db, &current_scope) {
                 writeln!(stdout, "{notification}")?;
             }
             stdout.flush()?;
@@ -60,11 +63,13 @@ pub fn serve(scope: McpScope) -> Result<()> {
 
         debug!("Received: {}", line);
 
+        let current_scope = scope.refreshed(&db)?;
+
         let response = match serde_json::from_str::<JsonRpcRequest>(&line) {
             Ok(req) if req.method.starts_with("resources/") => {
-                Some(resources.handle(&req, &db, &scope))
+                Some(resources.handle(&req, &db, &current_scope))
             }
-            Ok(req) => handle_request_with_scope(req, &scope),
+            Ok(req) => handle_request_with_scope(req, &current_scope),
             Err(e) => {
                 error!("Failed to parse request: {}", e);
                 Some(JsonRpcResponse::error(
@@ -221,6 +226,11 @@ fn handle_tools_list_with_project_file_write(
                                 "type": "string",
                                 "minLength": 1,
                                 "description": "Relative project path to read. By default this must be an explicitly shared file or inside a shared directory."
+                            },
+                            "expected_content_hash": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$",
+                                "description": "Optional content_hash from local full-text search. Requires project_id+rel_path for a file. A mismatch returns a tool error without file content."
                             },
                             "include_hidden": {
                                 "type": "boolean",

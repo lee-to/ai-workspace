@@ -2831,8 +2831,13 @@ impl Db {
             "index_file: id={} path={} size={} mtime={}",
             shared_item_id, rel_path, size, mtime
         );
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute(
+        // Participate in an atomic rebuild when one is already in progress.
+        let tx = self
+            .conn
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()?;
+        self.conn.execute(
             "INSERT INTO indexed_files (
                  shared_item_id,
                  rel_path,
@@ -2849,20 +2854,22 @@ impl Db {
                 indexed_at = excluded.indexed_at",
             params![shared_item_id, rel_path, abs_path, mtime, size],
         )?;
-        let indexed_file_id: i64 = tx.query_row(
+        let indexed_file_id: i64 = self.conn.query_row(
             "SELECT id FROM indexed_files WHERE shared_item_id = ?1 AND rel_path = ?2",
             params![shared_item_id, rel_path],
             |row| row.get(0),
         )?;
-        tx.execute(
+        self.conn.execute(
             "DELETE FROM files_fts WHERE rowid = ?1",
             params![indexed_file_id],
         )?;
-        tx.execute(
+        self.conn.execute(
             "INSERT INTO files_fts (rowid, path, content) VALUES (?1, ?2, ?3)",
             params![indexed_file_id, rel_path, content],
         )?;
-        tx.commit()?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(())
     }
 
@@ -2902,11 +2909,27 @@ impl Db {
     /// Remove every indexed file row and every file FTS row.
     pub fn clear_file_index(&self) -> Result<()> {
         debug!("clear_file_index");
-        let tx = self.conn.unchecked_transaction()?;
-        tx.execute("DELETE FROM indexed_files", [])?;
-        tx.execute("DELETE FROM files_fts", [])?;
-        tx.commit()?;
+        let tx = self
+            .conn
+            .is_autocommit()
+            .then(|| self.conn.unchecked_transaction())
+            .transpose()?;
+        self.conn.execute("DELETE FROM indexed_files", [])?;
+        self.conn.execute("DELETE FROM files_fts", [])?;
+        if let Some(tx) = tx {
+            tx.commit()?;
+        }
         Ok(())
+    }
+
+    /// Publish a complete FTS rebuild together. Errors, unwinding and process
+    /// termination leave the previous committed index intact.
+    pub fn rebuild_file_index<T>(&self, rebuild: impl FnOnce() -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        self.clear_file_index()?;
+        let result = rebuild()?;
+        tx.commit()?;
+        Ok(result)
     }
 
     /// Get (abs_path, mtime, size) of an indexed file for a shared item, if present.
@@ -3912,7 +3935,8 @@ impl Db {
                     i.abs_path, \
                     f.path, \
                     snippet(files_fts, 1, '[', ']', '…', 12), \
-                    bm25(files_fts) \
+                    bm25(files_fts), \
+                    f.content \
              FROM files_fts f \
              JOIN indexed_files i ON i.id = f.rowid \
              JOIN shared_items s ON s.id = i.shared_item_id \
@@ -3957,6 +3981,7 @@ impl Db {
                     path: r.get(7)?,
                     snippet: r.get(8)?,
                     rank: r.get(9)?,
+                    content_hash: crate::indexer::content_hash(r.get::<_, String>(10)?.as_bytes()),
                 },
                 r.get::<_, String>(3)?,
                 r.get::<_, String>(4)?,

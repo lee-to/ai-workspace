@@ -53,6 +53,7 @@ ai-workspace/
 │   ├── fts_search.rs       # FTS5 fulltext search integration tests
 │   ├── mcp_http_tests.rs   # Hosted/local MCP compatibility tests
 │   ├── mcp_subscriptions.rs # Live stdio event notification integration tests
+│   ├── mcp_consistency.rs  # Live search/read revision and access revocation tests
 │   └── mcp_tests.rs        # MCP protocol integration tests
 └── .ai-factory/
     └── DESCRIPTION.md      # Project specification and tech stack

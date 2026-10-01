@@ -5,6 +5,7 @@
 
 use anyhow::{Context as _, Result};
 use log::{debug, info, warn};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,6 +16,10 @@ use crate::walk::{self, WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
 pub const MAX_INDEX_FILE_SIZE: u64 = 1_024 * 1_024;
+
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 /// Summary of an indexing pass.
 #[derive(Debug, Default, Clone, Copy)]
@@ -242,6 +247,15 @@ fn index_single(
 /// For `kind='dir'` → walk the directory and index every .md file under it.
 /// Notes and non-.md files are skipped.
 pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Result<IndexStats> {
+    index_shared_item_with_progress(db, item, project_root, &mut |_| Ok(()))
+}
+
+fn index_shared_item_with_progress(
+    db: &Db,
+    item: &SharedItem,
+    project_root: &Path,
+    after_file: &mut impl FnMut(&IndexStats) -> Result<()>,
+) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
     match item.kind {
         SharedItemKind::File => {
@@ -259,6 +273,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 return Ok(stats);
             }
             index_single(db, item.id, &validated, &mut stats)?;
+            after_file(&stats)?;
         }
         SharedItemKind::Dir => {
             let Some(rel) = item.path.as_deref() else {
@@ -298,6 +313,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 if index_single(db, item.id, &child, &mut stats)? {
                     seen.insert(child.rel_path);
                 }
+                after_file(&stats)?;
             }
 
             for (indexed_rel_path, _, _, _) in db.list_indexed_files_for_item(item.id)? {
@@ -412,30 +428,44 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
 
 /// Rebuild the entire files_fts index for every shared_item whose kind is file/dir.
 pub fn reindex_all(db: &Db) -> Result<IndexStats> {
+    reindex_all_with_progress(db, |_| Ok(()))
+}
+
+// The callback is an internal synchronization/fault-injection seam for tests.
+fn reindex_all_with_progress(
+    db: &Db,
+    mut after_file: impl FnMut(&IndexStats) -> Result<()>,
+) -> Result<IndexStats> {
     let start = Instant::now();
     info!("reindex_all: starting full rebuild");
     let mut stats = IndexStats::default();
-    db.clear_file_index()?;
-
-    for project in db.list_projects()? {
-        let project_root = PathBuf::from(&project.path);
-        let items = db
-            .get_shared_items_for_project(project.id)
-            .with_context(|| format!("listing items for project {}", project.id))?;
-        for item in items {
-            match item.kind {
-                SharedItemKind::File | SharedItemKind::Dir => {
-                    let s = index_shared_item(db, &item, &project_root)?;
-                    stats.indexed += s.indexed;
-                    stats.skipped_size += s.skipped_size;
-                    stats.skipped_non_utf8 += s.skipped_non_utf8;
-                    stats.skipped_missing += s.skipped_missing;
+    db.rebuild_file_index(|| {
+        for project in db.list_projects()? {
+            let project_root = PathBuf::from(&project.path);
+            let items = db
+                .get_shared_items_for_project(project.id)
+                .with_context(|| format!("listing items for project {}", project.id))?;
+            for item in items {
+                match item.kind {
+                    SharedItemKind::File | SharedItemKind::Dir => {
+                        let s = index_shared_item_with_progress(
+                            db,
+                            &item,
+                            &project_root,
+                            &mut after_file,
+                        )?;
+                        stats.indexed += s.indexed;
+                        stats.skipped_size += s.skipped_size;
+                        stats.skipped_non_utf8 += s.skipped_non_utf8;
+                        stats.skipped_missing += s.skipped_missing;
+                    }
+                    SharedItemKind::Note => {}
                 }
-                SharedItemKind::Note => {}
             }
         }
-    }
 
+        Ok(())
+    })?;
     info!(
         "reindex_all: indexed={} skipped_size={} skipped_non_utf8={} skipped_missing={} in {:?}",
         stats.indexed,
@@ -673,6 +703,166 @@ mod tests {
             .create_project("p", project_root.to_str().unwrap())
             .unwrap();
         (db, workspace, project_root, pid)
+    }
+
+    fn rebuild_fixture(root: &Path) -> (PathBuf, PathBuf, i64) {
+        let db_path = root.join("index.db");
+        let project = root.join("project");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        for file in ["a.md", "b.md"] {
+            fs::write(project.join("docs").join(file), "old_marker").unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        let pid = db.create_project("p", project.to_str().unwrap()).unwrap();
+        let share = db.share_dir(pid, "docs", None).unwrap();
+        reindex_all(&db).unwrap();
+        for file in ["a.md", "b.md"] {
+            fs::write(project.join("docs").join(file), "new_marker").unwrap();
+        }
+        (db_path, project, share)
+    }
+
+    #[test]
+    fn interrupted_directory_rebuild_rolls_back_and_restart_honors_unshare() {
+        let root = TempDir::new().unwrap();
+        let (db_path, project, share) = rebuild_fixture(root.path());
+        let db = Db::open(&db_path).unwrap();
+        let mut processed = 0;
+        let result = reindex_all_with_progress(&db, |_| {
+            processed += 1;
+            anyhow::bail!("injected interruption after first directory child")
+        });
+        assert!(result.is_err());
+        assert_eq!(processed, 1);
+        drop(db);
+
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.search_files("old_marker", 10).unwrap().len(), 2);
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        fs::remove_file(project.join("docs/b.md")).unwrap();
+        reindex_all(&db).unwrap();
+        assert_eq!(db.search_files("new_marker", 10).unwrap().len(), 1);
+        assert!(db.search_files("old_marker", 10).unwrap().is_empty());
+        db.remove_shared_item(share).unwrap();
+        reindex_all(&db).unwrap();
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        assert!(db.get_item_by_id(share).unwrap().is_none());
+    }
+
+    // Run only in the subprocess below. The pipe is a deterministic barrier;
+    // the parent kills us while the transaction contains one directory child.
+    #[test]
+    fn reindex_crash_child() {
+        use std::io::{Read, Write};
+        let Some(path) = std::env::var_os("AI_WORKSPACE_REINDEX_TEST_DB") else {
+            return;
+        };
+        let db = Db::open(Path::new(&path)).unwrap();
+        reindex_all_with_progress(&db, |_| {
+            println!("REINDEX_PAUSED");
+            std::io::stdout().flush().unwrap();
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn killed_directory_rebuild_keeps_committed_index() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let root = TempDir::new().unwrap();
+        let (db_path, _, _) = rebuild_fixture(root.path());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexer::tests::reindex_crash_child",
+                "--nocapture",
+            ])
+            .env("AI_WORKSPACE_REINDEX_TEST_DB", &db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("REINDEX_PAUSED") {
+                    sender.send(()).unwrap();
+                    break;
+                }
+            }
+        });
+        let paused = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        // Another connection must see the old complete index while the writer
+        // is paused with a partial replacement, not just after crash recovery.
+        let visible = (|| -> rusqlite::Result<(i64, i64)> {
+            let reader = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let count = |query: &str| {
+                reader.query_row(
+                    "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH ?1",
+                    [query],
+                    |row| row.get(0),
+                )
+            };
+            Ok((count("old_marker")?, count("new_marker")?))
+        })();
+        // Always reap the subprocess, including when the barrier fails.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        paused.unwrap();
+        assert_eq!(visible.unwrap(), (2, 0));
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.search_files("old_marker", 10).unwrap().len(), 2);
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        assert_eq!(reindex_all(&db).unwrap().indexed, 2);
+        assert_eq!(db.search_files("new_marker", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn edit_during_rebuild_has_detectable_revision_drift() {
+        let root = TempDir::new().unwrap();
+        let (db_path, project, share) = rebuild_fixture(root.path());
+        let db = Db::open(&db_path).unwrap();
+        let mut edited = None;
+        reindex_all_with_progress(&db, |_| {
+            if edited.is_none() {
+                let (path, _, _, _) = db
+                    .list_indexed_files_for_item(share)?
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                // Same length and explicitly preserved mtime: stat checks alone
+                // cannot establish that these are the indexed bytes.
+                let file_path = project.join(&path);
+                let modified = fs::metadata(&file_path)?.modified()?;
+                fs::write(&file_path, "end_marker")?;
+                fs::File::options()
+                    .write(true)
+                    .open(&file_path)?
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                edited = Some(path);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let path = edited.unwrap();
+        let hit = db
+            .search_files("new_marker", 10)
+            .unwrap()
+            .into_iter()
+            .find(|hit| hit.path == path)
+            .unwrap();
+        assert_eq!(hit.content_hash, content_hash(b"new_marker"));
+        assert_ne!(
+            hit.content_hash,
+            content_hash(&fs::read(project.join(path)).unwrap())
+        );
     }
 
     #[test]
