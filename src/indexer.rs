@@ -769,6 +769,189 @@ mod tests {
     }
 
     #[test]
+    fn mcp_reader_child() {
+        if std::env::var_os("AI_WORKSPACE_MCP_REBUILD_TEST").is_none() {
+            return;
+        }
+        let db = Db::open_default().unwrap();
+        let group_id = db.get_group_by_name("readers").unwrap().unwrap().id;
+        let scope = crate::mcp::McpScope::Group {
+            group_id,
+            project_ids: db
+                .get_projects_for_group(group_id)
+                .unwrap()
+                .into_iter()
+                .map(|project| project.id)
+                .collect(),
+        };
+        drop(db);
+        // Exercise the actual stdio server and its per-tool Db::open path.
+        crate::mcp::serve(scope).unwrap();
+    }
+
+    struct TestProcess(std::process::Child);
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn mcp_reads_and_searches_remain_available_during_actual_rebuild() {
+        use serde_json::{Value, json};
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let (db_path, project, _) = rebuild_fixture(root.path());
+        for path in ["docs/a.md", "docs/b.md"] {
+            fs::write(project.join(path), "old_marker").unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        let pid = db.list_projects().unwrap()[0].id;
+        let group_id = db.get_or_create_group("readers").unwrap();
+        db.add_project_to_group(pid, group_id).unwrap();
+        let outsider = root.path().join("outsider");
+        fs::create_dir(&outsider).unwrap();
+        fs::write(outsider.join("private.md"), "old_marker private_marker").unwrap();
+        let outsider_id = db
+            .create_project("outsider", outsider.to_str().unwrap())
+            .unwrap();
+        db.share_file(outsider_id, "private.md", None).unwrap();
+        reindex_all(&db).unwrap();
+        drop(db);
+
+        let mut reader = TestProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "indexer::tests::mcp_reader_child", "--nocapture"])
+                .env("AI_WORKSPACE_DB", &db_path)
+                .env("AI_WORKSPACE_MCP_REBUILD_TEST", "1")
+                .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = reader.0.stdout.take().unwrap();
+        let (sender, responses) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // The Rust test harness may prefix the first JSON response.
+                if let Some(start) = line.find('{')
+                    && let Ok(response) = serde_json::from_str::<Value>(&line[start..])
+                    && sender.send(response).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut call = |name: &str, arguments: Value| -> Value {
+            writeln!(
+                reader.0.stdin.as_mut().unwrap(),
+                "{}",
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":name,"arguments":arguments}
+                })
+            )
+            .unwrap();
+            responses.recv_timeout(Duration::from_secs(10)).unwrap()
+        };
+        let search_args = json!({"query":"old_marker"});
+        let before = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(before["result"]["isError"], true, "{before}");
+        let hits: Value =
+            serde_json::from_str(before["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+        let hit = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["path"] == "docs/a.md")
+            .unwrap();
+        let read_args = json!({"project_id":hit["project_id"],"rel_path":hit["path"],
+            "expected_content_hash":hit["content_hash"]});
+
+        let mut writer = TestProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "indexer::tests::reindex_crash_child",
+                    "--nocapture",
+                ])
+                .env("AI_WORKSPACE_REINDEX_TEST_DB", &db_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = writer.0.stdout.take().unwrap();
+        let (sender, paused) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("REINDEX_PAUSED") {
+                    let _ = sender.send(());
+                    break;
+                }
+            }
+        });
+        paused.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let read = call("workspace_read", read_args.clone());
+        assert_ne!(read["result"]["isError"], true, "{read}");
+        assert_eq!(read["result"]["content"][0]["text"], "old_marker");
+        let during = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(during["result"]["isError"], true, "{during}");
+        assert_eq!(during["result"]["content"], before["result"]["content"]);
+        let projects = call("list_projects", json!({}));
+        assert_ne!(projects["result"]["isError"], true, "{projects}");
+        let denied = call(
+            "workspace_read",
+            json!({"project_id":outsider_id,"rel_path":"private.md"}),
+        );
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+
+        // Force refresh and pruning writes while the writer is still paused.
+        // Reads must remain available, and missing paths must still be filtered.
+        fs::write(project.join("docs/a.md"), "new_long_marker").unwrap();
+        fs::remove_file(project.join("docs/b.md")).unwrap();
+        let filtered = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(filtered["result"]["isError"], true, "{filtered}");
+        let filtered_hits: Value =
+            serde_json::from_str(filtered["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(filtered_hits.as_array().unwrap().len(), 1);
+        assert_eq!(filtered_hits[0]["path"], "docs/a.md");
+        assert_eq!(filtered_hits[0]["content_hash"], hit["content_hash"]);
+        let stale = call("workspace_read", read_args);
+        assert_eq!(stale["result"]["isError"], true);
+        assert!(
+            stale["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hash mismatch")
+        );
+
+        drop(writer); // Roll back the actual rebuild and release its writer lock.
+        let after = call(
+            "workspace_search_fulltext",
+            json!({"query":"new_long_marker"}),
+        );
+        assert_ne!(after["result"]["isError"], true, "{after}");
+        let after_hits: Value =
+            serde_json::from_str(after["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(after_hits.as_array().unwrap().len(), 1);
+        let old = call("workspace_search_fulltext", search_args);
+        assert_ne!(old["result"]["isError"], true, "{old}");
+        assert_eq!(old["result"]["content"][0]["text"], "[]");
+    }
+
+    #[test]
     fn killed_directory_rebuild_keeps_committed_index() {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};

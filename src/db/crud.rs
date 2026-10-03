@@ -181,6 +181,7 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self> {
         info!("Opening database at {}", path.display());
         let conn = Connection::open(path)?;
+        conn.busy_timeout(super::BUSY_TIMEOUT)?;
         super::schema::init_db(&conn)?;
         Ok(Db { conn })
     }
@@ -2932,6 +2933,20 @@ impl Db {
         Ok(result)
     }
 
+    /// Skip optional refresh/cleanup while another connection owns the writer
+    /// lock. The caller can still search the previous committed index.
+    pub fn try_refresh_file_index<T>(
+        &self,
+        refresh: impl FnOnce() -> Result<T>,
+    ) -> Result<Option<T>> {
+        let Some(tx) = super::try_write_transaction(&self.conn)? else {
+            return Ok(None);
+        };
+        let result = refresh()?;
+        tx.commit()?;
+        Ok(Some(result))
+    }
+
     /// Get (abs_path, mtime, size) of an indexed file for a shared item, if present.
     #[allow(dead_code)]
     pub fn get_file_index_meta(&self, shared_item_id: i64) -> Result<Option<(String, i64, i64)>> {
@@ -3895,7 +3910,7 @@ impl Db {
 
     /// Full-text search over indexed files. Returns hits ordered by bm25 (best first).
     pub fn search_files(&self, query: &str, limit: usize) -> Result<Vec<FileSearchHit>> {
-        self.search_files_scoped(query, limit, None)
+        self.search_files_scoped(query, limit, None, true)
     }
 
     /// Full-text search limited to the given project IDs before ranking/limit.
@@ -3905,7 +3920,17 @@ impl Db {
         limit: usize,
         project_ids: &[i64],
     ) -> Result<Vec<FileSearchHit>> {
-        self.search_files_scoped(query, limit, Some(project_ids))
+        self.search_files_scoped(query, limit, Some(project_ids), true)
+    }
+
+    /// Revalidate scope and paths without attempting to prune rejected rows.
+    pub fn search_files_readonly(
+        &self,
+        query: &str,
+        limit: usize,
+        project_ids: Option<&[i64]>,
+    ) -> Result<Vec<FileSearchHit>> {
+        self.search_files_scoped(query, limit, project_ids, false)
     }
 
     fn search_files_scoped(
@@ -3913,6 +3938,7 @@ impl Db {
         query: &str,
         limit: usize,
         project_ids: Option<&[i64]>,
+        prune: bool,
     ) -> Result<Vec<FileSearchHit>> {
         debug!(
             "search_files: query='{}' limit={} project_ids={:?}",
@@ -4003,11 +4029,15 @@ impl Db {
         let mut hits = Vec::new();
         for (indexed_file_id, mut hit, item_kind, item_path, project_path, abs_path) in rows {
             let Ok(normalized_item_path) = normalize_portable_rel_path(&item_path) else {
-                self.delete_file_index(hit.shared_item_id)?;
+                if prune {
+                    self.delete_file_index(hit.shared_item_id)?;
+                }
                 continue;
             };
             let Ok(normalized_hit_path) = normalize_portable_rel_path(&hit.path) else {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             };
             let item_rel = Path::new(&normalized_item_path);
@@ -4016,19 +4046,25 @@ impl Db {
             if !crate::walk::path_allowed_for_shared_ai_factory(item_rel, options)
                 || !crate::walk::path_allowed_for_shared_ai_factory(hit_rel, options)
             {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             }
 
             let project_root = Path::new(&project_path);
             let Ok(validated_item) = validate_project_rel_path(project_root, &normalized_item_path)
             else {
-                self.delete_file_index(hit.shared_item_id)?;
+                if prune {
+                    self.delete_file_index(hit.shared_item_id)?;
+                }
                 continue;
             };
             let Ok(validated_hit) = validate_project_rel_path(project_root, &normalized_hit_path)
             else {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             };
             let hit_in_item_scope = match item_kind.as_str() {
@@ -4039,15 +4075,21 @@ impl Db {
                 _ => false,
             };
             if !hit_in_item_scope {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             }
             let Ok(canonical_meta) = Path::new(&abs_path).canonicalize() else {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             };
             if canonical_meta != validated_hit.canonical_path {
-                self.delete_indexed_file_by_id(indexed_file_id)?;
+                if prune {
+                    self.delete_indexed_file_by_id(indexed_file_id)?;
+                }
                 continue;
             }
 

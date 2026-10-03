@@ -2026,29 +2026,28 @@ fn workspace_search_fulltext_scoped(
         query, limit
     );
 
-    // Bounded lazy refresh keeps common edits fresh; matching directory-owned
-    // file hits are revalidated below before snippets can be returned.
-    if let Err(e) = crate::indexer::refresh_stale(db, 200) {
-        log::warn!("refresh_stale failed: {}", e);
-        return tool_error(id, "Fulltext search refresh failed");
-    }
+    // Reserve the writer without waiting before lazy refresh or pruning. A
+    // rebuild must not prevent searching the previous committed index. The
+    // fallback still validates current shares, canonical paths and path policy.
+    let refreshed = db.try_refresh_file_index(|| {
+        crate::indexer::refresh_stale(db, 200)?;
+        let mut hits = search_files_for_scope(db, query, limit, scope, false)?;
+        if crate::indexer::refresh_search_hits(db, &hits)? > 0 {
+            hits = search_files_for_scope(db, query, limit, scope, false)?;
+        }
+        Ok(hits)
+    });
+    let hits = match refreshed {
+        Ok(Some(hits)) => Ok(hits),
+        Ok(None) => search_files_for_scope(db, query, limit, scope, true),
+        Err(e) => {
+            log::warn!("Fulltext search refresh failed: {}", e);
+            return tool_error(id, &format!("Fulltext search error: {}", e));
+        }
+    };
 
-    match search_files_for_scope(db, query, limit, scope) {
-        Ok(mut hits) => {
-            match crate::indexer::refresh_search_hits(db, &hits) {
-                Ok(refreshed) if refreshed > 0 => {
-                    match search_files_for_scope(db, query, limit, scope) {
-                        Ok(updated_hits) => hits = updated_hits,
-                        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("refresh_search_hits failed: {}", e);
-                    return tool_error(id, "Fulltext search refresh failed");
-                }
-            }
-
+    match hits {
+        Ok(hits) => {
             let results: Vec<_> = hits
                 .iter()
                 .filter(|h| scope.allows_project(h.project_id))
@@ -2081,7 +2080,11 @@ fn search_files_for_scope(
     query: &str,
     limit: usize,
     scope: &McpScope,
+    readonly: bool,
 ) -> anyhow::Result<Vec<FileSearchHit>> {
+    if readonly {
+        return db.search_files_readonly(query, limit, scope.allowed_project_ids().as_deref());
+    }
     match scope.allowed_project_ids() {
         Some(project_ids) => db.search_files_for_projects(query, limit, &project_ids),
         None => db.search_files(query, limit),
