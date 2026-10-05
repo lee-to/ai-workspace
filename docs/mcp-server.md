@@ -230,6 +230,7 @@ Read the content of a shared file, directory, or note. Supports two modes: by sh
 | `item_id` | integer | — | The shared item ID (mutually exclusive with `project_id`+`rel_path`) |
 | `project_id` | integer | — | Project ID to read from (use with `rel_path`) |
 | `rel_path` | string | — | Relative path within the project (use with `project_id`) |
+| `expected_content_hash` | string | no | Lowercase SHA-256 from a local full-text hit; requires `project_id`+`rel_path` for a file |
 | `include_hidden` | boolean | no | Include hidden/dotfile paths (default: `false`) |
 | `include_sensitive` | boolean | no | Include credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key` (default: `false`) |
 
@@ -239,6 +240,7 @@ Provide **either** `item_id` **or** `project_id`+`rel_path`, not both. Passing b
 - **File:** returns file content as text (max 10 MB)
 - **Directory:** returns listing of filenames
 - **Note:** returns note content (only via `item_id`)
+- Without `expected_content_hash`, file reads return current filesystem content, which may differ from an earlier search snippet. With it, the server hashes the exact UTF-8 bytes read and returns a tool error containing `content hash mismatch` if they differ; no file content is returned on mismatch. Deleted files and revoked access return the usual read/access errors, before checking the hash. The hash is a revision check, not an access token.
 - `item_id` reads continue to work for shared files and directories
 - `project_id`+`rel_path` is limited to an explicitly shared file or a path inside an explicitly shared directory by default
 - Set `AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS=1` to allow project-wide `rel_path` reads inside the configured MCP scope
@@ -289,8 +291,11 @@ Full-text search over shared `.md` **files** (including `.md` files inside share
 | `path` | string | File path relative to the project root |
 | `snippet` | string | Context snippet with matched terms wrapped in `[...]` |
 | `rank` | number | bm25 score (lower = better match) |
+| `content_hash` | string | Lowercase SHA-256 of the indexed UTF-8 content that produced the snippet |
 
 Use `workspace_read` with `project_id` and `rel_path` set to the returned `path` to read the exact matched file. This matters for hits inside shared directories because `shared_item_id` points to the shared directory item.
+
+Pass the hit's `content_hash` as `expected_content_hash` to detect edits between indexing/search and reading. It identifies indexed bytes, not a filesystem snapshot: a source can change during or after indexing, and same-size edits with unchanged mtime can evade stat-based refresh. On mismatch, read current content without the check, or run `ai-workspace reindex`, search again, and retry. Reads check current shares; selected project/group identities remain fixed for the server session, while their memberships refresh before every request and resource poll. Leaving a group therefore revokes group-scoped access in an already open session. Project-wide opt-in still permits unshared path reads inside the current MCP scope.
 
 **Indexing behavior:**
 - Only `.md` files are indexed; non-markdown files, files >1 MB, and non-UTF-8 content are skipped.
@@ -299,6 +304,10 @@ Use `workspace_read` with `project_id` and `rel_path` set to the returned `path`
 - Files whose mtime has changed on disk are lazily refreshed before each search with a bounded budget (200 indexed rows or not-yet-indexed shared file/dir items per call).
 - Deleted indexed child files are removed during lazy refresh; newly added child files inside already-indexed shared directories are picked up by `ai-workspace reindex`.
 - If the database predates FTS (or the index looks empty), run `ai-workspace reindex` once to populate it.
+- A full `reindex` replaces the SQLite FTS index in one transaction. Readers observe the previous committed index until the rebuild commits; failure or process termination rolls the partial rebuild back. Concurrent database mutations may wait for the rebuild's write lock. Restarting rebuilds from current shares and removes obsolete entries. This atomic publication applies to the database index, not to external source files. Skipped files (size, encoding, missing paths) remain subject to the rules above.
+- MCP reads remain available during a rebuild. Optional schema maintenance, lazy refresh, and index pruning are deferred when another writer holds the lock. Full-text search then uses the previous committed index while still checking current scope, shared paths, canonical paths, and path policy; deleted or unsafe paths are filtered without cleanup writes. Snippets and hashes still identify indexed content, so use `expected_content_hash` to detect source edits. Maintenance and lazy refresh resume on subsequent database opens/searches once the writer is available.
+
+These guarantees cover local Markdown FTS and reads. Rust CodeGraph retains its own sync/freshness behavior; hosted cloud reads use explicitly published snapshots. Neither shares a global transaction with local FTS or the filesystem, and the optional read hash parameter described here is local-only.
 
 **vs `workspace_search`:** `workspace_search` searches note content only with sanitized terms; `workspace_search_fulltext` searches `.md` file content and accepts full FTS5 query syntax.
 

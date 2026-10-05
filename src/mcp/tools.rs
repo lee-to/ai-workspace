@@ -157,6 +157,29 @@ pub enum McpScope {
 }
 
 impl McpScope {
+    /// Keep the selected project/group identity, but enforce current membership.
+    pub(super) fn refreshed(&self, db: &Db) -> anyhow::Result<Self> {
+        Ok(match self {
+            Self::Global => Self::Global,
+            Self::Group { group_id, .. } => Self::Group {
+                group_id: *group_id,
+                project_ids: db
+                    .get_projects_for_group(*group_id)?
+                    .into_iter()
+                    .map(|project| project.id)
+                    .collect(),
+            },
+            Self::Project { project_id, .. } => Self::Project {
+                project_id: *project_id,
+                group_ids: db
+                    .get_groups_for_project(*project_id)?
+                    .into_iter()
+                    .map(|group| group.id)
+                    .collect(),
+            },
+        })
+    }
+
     #[cfg(test)]
     pub fn global() -> Self {
         Self::Global
@@ -757,6 +780,27 @@ pub fn handle_tool_call_scoped(
                 );
             }
 
+            let expected_hash = match arguments.get("expected_content_hash") {
+                None => None,
+                Some(serde_json::Value::String(hash))
+                    if item_id.is_none()
+                        && hash.len() == 64
+                        && hash
+                            .bytes()
+                            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()) =>
+                {
+                    Some(hash.as_str())
+                }
+                Some(_) => {
+                    return JsonRpcResponse::error(
+                        id,
+                        McpError::invalid_params(
+                            "expected_content_hash requires project_id+rel_path and a lowercase SHA-256 hex digest",
+                        ),
+                    );
+                }
+            };
+
             let read_by_item_id = item_id.is_some();
             let read_by_path = project_id.is_some() && path.is_some();
             if !read_by_item_id && !read_by_path {
@@ -776,7 +820,15 @@ pub fn handle_tool_call_scoped(
             if let Some(iid) = item_id {
                 workspace_read_scoped(id, iid, &db, options, scope)
             } else if let (Some(pid), Some(p)) = (project_id, path) {
-                workspace_read_by_path_scoped(id, pid, &p, &db, options, scope)
+                workspace_read_by_path_scoped_with_hash(
+                    id,
+                    pid,
+                    &p,
+                    &db,
+                    options,
+                    scope,
+                    expected_hash,
+                )
             } else {
                 unreachable!("workspace_read parameters are validated before DB access")
             }
@@ -1636,6 +1688,7 @@ fn read_visible_path(
     canonical: &Path,
     options: walk::WalkOptions,
     allow_shared_ai_factory: bool,
+    expected_content_hash: Option<&str>,
 ) -> JsonRpcResponse {
     let path_allowed = if allow_shared_ai_factory {
         path_allowed_for_shared_context_under_root(canonical_root, canonical, options)
@@ -1651,6 +1704,9 @@ fn read_visible_path(
 
     debug!("Reading file: {}", canonical.display());
     if canonical.is_dir() {
+        if expected_content_hash.is_some() {
+            return tool_error(id, "expected_content_hash is only supported for files");
+        }
         match std::fs::read_dir(canonical) {
             Ok(entries) => {
                 let mut listing: Vec<String> = entries
@@ -1687,7 +1743,17 @@ fn read_visible_path(
                 ),
             ),
             _ => match std::fs::read_to_string(canonical) {
-                Ok(content) => tool_result(id, content),
+                Ok(content) => {
+                    if expected_content_hash.is_some_and(|expected| {
+                        crate::indexer::content_hash(content.as_bytes()) != expected
+                    }) {
+                        return tool_error(
+                            id,
+                            "Stale search result: content hash mismatch. Search again or read without expected_content_hash for current content.",
+                        );
+                    }
+                    tool_result(id, content)
+                }
                 Err(e) => {
                     error!("Failed to read file {}: {}", canonical.display(), e);
                     tool_error(id, "Failed to read file")
@@ -1778,7 +1844,7 @@ fn workspace_read_scoped(
         return tool_error(id, "Access denied: path is outside project directory");
     }
 
-    read_visible_path(id, &canonical_root, &canonical, options, true)
+    read_visible_path(id, &canonical_root, &canonical, options, true, None)
 }
 
 #[cfg(test)]
@@ -1793,6 +1859,7 @@ fn workspace_read_by_path(
     workspace_read_by_path_scoped(id, project_id, path, db, options, &McpScope::global())
 }
 
+#[cfg(test)]
 fn workspace_read_by_path_scoped(
     id: serde_json::Value,
     project_id: i64,
@@ -1800,6 +1867,18 @@ fn workspace_read_by_path_scoped(
     db: &Db,
     options: walk::WalkOptions,
     scope: &McpScope,
+) -> JsonRpcResponse {
+    workspace_read_by_path_scoped_with_hash(id, project_id, path, db, options, scope, None)
+}
+
+fn workspace_read_by_path_scoped_with_hash(
+    id: serde_json::Value,
+    project_id: i64,
+    path: &str,
+    db: &Db,
+    options: walk::WalkOptions,
+    scope: &McpScope,
+    expected_content_hash: Option<&str>,
 ) -> JsonRpcResponse {
     info!(
         "workspace_read_by_path: project_id={}, path={}",
@@ -1883,6 +1962,7 @@ fn workspace_read_by_path_scoped(
         &canonical,
         options,
         matched_scope.is_some(),
+        expected_content_hash,
     )
 }
 
@@ -1946,29 +2026,28 @@ fn workspace_search_fulltext_scoped(
         query, limit
     );
 
-    // Bounded lazy refresh keeps common edits fresh; matching directory-owned
-    // file hits are revalidated below before snippets can be returned.
-    if let Err(e) = crate::indexer::refresh_stale(db, 200) {
-        log::warn!("refresh_stale failed: {}", e);
-        return tool_error(id, "Fulltext search refresh failed");
-    }
+    // Reserve the writer without waiting before lazy refresh or pruning. A
+    // rebuild must not prevent searching the previous committed index. The
+    // fallback still validates current shares, canonical paths and path policy.
+    let refreshed = db.try_refresh_file_index(|| {
+        crate::indexer::refresh_stale(db, 200)?;
+        let mut hits = search_files_for_scope(db, query, limit, scope, false)?;
+        if crate::indexer::refresh_search_hits(db, &hits)? > 0 {
+            hits = search_files_for_scope(db, query, limit, scope, false)?;
+        }
+        Ok(hits)
+    });
+    let hits = match refreshed {
+        Ok(Some(hits)) => Ok(hits),
+        Ok(None) => search_files_for_scope(db, query, limit, scope, true),
+        Err(e) => {
+            log::warn!("Fulltext search refresh failed: {}", e);
+            return tool_error(id, &format!("Fulltext search error: {}", e));
+        }
+    };
 
-    match search_files_for_scope(db, query, limit, scope) {
-        Ok(mut hits) => {
-            match crate::indexer::refresh_search_hits(db, &hits) {
-                Ok(refreshed) if refreshed > 0 => {
-                    match search_files_for_scope(db, query, limit, scope) {
-                        Ok(updated_hits) => hits = updated_hits,
-                        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
-                    }
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    log::warn!("refresh_search_hits failed: {}", e);
-                    return tool_error(id, "Fulltext search refresh failed");
-                }
-            }
-
+    match hits {
+        Ok(hits) => {
             let results: Vec<_> = hits
                 .iter()
                 .filter(|h| scope.allows_project(h.project_id))
@@ -1985,6 +2064,7 @@ fn workspace_search_fulltext_scoped(
                         "path": h.path,
                         "snippet": h.snippet,
                         "rank": h.rank,
+                        "content_hash": h.content_hash,
                     })
                 })
                 .collect();
@@ -2000,7 +2080,11 @@ fn search_files_for_scope(
     query: &str,
     limit: usize,
     scope: &McpScope,
+    readonly: bool,
 ) -> anyhow::Result<Vec<FileSearchHit>> {
+    if readonly {
+        return db.search_files_readonly(query, limit, scope.allowed_project_ids().as_deref());
+    }
     match scope.allowed_project_ids() {
         Some(project_ids) => db.search_files_for_projects(query, limit, &project_ids),
         None => db.search_files(query, limit),

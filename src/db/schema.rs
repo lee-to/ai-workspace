@@ -337,8 +337,14 @@ fn unique_slug(base: &str, used_slugs: &mut std::collections::HashSet<String>) -
 }
 
 fn run_schema_maintenance(conn: &Connection) -> Result<()> {
+    let Some(tx) = super::try_write_transaction(conn)? else {
+        debug!("Deferring schema maintenance while another writer is active");
+        return Ok(());
+    };
     migrate_projects_slug(conn)?;
-    remove_orphaned_notes_fts_rows(conn)
+    remove_orphaned_notes_fts_rows(conn)?;
+    tx.commit()?;
+    Ok(())
 }
 
 fn execute_schema_step(conn: &Connection, step_name: &str, sql: &str) -> Result<()> {
@@ -708,6 +714,36 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM notes_fts", [], |row| row.get(0))
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn maintenance_defers_orphan_cleanup_until_writer_is_available() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let writer = Connection::open(file.path()).unwrap();
+        init_db(&writer).unwrap();
+        writer
+            .execute(
+                "INSERT INTO notes_fts (rowid, label, content) VALUES (99, 'orphan', 'stale')",
+                [],
+            )
+            .unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let reader = Connection::open(file.path()).unwrap();
+        reader.busy_timeout(std::time::Duration::ZERO).unwrap();
+        init_db(&reader).unwrap();
+        let count = || {
+            reader
+                .query_row(
+                    "SELECT COUNT(*) FROM notes_fts WHERE rowid = 99",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count(), 1);
+        writer.execute_batch("ROLLBACK").unwrap();
+        init_db(&reader).unwrap();
+        assert_eq!(count(), 0);
     }
 
     #[test]

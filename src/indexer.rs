@@ -5,6 +5,7 @@
 
 use anyhow::{Context as _, Result};
 use log::{debug, info, warn};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -15,6 +16,10 @@ use crate::walk::{self, WalkOptions, walk_project_tree};
 
 /// Skip files larger than 1 MB (same limit used by grep).
 pub const MAX_INDEX_FILE_SIZE: u64 = 1_024 * 1_024;
+
+pub(crate) fn content_hash(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
 
 /// Summary of an indexing pass.
 #[derive(Debug, Default, Clone, Copy)]
@@ -242,6 +247,15 @@ fn index_single(
 /// For `kind='dir'` → walk the directory and index every .md file under it.
 /// Notes and non-.md files are skipped.
 pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Result<IndexStats> {
+    index_shared_item_with_progress(db, item, project_root, &mut |_| Ok(()))
+}
+
+fn index_shared_item_with_progress(
+    db: &Db,
+    item: &SharedItem,
+    project_root: &Path,
+    after_file: &mut impl FnMut(&IndexStats) -> Result<()>,
+) -> Result<IndexStats> {
     let mut stats = IndexStats::default();
     match item.kind {
         SharedItemKind::File => {
@@ -259,6 +273,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 return Ok(stats);
             }
             index_single(db, item.id, &validated, &mut stats)?;
+            after_file(&stats)?;
         }
         SharedItemKind::Dir => {
             let Some(rel) = item.path.as_deref() else {
@@ -298,6 +313,7 @@ pub fn index_shared_item(db: &Db, item: &SharedItem, project_root: &Path) -> Res
                 if index_single(db, item.id, &child, &mut stats)? {
                     seen.insert(child.rel_path);
                 }
+                after_file(&stats)?;
             }
 
             for (indexed_rel_path, _, _, _) in db.list_indexed_files_for_item(item.id)? {
@@ -412,30 +428,44 @@ pub fn refresh_if_stale(db: &Db, item: &SharedItem, project_root: &Path) -> Resu
 
 /// Rebuild the entire files_fts index for every shared_item whose kind is file/dir.
 pub fn reindex_all(db: &Db) -> Result<IndexStats> {
+    reindex_all_with_progress(db, |_| Ok(()))
+}
+
+// The callback is an internal synchronization/fault-injection seam for tests.
+fn reindex_all_with_progress(
+    db: &Db,
+    mut after_file: impl FnMut(&IndexStats) -> Result<()>,
+) -> Result<IndexStats> {
     let start = Instant::now();
     info!("reindex_all: starting full rebuild");
     let mut stats = IndexStats::default();
-    db.clear_file_index()?;
-
-    for project in db.list_projects()? {
-        let project_root = PathBuf::from(&project.path);
-        let items = db
-            .get_shared_items_for_project(project.id)
-            .with_context(|| format!("listing items for project {}", project.id))?;
-        for item in items {
-            match item.kind {
-                SharedItemKind::File | SharedItemKind::Dir => {
-                    let s = index_shared_item(db, &item, &project_root)?;
-                    stats.indexed += s.indexed;
-                    stats.skipped_size += s.skipped_size;
-                    stats.skipped_non_utf8 += s.skipped_non_utf8;
-                    stats.skipped_missing += s.skipped_missing;
+    db.rebuild_file_index(|| {
+        for project in db.list_projects()? {
+            let project_root = PathBuf::from(&project.path);
+            let items = db
+                .get_shared_items_for_project(project.id)
+                .with_context(|| format!("listing items for project {}", project.id))?;
+            for item in items {
+                match item.kind {
+                    SharedItemKind::File | SharedItemKind::Dir => {
+                        let s = index_shared_item_with_progress(
+                            db,
+                            &item,
+                            &project_root,
+                            &mut after_file,
+                        )?;
+                        stats.indexed += s.indexed;
+                        stats.skipped_size += s.skipped_size;
+                        stats.skipped_non_utf8 += s.skipped_non_utf8;
+                        stats.skipped_missing += s.skipped_missing;
+                    }
+                    SharedItemKind::Note => {}
                 }
-                SharedItemKind::Note => {}
             }
         }
-    }
 
+        Ok(())
+    })?;
     info!(
         "reindex_all: indexed={} skipped_size={} skipped_non_utf8={} skipped_missing={} in {:?}",
         stats.indexed,
@@ -673,6 +703,349 @@ mod tests {
             .create_project("p", project_root.to_str().unwrap())
             .unwrap();
         (db, workspace, project_root, pid)
+    }
+
+    fn rebuild_fixture(root: &Path) -> (PathBuf, PathBuf, i64) {
+        let db_path = root.join("index.db");
+        let project = root.join("project");
+        fs::create_dir_all(project.join("docs")).unwrap();
+        for file in ["a.md", "b.md"] {
+            fs::write(project.join("docs").join(file), "old_marker").unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        let pid = db.create_project("p", project.to_str().unwrap()).unwrap();
+        let share = db.share_dir(pid, "docs", None).unwrap();
+        reindex_all(&db).unwrap();
+        for file in ["a.md", "b.md"] {
+            fs::write(project.join("docs").join(file), "new_marker").unwrap();
+        }
+        (db_path, project, share)
+    }
+
+    #[test]
+    fn interrupted_directory_rebuild_rolls_back_and_restart_honors_unshare() {
+        let root = TempDir::new().unwrap();
+        let (db_path, project, share) = rebuild_fixture(root.path());
+        let db = Db::open(&db_path).unwrap();
+        let mut processed = 0;
+        let result = reindex_all_with_progress(&db, |_| {
+            processed += 1;
+            anyhow::bail!("injected interruption after first directory child")
+        });
+        assert!(result.is_err());
+        assert_eq!(processed, 1);
+        drop(db);
+
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.search_files("old_marker", 10).unwrap().len(), 2);
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        fs::remove_file(project.join("docs/b.md")).unwrap();
+        reindex_all(&db).unwrap();
+        assert_eq!(db.search_files("new_marker", 10).unwrap().len(), 1);
+        assert!(db.search_files("old_marker", 10).unwrap().is_empty());
+        db.remove_shared_item(share).unwrap();
+        reindex_all(&db).unwrap();
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        assert!(db.get_item_by_id(share).unwrap().is_none());
+    }
+
+    // Run only in the subprocess below. The pipe is a deterministic barrier;
+    // the parent kills us while the transaction contains one directory child.
+    #[test]
+    fn reindex_crash_child() {
+        use std::io::{Read, Write};
+        let Some(path) = std::env::var_os("AI_WORKSPACE_REINDEX_TEST_DB") else {
+            return;
+        };
+        let db = Db::open(Path::new(&path)).unwrap();
+        reindex_all_with_progress(&db, |_| {
+            println!("REINDEX_PAUSED");
+            std::io::stdout().flush().unwrap();
+            let mut byte = [0];
+            std::io::stdin().read_exact(&mut byte).unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn mcp_reader_child() {
+        if std::env::var_os("AI_WORKSPACE_MCP_REBUILD_TEST").is_none() {
+            return;
+        }
+        let db = Db::open_default().unwrap();
+        let group_id = db.get_group_by_name("readers").unwrap().unwrap().id;
+        let scope = crate::mcp::McpScope::Group {
+            group_id,
+            project_ids: db
+                .get_projects_for_group(group_id)
+                .unwrap()
+                .into_iter()
+                .map(|project| project.id)
+                .collect(),
+        };
+        drop(db);
+        // Exercise the actual stdio server and its per-tool Db::open path.
+        crate::mcp::serve(scope).unwrap();
+    }
+
+    struct TestProcess(std::process::Child);
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn mcp_reads_and_searches_remain_available_during_actual_rebuild() {
+        use serde_json::{Value, json};
+        use std::io::{BufRead, BufReader, Write};
+        use std::process::{Command, Stdio};
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let root = TempDir::new().unwrap();
+        let (db_path, project, _) = rebuild_fixture(root.path());
+        for path in ["docs/a.md", "docs/b.md"] {
+            fs::write(project.join(path), "old_marker").unwrap();
+        }
+        let db = Db::open(&db_path).unwrap();
+        let pid = db.list_projects().unwrap()[0].id;
+        let group_id = db.get_or_create_group("readers").unwrap();
+        db.add_project_to_group(pid, group_id).unwrap();
+        let outsider = root.path().join("outsider");
+        fs::create_dir(&outsider).unwrap();
+        fs::write(outsider.join("private.md"), "old_marker private_marker").unwrap();
+        let outsider_id = db
+            .create_project("outsider", outsider.to_str().unwrap())
+            .unwrap();
+        db.share_file(outsider_id, "private.md", None).unwrap();
+        reindex_all(&db).unwrap();
+        drop(db);
+
+        let mut reader = TestProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "indexer::tests::mcp_reader_child", "--nocapture"])
+                .env("AI_WORKSPACE_DB", &db_path)
+                .env("AI_WORKSPACE_MCP_REBUILD_TEST", "1")
+                .env_remove("AI_WORKSPACE_ALLOW_PROJECT_WIDE_TOOLS")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = reader.0.stdout.take().unwrap();
+        let (sender, responses) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                // The Rust test harness may prefix the first JSON response.
+                if let Some(start) = line.find('{')
+                    && let Ok(response) = serde_json::from_str::<Value>(&line[start..])
+                    && sender.send(response).is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let mut call = |name: &str, arguments: Value| -> Value {
+            writeln!(
+                reader.0.stdin.as_mut().unwrap(),
+                "{}",
+                json!({
+                    "jsonrpc":"2.0", "id":1, "method":"tools/call",
+                    "params":{"name":name,"arguments":arguments}
+                })
+            )
+            .unwrap();
+            responses.recv_timeout(Duration::from_secs(10)).unwrap()
+        };
+        let search_args = json!({"query":"old_marker"});
+        let before = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(before["result"]["isError"], true, "{before}");
+        let hits: Value =
+            serde_json::from_str(before["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(hits.as_array().unwrap().len(), 2);
+        let hit = hits
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|hit| hit["path"] == "docs/a.md")
+            .unwrap();
+        let read_args = json!({"project_id":hit["project_id"],"rel_path":hit["path"],
+            "expected_content_hash":hit["content_hash"]});
+
+        let mut writer = TestProcess(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "indexer::tests::reindex_crash_child",
+                    "--nocapture",
+                ])
+                .env("AI_WORKSPACE_REINDEX_TEST_DB", &db_path)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let stdout = writer.0.stdout.take().unwrap();
+        let (sender, paused) = mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("REINDEX_PAUSED") {
+                    let _ = sender.send(());
+                    break;
+                }
+            }
+        });
+        paused.recv_timeout(Duration::from_secs(10)).unwrap();
+
+        let read = call("workspace_read", read_args.clone());
+        assert_ne!(read["result"]["isError"], true, "{read}");
+        assert_eq!(read["result"]["content"][0]["text"], "old_marker");
+        let during = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(during["result"]["isError"], true, "{during}");
+        assert_eq!(during["result"]["content"], before["result"]["content"]);
+        let projects = call("list_projects", json!({}));
+        assert_ne!(projects["result"]["isError"], true, "{projects}");
+        let denied = call(
+            "workspace_read",
+            json!({"project_id":outsider_id,"rel_path":"private.md"}),
+        );
+        assert_eq!(denied["result"]["isError"], true, "{denied}");
+
+        // Force refresh and pruning writes while the writer is still paused.
+        // Reads must remain available, and missing paths must still be filtered.
+        fs::write(project.join("docs/a.md"), "new_long_marker").unwrap();
+        fs::remove_file(project.join("docs/b.md")).unwrap();
+        let filtered = call("workspace_search_fulltext", search_args.clone());
+        assert_ne!(filtered["result"]["isError"], true, "{filtered}");
+        let filtered_hits: Value =
+            serde_json::from_str(filtered["result"]["content"][0]["text"].as_str().unwrap())
+                .unwrap();
+        assert_eq!(filtered_hits.as_array().unwrap().len(), 1);
+        assert_eq!(filtered_hits[0]["path"], "docs/a.md");
+        assert_eq!(filtered_hits[0]["content_hash"], hit["content_hash"]);
+        let stale = call("workspace_read", read_args);
+        assert_eq!(stale["result"]["isError"], true);
+        assert!(
+            stale["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("hash mismatch")
+        );
+
+        drop(writer); // Roll back the actual rebuild and release its writer lock.
+        let after = call(
+            "workspace_search_fulltext",
+            json!({"query":"new_long_marker"}),
+        );
+        assert_ne!(after["result"]["isError"], true, "{after}");
+        let after_hits: Value =
+            serde_json::from_str(after["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(after_hits.as_array().unwrap().len(), 1);
+        let old = call("workspace_search_fulltext", search_args);
+        assert_ne!(old["result"]["isError"], true, "{old}");
+        assert_eq!(old["result"]["content"][0]["text"], "[]");
+    }
+
+    #[test]
+    fn killed_directory_rebuild_keeps_committed_index() {
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        let root = TempDir::new().unwrap();
+        let (db_path, _, _) = rebuild_fixture(root.path());
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "indexer::tests::reindex_crash_child",
+                "--nocapture",
+            ])
+            .env("AI_WORKSPACE_REINDEX_TEST_DB", &db_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                if line.unwrap().contains("REINDEX_PAUSED") {
+                    sender.send(()).unwrap();
+                    break;
+                }
+            }
+        });
+        let paused = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        // Another connection must see the old complete index while the writer
+        // is paused with a partial replacement, not just after crash recovery.
+        let visible = (|| -> rusqlite::Result<(i64, i64)> {
+            let reader = rusqlite::Connection::open_with_flags(
+                &db_path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )?;
+            let count = |query: &str| {
+                reader.query_row(
+                    "SELECT COUNT(*) FROM files_fts WHERE files_fts MATCH ?1",
+                    [query],
+                    |row| row.get(0),
+                )
+            };
+            Ok((count("old_marker")?, count("new_marker")?))
+        })();
+        // Always reap the subprocess, including when the barrier fails.
+        child.kill().unwrap();
+        child.wait().unwrap();
+        paused.unwrap();
+        assert_eq!(visible.unwrap(), (2, 0));
+        let db = Db::open(&db_path).unwrap();
+        assert_eq!(db.search_files("old_marker", 10).unwrap().len(), 2);
+        assert!(db.search_files("new_marker", 10).unwrap().is_empty());
+        assert_eq!(reindex_all(&db).unwrap().indexed, 2);
+        assert_eq!(db.search_files("new_marker", 10).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn edit_during_rebuild_has_detectable_revision_drift() {
+        let root = TempDir::new().unwrap();
+        let (db_path, project, share) = rebuild_fixture(root.path());
+        let db = Db::open(&db_path).unwrap();
+        let mut edited = None;
+        reindex_all_with_progress(&db, |_| {
+            if edited.is_none() {
+                let (path, _, _, _) = db
+                    .list_indexed_files_for_item(share)?
+                    .into_iter()
+                    .next()
+                    .unwrap();
+                // Same length and explicitly preserved mtime: stat checks alone
+                // cannot establish that these are the indexed bytes.
+                let file_path = project.join(&path);
+                let modified = fs::metadata(&file_path)?.modified()?;
+                fs::write(&file_path, "end_marker")?;
+                fs::File::options()
+                    .write(true)
+                    .open(&file_path)?
+                    .set_times(fs::FileTimes::new().set_modified(modified))?;
+                edited = Some(path);
+            }
+            Ok(())
+        })
+        .unwrap();
+        let path = edited.unwrap();
+        let hit = db
+            .search_files("new_marker", 10)
+            .unwrap()
+            .into_iter()
+            .find(|hit| hit.path == path)
+            .unwrap();
+        assert_eq!(hit.content_hash, content_hash(b"new_marker"));
+        assert_ne!(
+            hit.content_hash,
+            content_hash(&fs::read(project.join(path)).unwrap())
+        );
     }
 
     #[test]

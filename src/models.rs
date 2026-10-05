@@ -330,6 +330,8 @@ pub struct FileSearchHit {
     pub project_id: i64,
     pub path: String,
     pub snippet: String,
+    /// SHA-256 of the indexed UTF-8 bytes, not a promise of current disk content.
+    pub content_hash: String,
     /// bm25 score — lower is better (SQLite FTS5 convention).
     pub rank: f64,
 }
