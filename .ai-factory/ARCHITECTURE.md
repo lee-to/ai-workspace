@@ -84,6 +84,23 @@ migrations/
 - **Hosted MCP**: HTTP MCP reads only token-derived tenant snapshots through a seven-tool positive allowlist. It never routes into local SQLite/filesystem handlers.
 
 ## Key Principles
+
+### Local process ownership
+
+`local` coordinates the local CLI and MCP presentation layers. One owner per
+canonical SQLite path holds `db::owner::OwnerGuard`; no application entry point
+may bypass a live owner. CLI invocations either hold this guard themselves or
+forward to the owner's serialized worker. The default stdio entry point is a
+bridge to that worker; HTTP clients connect directly without bridge processes.
+The hosted cloud service remains independent and never uses this local adapter.
+
+Each request installs a thread-local `execution::Context` for cwd and supported
+environment options. Never change process-global cwd or environment in server
+handlers. CLI output capture is also thread-local. Database operations remain
+in `db`, including the SQLite transaction used for cross-process ownership.
+The owner uses separate MCP scope/subscription state per connection and refreshes
+authorization against current database membership on every operation.
+
 1. **Models are plain data** — `models.rs` contains only structs, enums, and their serialization. No business logic, no database code.
 2. **Storage stays behind its module** — SQLite access goes through `db::Db`; PostgreSQL access goes through `cloud::store::CloudStore`. Presentation handlers contain no raw SQL.
 3. **Presentation layers are independent** — CLI and MCP never import from each other. They share behavior only through the Db layer.

@@ -8,6 +8,67 @@ The MCP server exposes shared workspace context to AI agents via JSON-RPC over s
 ai-workspace serve
 ```
 
+`serve` is a stdio compatibility bridge to one shared local owner per database.
+The first bridge starts the owner automatically; later bridges reuse it. Only
+the owner opens the application database and updates the index while it is
+running. CLI commands also forward their work to that owner. Without an owner,
+a CLI command holds the same exclusive workspace lock for its own lifetime.
+An automatically started owner exits after all connections close and five idle
+seconds. Stdio still requires one small bridge process per client.
+
+### Connect all clients to one process over HTTP
+
+To avoid the per-client bridge processes, run a local owner explicitly:
+
+```bash
+ai-workspace serve --http --bind 127.0.0.1:8765
+```
+
+Keep this process running and configure each HTTP-capable MCP client with the
+same URL, `http://127.0.0.1:8765/mcp`, and a `Bearer` authorization header. Obtain
+the token from the `token` field in the credentials file reported by:
+
+```bash
+ai-workspace local-status
+```
+
+This is the full local SQLite/filesystem MCP service, including the existing
+opt-in tools. It is separate from `cloud serve` and requires no PostgreSQL,
+OIDC provider, or cloud account. It implements Streamable HTTP protocol versions
+`2025-03-26`, `2025-06-18`, and `2025-11-25`, with independent sessions and event
+SSE streams. Clients must preserve the returned `Mcp-Session-Id` header and use
+DELETE `/mcp` when closing a session. A GET `/mcp` opens the session's SSE stream.
+Protocol `2026-07-28` is not advertised by this local endpoint.
+
+HTTP connections use the owner's configured scope and write opt-ins. For example,
+`serve --http --project api` restricts its MCP connections to that project.
+Existing stdio connections preserve each client's cwd, scope, and tool opt-ins;
+a bridge cannot request a scope outside an explicitly restricted owner.
+The bearer token grants local administrative access, including CLI forwarding:
+do not share it with untrusted clients. The listener accepts loopback addresses
+only and validates Host, Origin, and bearer credentials.
+
+A second owner for the same canonical database path exits with an
+`already running` message. Different databases can have independent owners;
+use different ports or `--bind 127.0.0.1:0` to select a free port. Paths resolving
+through symlinks to the same database share ownership. Do not use hard-linked
+aliases of a database file: ownership is keyed by its canonical path.
+
+The owner stores `<database>.instance.json` for local discovery and credentials,
+persists its token in `<database>.local-token` so configured clients can reconnect
+after a restart,
+and holds an OS-released SQLite exclusive transaction on
+`<database>.owner-lock`. Do not delete the lock file to unblock a live process.
+After a crash, a new owner acquires the released lock and replaces stale
+discovery data automatically. Keep the database directory private to your
+Windows account (or use private directory permissions on Unix).
+
+After upgrading from versions without shared ownership, restart existing MCP
+clients to retire their old `serve` processes. Configure clients with HTTP URLs
+to reduce the application to a single process; leaving their stdio configuration
+in place preserves one bridge per client. This change does not terminate existing
+sessions or rewrite client configuration automatically.
+
 This is the full local tool surface backed by SQLite and local files. The optional hosted service uses authenticated HTTP, PostgreSQL snapshots, and a separate positive allowlist of seven read-only tools; see [Cloud](cloud.md).
 
 ## Event resource subscriptions

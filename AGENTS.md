@@ -20,6 +20,10 @@ ai-workspace/
 ├── README.md               # Project landing page
 ├── src/
 │   ├── main.rs             # Entry point, clap App definition
+│   ├── execution.rs        # Request-local cwd, environment and CLI output capture
+│   ├── local/
+│   │   ├── mod.rs          # Owner discovery, CLI forwarding, stdio bridge
+│   │   └── server.rs       # Local HTTP MCP and serialized state-owner worker
 │   ├── models.rs           # Data models (Project, Group, SharedItem, SharedItemKind)
 │   ├── walk.rs             # File tree walker and grep (ignore + regex crates)
 │   ├── indexer.rs          # FTS5 indexer for shared .md files (mtime refresh, reindex)
@@ -38,6 +42,7 @@ ai-workspace/
 │   ├── db/
 │   │   ├── mod.rs          # DB module exports
 │   │   ├── schema.rs       # SQLite schema creation (tables, FTS5, triggers)
+│   │   ├── owner.rs        # Canonical DB identity and cross-process ownership lock
 │   │   └── crud.rs         # Database CRUD operations (Db struct)
 │   └── mcp/
 │       ├── mod.rs          # MCP server entry (stdio loop, request routing)
@@ -48,6 +53,7 @@ ai-workspace/
 │   └── 0001_cloud_read_model.sql # PostgreSQL JSONB/FTS tables and forced RLS
 ├── tests/
 │   ├── cli_tests.rs        # CLI integration tests
+│   ├── local_owner.rs      # Native owner election, HTTP/stdio sharing, recovery and access tests
 │   ├── cloud_push.rs       # Snapshot push/redaction integration tests
 │   ├── cloud_server.rs     # Cloud CLI/server boundary tests
 │   ├── fts_search.rs       # FTS5 fulltext search integration tests

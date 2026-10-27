@@ -2,7 +2,9 @@ mod cli;
 mod cloud;
 mod codegraph;
 mod db;
+mod execution;
 mod indexer;
+mod local;
 mod mcp;
 mod models;
 mod path;
@@ -13,7 +15,7 @@ use clap::Parser;
 use log::{debug, info};
 use std::path::PathBuf;
 
-#[derive(Parser)]
+#[derive(Parser, serde::Serialize, serde::Deserialize)]
 #[command(
     name = "ai-workspace",
     version,
@@ -34,7 +36,7 @@ fn main() -> Result<()> {
     let app = App::parse();
     debug!("Parsed command: {:?}", app.command);
 
-    cli::run(app.command, app.config)
+    local::run(app)
 }
 
 #[cfg(test)]

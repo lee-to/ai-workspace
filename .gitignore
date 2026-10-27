@@ -5,3 +5,7 @@
 .ai-factory/PLAN.md
 .env
 .env.*
+*.instance.json
+*.owner-lock
+*.owner-lock-journal
+*.local-token
