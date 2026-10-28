@@ -118,6 +118,7 @@ pub fn reindex_project(
     project: &Project,
     scope: CodeGraphScope,
 ) -> Result<CodeGraphRunStats> {
+    crate::context::verify_checkout(db, project.id)?;
     info!(
         "codegraph reindex start: project_id={} slug={} scope={:?}",
         project.id, project.slug, scope
@@ -132,6 +133,7 @@ pub fn sync_project(
     project: &Project,
     scope: CodeGraphScope,
 ) -> Result<CodeGraphRunStats> {
+    crate::context::verify_checkout(db, project.id)?;
     info!(
         "codegraph sync start: project_id={} slug={} scope={:?}",
         project.id, project.slug, scope
@@ -607,6 +609,47 @@ fn collect_candidate_files(
     }
 
     Ok(candidates.into_values().collect())
+}
+
+pub(crate) fn unindexed_candidates(
+    db: &Db,
+    project: &Project,
+    full_project: bool,
+) -> Result<Vec<String>> {
+    let scope = if full_project {
+        CodeGraphScope::FullProject
+    } else {
+        CodeGraphScope::SharedOnly
+    };
+    let indexed = db
+        .indexed_code_hashes(project.id)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect::<BTreeSet<_>>();
+    let candidates =
+        collect_candidate_files(db, project, scope, &mut CodeGraphRunStats::default())?;
+    let mut missing = Vec::new();
+    for candidate in candidates {
+        if !indexed.contains(&candidate.rel_path)
+            && std::fs::metadata(&candidate.abs_path)?.len() <= MAX_CODE_FILE_SIZE
+            && std::fs::read_to_string(&candidate.abs_path).is_ok()
+        {
+            missing.push(candidate.rel_path);
+        }
+    }
+    Ok(missing)
+}
+
+pub(crate) fn shared_source_paths(db: &Db, project: &Project) -> Result<BTreeSet<String>> {
+    Ok(collect_candidate_files(
+        db,
+        project,
+        CodeGraphScope::SharedOnly,
+        &mut CodeGraphRunStats::default(),
+    )?
+    .into_iter()
+    .map(|candidate| candidate.rel_path)
+    .collect())
 }
 
 fn parse_rust_source(
@@ -1105,7 +1148,12 @@ fn is_ignored_call_token(name: &str) -> bool {
     )
 }
 
-pub fn source_snippet(project: &Project, node: &CodeNode, context_lines: usize) -> Result<String> {
+pub fn source_snippet(
+    db: &Db,
+    project: &Project,
+    node: &CodeNode,
+    context_lines: usize,
+) -> Result<String> {
     let validated = validate_project_rel_path(Path::new(&project.path), &node.file_path)?;
     if !walk::path_allowed_by_options(Path::new(&validated.rel_path), WalkOptions::default()) {
         anyhow::bail!("codegraph source snippet blocked by path policy");
@@ -1116,6 +1164,12 @@ pub fn source_snippet(project: &Project, node: &CodeNode, context_lines: usize) 
             validated.canonical_path.display()
         )
     })?;
+    let (expected, _, _) = db
+        .get_code_file_meta(project.id, &node.file_path)?
+        .ok_or_else(|| anyhow::anyhow!("Stale CodeGraph index: source revision missing"))?;
+    if stable_hash_hex(content.as_bytes()) != expected {
+        anyhow::bail!("Stale CodeGraph index: source changed; run codegraph sync");
+    }
     let lines = content.lines().collect::<Vec<_>>();
     if lines.is_empty() {
         return Ok(String::new());
@@ -1149,7 +1203,7 @@ fn mtime_epoch(meta: &std::fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
-fn stable_hash_hex(bytes: &[u8]) -> String {
+pub(crate) fn stable_hash_hex(bytes: &[u8]) -> String {
     const FNV_OFFSET: u64 = 0xcbf29ce484222325;
     const FNV_PRIME: u64 = 0x100000001b3;
     let mut hash = FNV_OFFSET;

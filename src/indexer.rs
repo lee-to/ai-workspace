@@ -256,6 +256,9 @@ fn index_shared_item_with_progress(
     project_root: &Path,
     after_file: &mut impl FnMut(&IndexStats) -> Result<()>,
 ) -> Result<IndexStats> {
+    if let Some(project_id) = item.project_id {
+        crate::context::verify_checkout(db, project_id)?;
+    }
     let mut stats = IndexStats::default();
     match item.kind {
         SharedItemKind::File => {
@@ -509,6 +512,7 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
             refreshed += 1;
             continue;
         };
+        crate::context::verify_checkout(db, pid)?;
         let root = PathBuf::from(&project.path);
         let Some(rel) = item.path.as_deref() else {
             db.delete_indexed_file_by_id(indexed_file_id)?;
@@ -632,6 +636,7 @@ pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
             refreshed += 1;
             continue;
         };
+        crate::context::verify_checkout(db, project_id)?;
         let root = PathBuf::from(&project.path);
         let Some(rel) = item.path.as_deref() else {
             db.delete_file_index(hit.shared_item_id)?;

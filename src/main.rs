@@ -1,6 +1,7 @@
 mod cli;
 mod cloud;
 mod codegraph;
+mod context;
 mod db;
 mod execution;
 mod indexer;

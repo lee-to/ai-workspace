@@ -56,7 +56,7 @@ pub type IndexedFileMeta = (i64, i64, String, String, i64, i64);
 pub type SharedItemIndexedFileMeta = (String, String, i64, i64);
 
 pub struct Db {
-    conn: Connection,
+    pub(super) conn: Connection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,6 +310,10 @@ impl Db {
             })?;
         let id = self.conn.last_insert_rowid();
         info!("Created project id={} name='{}' slug='{}'", id, name, slug);
+        self.checkout_binding(id)?;
+        if Path::new(path).is_dir() {
+            self.verify_checkout(id)?;
+        }
         Ok(id)
     }
 
@@ -571,13 +575,27 @@ impl Db {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
 
-        Ok(projects
+        let selected = projects
             .into_iter()
             .filter(|project| {
                 let project_key = project_path_lookup_key(&project.path);
                 path_is_same_or_child(&cwd_key, &project_key)
             })
-            .max_by_key(|project| project_path_lookup_key(&project.path).len()))
+            .max_by_key(|project| project_path_lookup_key(&project.path).len());
+        if let Some(project) = &selected {
+            let root_key = project_path_lookup_key(&project.path);
+            for directory in Path::new(cwd).ancestors() {
+                if project_path_lookup_key(&directory.to_string_lossy()) == root_key {
+                    break;
+                }
+                if directory.join(".git").try_exists()? {
+                    anyhow::bail!(
+                        "Current directory belongs to an unregistered Git checkout; use worktree add explicitly"
+                    );
+                }
+            }
+        }
+        Ok(selected)
     }
 
     pub fn get_project_by_id(&self, id: i64) -> Result<Option<Project>> {
@@ -640,8 +658,12 @@ impl Db {
             return Ok(Some(project));
         }
 
+        if target.contains(['/', '\\']) || Path::new(target).is_absolute() {
+            return Ok(None);
+        }
         let slug = normalize_project_slug(target);
         if let Some(project) = self.get_project_by_slug(&slug)? {
+            self.require_unambiguous_checkout(project.id)?;
             return Ok(Some(project));
         }
 
@@ -4028,6 +4050,9 @@ impl Db {
 
         let mut hits = Vec::new();
         for (indexed_file_id, mut hit, item_kind, item_path, project_path, abs_path) in rows {
+            // A reused directory name must never make old index rows point at
+            // an unrelated replacement checkout. Do not prune history here.
+            self.verify_checkout(hit.project_id)?;
             let Ok(normalized_item_path) = normalize_portable_rel_path(&item_path) else {
                 if prune {
                     self.delete_file_index(hit.shared_item_id)?;

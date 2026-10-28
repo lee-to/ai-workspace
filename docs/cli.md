@@ -80,6 +80,53 @@ If the configured workspace JSON exists, `init` reads it and applies the config 
 
 **AI Factory preset:** `init --preset ai-factory` creates missing `.ai-factory/DESCRIPTION.md`, `.ai-factory/ARCHITECTURE.md`, and `.ai-factory/PLAN.md` files without overwriting existing content. It shares those files with the labels `ai-factory-description`, `ai-factory-architecture`, and `ai-factory-plan`. If `.ai-factory/references`, `.ai-factory/patches`, or `.ai-factory/specs` already exist, it shares those directories as `ai-factory-references`, `ai-factory-patches`, and `ai-factory-specs`; missing optional directories are skipped. Re-running the preset is idempotent.
 
+### `worktree add`, `worktree relocate` and `context`
+
+Each existing project ID continues to select one concrete checkout. Checkouts
+can share a `logical_project_id`, while retaining separate binding IDs, shares,
+groups, notes, indexes and history. To attach another checkout, run inside it:
+
+```bash
+ai-workspace worktree add --project sample --slug sample-feature
+ai-workspace share docs
+ai-workspace context
+```
+
+`worktree add` registers an existing directory; it does not create a Git worktree,
+load another checkout's config, join its groups, copy its history or share any
+files automatically. The optional slug must be unique. Association is explicit;
+the command also supports non-Git checkouts.
+
+Once a logical project has multiple checkouts, slug selectors require
+disambiguation: use a numeric project ID or exact registered checkout path.
+Commands without a selector continue to use the concrete checkout containing cwd.
+`ai-workspace context --project 2` prints JSON with the logical and binding IDs,
+Git commit (null for a non-Git/unborn checkout), SHA-256 source/share digests and
+`snapshot_id`, without absolute paths. Source digests cover safe shared files,
+including dirty bytes, independently of mtime or branch labels. A snapshot is
+bounded to 10,000 traversal entries, 64 path components and 64 MiB of source.
+An exceeded bound makes `context` return an error. Existing plain reads/searches
+remain available with `complete: false` metadata and no snapshot ID; they do not
+claim a complete current snapshot.
+
+Registrations keep an untracked `.ai-workspace-id` UUID marker in their root.
+Preserve it when moving the checkout; do not commit or copy it to a sibling.
+Existing registrations establish this marker on first local context access.
+A missing or mismatched marker after that is an error, including when another
+directory occupies the old path. Relocation requires an explicit command from
+the moved directory, with its original marker:
+
+```bash
+ai-workspace worktree relocate --project 2
+```
+
+The binding ID survives relocation, while the snapshot ID changes. An unrelated
+directory cannot be attached by relocation. Indexes refresh through the existing
+`reindex` / `codegraph sync` flows. CodeGraph reads reject modified, missing or
+new eligible source files until explicitly synchronized. CLI CodeGraph search
+uses current shared scopes by default; `codegraph search <query> --full-project`
+explicitly allows indexed source outside those shares.
+
 ### `share`
 
 Share a file or directory with all project groups.
