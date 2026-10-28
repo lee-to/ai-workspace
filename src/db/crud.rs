@@ -582,10 +582,16 @@ impl Db {
                 path_is_same_or_child(&cwd_key, &project_key)
             })
             .max_by_key(|project| project_path_lookup_key(&project.path).len());
-        if let Some(project) = &selected {
-            let root_key = project_path_lookup_key(&project.path);
-            for directory in Path::new(cwd).ancestors() {
-                if project_path_lookup_key(&directory.to_string_lossy()) == root_key {
+        // Lookup keys also support persisted Windows paths on Unix. Only probe
+        // the host filesystem when both paths resolve to a real native subtree;
+        // otherwise an empty relative ancestor would probe the process's .git.
+        if let Some(project) = &selected
+            && let Ok(native_cwd) = Path::new(cwd).canonicalize()
+            && let Ok(native_root) = Path::new(&project.path).canonicalize()
+            && native_cwd.starts_with(&native_root)
+        {
+            for directory in native_cwd.ancestors() {
+                if directory == native_root {
                     break;
                 }
                 if directory.join(".git").try_exists()? {
