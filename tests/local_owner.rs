@@ -65,7 +65,11 @@ impl Drop for Owner {
 
 impl Owner {
     fn start(db: &Path, cwd: &Path) -> Self {
-        let mut child = command(db, cwd)
+        Self::start_command(db, command(db, cwd))
+    }
+
+    fn start_command(db: &Path, mut launch: Command) -> Self {
+        let mut child = launch
             .args(["serve", "--http", "--bind", "127.0.0.1:0"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -140,18 +144,178 @@ impl Owner {
 }
 
 fn wait(child: &mut Child) -> std::process::ExitStatus {
+    wait_timeout(child, Duration::from_secs(15))
+}
+
+fn wait_timeout(child: &mut Child, timeout: Duration) -> std::process::ExitStatus {
     let start = Instant::now();
     loop {
         if let Some(status) = child.try_wait().unwrap() {
             return status;
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > timeout {
             child.kill().unwrap();
             child.wait().unwrap();
             panic!("child did not exit");
         }
         std::thread::sleep(Duration::from_millis(25));
     }
+}
+
+struct HangingPeer {
+    url: String,
+    accepted: std::sync::mpsc::Receiver<()>,
+    stop: std::sync::mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl HangingPeer {
+    fn start() -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (accepted_sender, accepted) = std::sync::mpsc::channel();
+        let (stop, stopped) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            loop {
+                if !matches!(
+                    stopped.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ) {
+                    break;
+                }
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _ = accepted_sender.send(());
+                        // Keep the peer open without an HTTP response. The real
+                        // cloud client must reach its production 30-second timeout.
+                        let _ = stopped.recv_timeout(Duration::from_secs(50));
+                        drop(stream);
+                        break;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback fixture: {error}"),
+                }
+            }
+        });
+        Self {
+            url,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for HangingPeer {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct ChildGuard(Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[test]
+fn healthy_bridges_survive_a_cloud_operation_longer_than_their_heartbeat_lease() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("workspace.db");
+    let _owner = Owner::start(&db, root.path());
+    cli(
+        &db,
+        root.path(),
+        &["init", "--name", "slow-owner", "--slug", "slow-owner"],
+    );
+    let mut first = Bridge::start(&db, root.path(), &[], false);
+    let mut second = Bridge::start(&db, root.path(), &[], false);
+    for bridge in [&mut first, &mut second] {
+        assert!(bridge.rpc("initialize")["result"].is_object());
+    }
+    let peer = HangingPeer::start();
+    let started = Instant::now();
+    let mut push = ChildGuard(
+        command(&db, root.path())
+            .args(["cloud", "push", "--url", &peer.url, "--workspace", "test"])
+            .env("AI_WORKSPACE_CLOUD_TOKEN", "isolated-test-token")
+            .env("NO_PROXY", "*")
+            .env("no_proxy", "*")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    peer.accepted
+        .recv_timeout(Duration::from_secs(10))
+        .expect("cloud push did not reach the loopback fixture");
+    assert!(!wait_timeout(&mut push.0, Duration::from_secs(45)).success());
+    assert!(started.elapsed() >= Duration::from_secs(30));
+    let mut error = String::new();
+    std::io::Read::read_to_string(&mut push.0.stderr.take().unwrap(), &mut error).unwrap();
+    assert!(
+        error.contains("Cloud push request failed"),
+        "unexpected failure: {error}"
+    );
+    for bridge in [&mut first, &mut second] {
+        assert!(
+            bridge.child.try_wait().unwrap().is_none(),
+            "healthy bridge was expired while the worker was busy"
+        );
+        assert!(bridge.rpc("tools/list")["result"].is_object());
+    }
+    first.eof();
+    second.eof();
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn unrelated_non_unicode_environment_does_not_break_owner_or_forwarded_cli() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("workspace.db");
+    #[cfg(unix)]
+    let invalid = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(vec![0xff])
+    };
+    #[cfg(windows)]
+    let invalid = {
+        use std::os::windows::ffi::OsStringExt;
+        std::ffi::OsString::from_wide(&[0xd800])
+    };
+    let seed = command(&db, root.path())
+        .env("UNRELATED_INVALID_UNICODE", &invalid)
+        .args(["init", "--name", "non-utf8-env", "--slug", "non-utf8-env"])
+        .output()
+        .unwrap();
+    assert!(
+        seed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&seed.stderr)
+    );
+    let mut launch = command(&db, root.path());
+    launch.env("UNRELATED_INVALID_UNICODE", &invalid);
+    let _owner = Owner::start_command(&db, launch);
+    let output = command(&db, root.path())
+        .env("UNRELATED_INVALID_UNICODE", invalid)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("non-utf8-env"));
 }
 
 #[test]

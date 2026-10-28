@@ -31,7 +31,16 @@ struct Session {
     pending: Vec<Value>,
     bridge: bool,
     version: String,
-    touched: Instant,
+    // Timestamp on the worker's available-time clock, not wall-clock time.
+    touched: Duration,
+}
+
+impl Session {
+    fn is_live(&self, available_time: Duration) -> bool {
+        available_time.saturating_sub(self.touched)
+            < Duration::from_secs(if self.bridge { 30 } else { 3600 })
+            || self.sender.receiver_count() > 0
+    }
 }
 
 enum Work {
@@ -151,7 +160,13 @@ fn fixed_context(mut context: Context, base: &Context) -> Context {
     context
 }
 
-fn new_session(scope: McpScope, context: Context, bridge: bool, version: String) -> Session {
+fn new_session(
+    scope: McpScope,
+    context: Context,
+    bridge: bool,
+    version: String,
+    available_time: Duration,
+) -> Session {
     let (sender, _) = broadcast::channel(128);
     Session {
         scope,
@@ -161,7 +176,7 @@ fn new_session(scope: McpScope, context: Context, bridge: bool, version: String)
         pending: Vec::new(),
         bridge,
         version,
-        touched: Instant::now(),
+        touched: available_time,
     }
 }
 
@@ -195,13 +210,18 @@ fn worker(
     }
     let _stop_on_exit = StopOnExit(shutdown.clone());
     let mut sessions = HashMap::<String, Session>::new();
-    let mut last_activity = Instant::now();
+    let mut available_time = Duration::ZERO;
+    let mut last_activity = Duration::ZERO;
     let mut next_poll = Instant::now() + Duration::from_secs(1);
     loop {
+        let waiting = Instant::now();
         let message = receiver.recv_timeout(next_poll.saturating_duration_since(Instant::now()));
+        // Heartbeats queue behind CLI/tools and subscription maintenance. None
+        // of that busy time may consume a client's lease (or owner idle time).
+        available_time = available_time.saturating_add(waiting.elapsed());
         match message {
             Ok(work) => {
-                last_activity = Instant::now();
+                last_activity = available_time;
                 match work {
                     Work::Stop => break,
                     Work::Cli(request, reply) => {
@@ -239,26 +259,40 @@ fn worker(
                             let id = uuid::Uuid::new_v4().to_string();
                             sessions.insert(
                                 id.clone(),
-                                new_session(scope, context, true, "2024-11-05".into()),
+                                new_session(
+                                    scope,
+                                    context,
+                                    true,
+                                    "2024-11-05".into(),
+                                    available_time,
+                                ),
                             );
                             Ok(id)
                         });
                         let _ = reply.send(result);
                     }
                     Work::Rpc(id, request, reply) => {
-                        let result = rpc_work(&mut sessions, &db, &base_scope, &base, id, request);
+                        let result = rpc_work(
+                            &mut sessions,
+                            &db,
+                            &base_scope,
+                            &base,
+                            id,
+                            request,
+                            available_time,
+                        );
                         let _ = reply.send(result);
                     }
                     Work::Poll(id, reply) => {
                         let result = sessions.get_mut(&id).filter(|s| s.bridge).map(|session| {
-                            session.touched = Instant::now();
+                            session.touched = available_time;
                             std::mem::take(&mut session.pending)
                         });
                         let _ = reply.send(result);
                     }
                     Work::Subscribe(id, reply) => {
                         let _ = reply.send(sessions.get_mut(&id).filter(|s| !s.bridge).map(|s| {
-                            s.touched = Instant::now();
+                            s.touched = available_time;
                             s.sender.subscribe()
                         }));
                     }
@@ -271,11 +305,7 @@ fn worker(
             Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
         if Instant::now() >= next_poll {
-            sessions.retain(|_, session| {
-                session.touched.elapsed()
-                    < Duration::from_secs(if session.bridge { 30 } else { 3600 })
-                    || session.sender.receiver_count() > 0
-            });
+            sessions.retain(|_, session| session.is_live(available_time));
             for session in sessions.values_mut() {
                 execution::with(&session.context, || {
                     if let (Ok(scope), Ok(current_base)) =
@@ -297,7 +327,7 @@ fn worker(
             next_poll = Instant::now() + Duration::from_secs(1);
             if idle_timeout > 0
                 && sessions.is_empty()
-                && last_activity.elapsed() >= Duration::from_secs(idle_timeout)
+                && available_time.saturating_sub(last_activity) >= Duration::from_secs(idle_timeout)
             {
                 let _ = shutdown.send(true);
                 break;
@@ -313,6 +343,7 @@ fn rpc_work(
     base: &Context,
     mut id: Option<String>,
     request: JsonRpcRequest,
+    available_time: Duration,
 ) -> RpcReply {
     let error = |status, message| RpcReply {
         response: Some(JsonRpcResponse::error(
@@ -346,7 +377,13 @@ fn rpc_work(
         let session_id = uuid::Uuid::new_v4().to_string();
         sessions.insert(
             session_id.clone(),
-            new_session(base_scope.clone(), base.clone(), false, version.into()),
+            new_session(
+                base_scope.clone(),
+                base.clone(),
+                false,
+                version.into(),
+                available_time,
+            ),
         );
         id = Some(session_id);
     }
@@ -367,7 +404,7 @@ fn rpc_work(
     {
         return error(StatusCode::BAD_REQUEST, "Invalid JSON-RPC envelope");
     }
-    session.touched = Instant::now();
+    session.touched = available_time;
     let initialize = request.method == "initialize";
     let mut response = execution::with(&session.context, || {
         match session.scope.refreshed(db).and_then(|scope| {
@@ -566,4 +603,40 @@ async fn events(State(state): State<HttpState>, headers: HeaderMap) -> Response 
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abandoned_sessions_still_expire_when_the_worker_is_available() {
+        let context = Context {
+            cwd: std::env::current_dir().unwrap(),
+            vars: HashMap::new(),
+        };
+        let mut bridge = new_session(
+            McpScope::Global,
+            context.clone(),
+            true,
+            "2024-11-05".into(),
+            Duration::from_secs(10),
+        );
+        assert!(bridge.is_live(Duration::from_secs(39)));
+        assert!(!bridge.is_live(Duration::from_secs(40)));
+        bridge.touched = Duration::from_secs(40);
+        assert!(bridge.is_live(Duration::from_secs(69)));
+        assert!(!bridge.is_live(Duration::from_secs(70)));
+        let http = new_session(
+            McpScope::Global,
+            context,
+            false,
+            VERSIONS[0].into(),
+            Duration::ZERO,
+        );
+        let listener = http.sender.subscribe();
+        assert!(http.is_live(Duration::from_secs(3600)));
+        drop(listener);
+        assert!(!http.is_live(Duration::from_secs(3600)));
+    }
 }
