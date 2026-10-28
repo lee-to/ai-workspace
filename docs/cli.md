@@ -2,6 +2,18 @@
 
 # CLI Reference
 
+## Shared local owner
+
+- `ai-workspace serve`: stdio bridge; automatically starts or joins the local owner for the selected database.
+- `ai-workspace serve --http --bind 127.0.0.1:8765`: run the shared local HTTP MCP owner in the foreground. Existing scope options apply.
+- `ai-workspace local-status`: show the active owner's PID, MCP URL, and credentials file path; never prints the token.
+
+Local CLI commands use the same workspace ownership lock. While an owner is
+running, they execute through it with the caller's working directory, config,
+and environment options. Commands are serialized with MCP operations. An
+unresponsive owner produces an error; the CLI does not bypass its lock.
+See [local HTTP setup](mcp-server.md#connect-all-clients-to-one-process-over-http).
+
 All commands are run as `ai-workspace <command>`.
 
 Global options:

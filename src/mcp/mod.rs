@@ -1,6 +1,6 @@
 pub(crate) mod protocol;
 pub(crate) mod resources;
-mod tools;
+pub(crate) mod tools;
 
 use anyhow::Result;
 use log::{debug, error, info};
@@ -96,11 +96,15 @@ fn handle_request(req: JsonRpcRequest) -> Option<JsonRpcResponse> {
     handle_request_with_scope(req, &McpScope::global())
 }
 
-fn handle_request_with_scope(req: JsonRpcRequest, scope: &McpScope) -> Option<JsonRpcResponse> {
+pub(crate) fn handle_request_with_scope(
+    req: JsonRpcRequest,
+    scope: &McpScope,
+) -> Option<JsonRpcResponse> {
     debug!("Handling method: {}", req.method);
 
     match req.method.as_str() {
         "initialize" => Some(handle_initialize(req.id)),
+        "ping" => Some(JsonRpcResponse::result(req.id, serde_json::json!({}))),
         "tools/list" => Some(handle_tools_list(req.id)),
         "tools/call" => Some(tools::handle_tool_call_scoped(req.id, req.params, scope)),
         _ if req.method.starts_with("notifications/") => {

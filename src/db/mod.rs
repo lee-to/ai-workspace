@@ -1,4 +1,5 @@
 mod crud;
+pub(crate) mod owner;
 mod schema;
 
 use rusqlite::{Connection, Error, ErrorCode, Transaction, TransactionBehavior};

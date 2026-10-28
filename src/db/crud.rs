@@ -159,7 +159,7 @@ fn sql_placeholders(count: usize) -> String {
 
 /// DB path: AI_WORKSPACE_DB env var, or ~/.ai-workspace/workspace.db
 pub fn default_db_path() -> Result<std::path::PathBuf> {
-    if let Ok(p) = std::env::var("AI_WORKSPACE_DB") {
+    if let Ok(p) = crate::execution::var("AI_WORKSPACE_DB") {
         debug!("Using AI_WORKSPACE_DB={}", p);
         let path = std::path::PathBuf::from(p);
         if let Some(parent) = path.parent() {

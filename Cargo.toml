@@ -33,7 +33,7 @@ regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "json", "rustls"] }
 sha2 = "0.10"
 sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio-rustls"] }
-self_update = { version = "1.0.0-rc.6", default-features = false, features = ["archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate", "github", "ureq", "rustls"] }
+self_update = { version = "1.3.3", default-features = false, features = ["archive-tar", "archive-zip", "compression-tar-gz", "compression-zip-deflate", "github", "ureq", "rustls"] }
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
 tower-http = { version = "0.6", features = ["timeout"] }

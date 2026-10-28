@@ -1,3 +1,8 @@
+macro_rules! println {
+    () => { crate::execution::println(format_args!("")) };
+    ($($arg:tt)*) => { crate::execution::println(format_args!($($arg)*)) };
+}
+
 use anyhow::{Context as _, Result, bail};
 use clap::{Subcommand, ValueEnum};
 use log::{debug, info, warn};
@@ -19,26 +24,26 @@ use crate::path::validate_config_share_path;
 const WORKSPACE_CONFIG_ENV: &str = "AI_WORKSPACE_CONFIG";
 const DEFAULT_WORKSPACE_CONFIG_FILE: &str = ".ai-workspace.json";
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum NoteScope {
     Project,
     Group,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum ListTarget {
     All,
     Projects,
     Groups,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum InitPreset {
     #[value(name = "ai-factory")]
     AiFactory,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliServiceLinkKind {
     #[value(name = "depends_on")]
     DependsOn,
@@ -55,7 +60,7 @@ impl From<CliServiceLinkKind> for ServiceLinkKind {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliArtifactDependencyKind {
     #[value(name = "references")]
     References,
@@ -78,7 +83,7 @@ impl From<CliArtifactDependencyKind> for ArtifactDependencyKind {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliArtifactReaction {
     #[value(name = "inspect")]
     Inspect,
@@ -90,7 +95,7 @@ pub enum CliArtifactReaction {
     RemoveReference,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliWorkspaceEventKind {
     #[value(name = "service_deleted")]
     ServiceDeleted,
@@ -110,7 +115,7 @@ impl From<CliWorkspaceEventKind> for WorkspaceEventKind {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliEventSeverity {
     #[value(name = "info")]
     Info,
@@ -133,7 +138,7 @@ impl From<CliEventSeverity> for EventSeverity {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliEventStatus {
     #[value(name = "open")]
     Open,
@@ -150,7 +155,7 @@ impl From<CliEventStatus> for EventStatus {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum)]
+#[derive(Debug, Clone, ValueEnum, serde::Serialize, serde::Deserialize)]
 pub enum CliMcpScope {
     #[value(name = "global")]
     Global,
@@ -184,7 +189,7 @@ impl From<CliArtifactReaction> for ArtifactReaction {
     }
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum LinkCommand {
     /// Add a directional service link
     Add {
@@ -212,7 +217,7 @@ pub enum LinkCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum ArtifactCommand {
     /// Mark a shared file or directory as depending on a service
     Depends {
@@ -244,7 +249,7 @@ pub enum ArtifactCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum EventCommand {
     /// Create a workspace event and calculate its impact
     Create {
@@ -292,7 +297,7 @@ pub enum EventCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum CodeGraphCommand {
     /// Rebuild the Rust code graph for a project
     Reindex {
@@ -334,7 +339,7 @@ pub enum CodeGraphCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum CloudCommand {
     /// Push the current project's synchronized snapshot
     Push {
@@ -359,7 +364,7 @@ pub enum CloudCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum Command {
     /// Initialize current directory as a project
     Init {
@@ -465,8 +470,17 @@ pub enum Command {
     Export,
     /// Sync: verify shared files/dirs exist, clean up stale entries, reconcile workspace JSON
     Sync,
-    /// Start MCP server (stdio transport)
+    /// Connect over stdio to the shared local MCP server, or host it over HTTP
     Serve {
+        /// Run the single local owner in the foreground (HTTP MCP)
+        #[arg(long)]
+        http: bool,
+        /// Loopback listen address for --http
+        #[arg(long, default_value = "127.0.0.1:8765", requires = "http")]
+        bind: String,
+        /// Stop an automatically started owner after this many idle seconds (0: never)
+        #[arg(long, default_value_t = 0, requires = "http", hide = true)]
+        idle_timeout: u64,
         /// MCP metadata/access scope (default: global, or AI_WORKSPACE_SCOPE)
         #[arg(long, value_enum)]
         scope: Option<CliMcpScope>,
@@ -477,6 +491,8 @@ pub enum Command {
         #[arg(long)]
         project: Option<String>,
     },
+    /// Show the active local owner's URL and credentials file
+    LocalStatus,
     /// Update ai-workspace to the latest version
     Update,
     /// Full-text search across indexed .md files
@@ -533,7 +549,7 @@ fn codegraph_scope(full_project: bool) -> crate::codegraph::CodeGraphScope {
 }
 
 fn current_project_dir() -> Result<std::path::PathBuf> {
-    let cwd = env::current_dir()?;
+    let cwd = crate::execution::cwd()?;
     match cwd.canonicalize() {
         Ok(path) => Ok(path),
         Err(err) => {
@@ -549,7 +565,7 @@ fn current_project_dir() -> Result<std::path::PathBuf> {
 
 fn normalize_config_override(cli_config_path: Option<PathBuf>) -> Result<Option<PathBuf>> {
     let Some(path) = cli_config_path else {
-        return match env::var_os(WORKSPACE_CONFIG_ENV) {
+        return match crate::execution::var_os(WORKSPACE_CONFIG_ENV) {
             Some(value) if value.is_empty() => bail!("{WORKSPACE_CONFIG_ENV} must not be empty"),
             Some(value) => Ok(Some(PathBuf::from(value))),
             None => Ok(None),
@@ -902,13 +918,13 @@ fn make_table_row(row: &[String], widths: &[usize]) -> String {
 }
 
 fn use_color_output() -> bool {
-    if matches!(env::var("NO_COLOR"), Ok(value) if !value.is_empty()) {
+    if matches!(crate::execution::var("NO_COLOR"), Ok(value) if !value.is_empty()) {
         return false;
     }
-    if matches!(env::var("CLICOLOR"), Ok(value) if value == "0") {
+    if matches!(crate::execution::var("CLICOLOR"), Ok(value) if value == "0") {
         return false;
     }
-    if matches!(env::var("CLICOLOR_FORCE"), Ok(value) if value != "0") {
+    if matches!(crate::execution::var("CLICOLOR_FORCE"), Ok(value) if value != "0") {
         return true;
     }
     std::io::stdout().is_terminal()
@@ -1553,6 +1569,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             scope,
             group,
             project,
+            ..
         } => {
             let request = crate::mcp::McpScopeRequest::from_cli_and_env(
                 scope.map(Into::into),
@@ -2110,7 +2127,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         return Ok(());
                     }
 
-                    let cwd_project = env::current_dir().ok().and_then(|cwd| {
+                    let cwd_project = crate::execution::cwd().ok().and_then(|cwd| {
                         db.find_project_by_cwd(&cwd.to_string_lossy())
                             .ok()
                             .flatten()
@@ -2777,6 +2794,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             }
         }
         Command::Cloud { .. } => unreachable!("cloud commands return before local dispatch"),
+        Command::LocalStatus => unreachable!("local status is handled before CLI dispatch"),
     }
 }
 
@@ -2789,13 +2807,13 @@ fn run_cloud(command: CloudCommand) -> Result<()> {
             workspace,
         } => {
             let url = url
-                .or_else(|| env::var("AI_WORKSPACE_CLOUD_URL").ok())
+                .or_else(|| crate::execution::var("AI_WORKSPACE_CLOUD_URL").ok())
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!("Cloud URL is required (--url or AI_WORKSPACE_CLOUD_URL)")
                 })?;
             let workspace = workspace
-                .or_else(|| env::var("AI_WORKSPACE_CLOUD_WORKSPACE").ok())
+                .or_else(|| crate::execution::var("AI_WORKSPACE_CLOUD_WORKSPACE").ok())
                 .filter(|value| !value.trim().is_empty())
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -2826,7 +2844,7 @@ fn run_cloud(command: CloudCommand) -> Result<()> {
         }
         CloudCommand::Serve { bind } => {
             let bind = bind
-                .or_else(|| env::var("AI_WORKSPACE_CLOUD_BIND").ok())
+                .or_else(|| crate::execution::var("AI_WORKSPACE_CLOUD_BIND").ok())
                 .unwrap_or_else(|| "127.0.0.1:8080".into());
             let config = crate::cloud::http::CloudServerConfig::new(
                 &bind,
@@ -2843,7 +2861,7 @@ fn run_cloud(command: CloudCommand) -> Result<()> {
 }
 
 fn required_cloud_env(name: &str) -> Result<String> {
-    env::var(name)
+    crate::execution::var(name)
         .ok()
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("{name} is required"))

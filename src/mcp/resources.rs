@@ -68,7 +68,7 @@ fn read(db: &Db, scope: &McpScope, uri: &str) -> Result<Value, McpError> {
 }
 
 #[derive(Default)]
-pub(super) struct EventResources {
+pub(crate) struct EventResources {
     subscriptions: BTreeMap<String, [u8; 32]>,
     data_version: Option<i64>,
 }

@@ -20,7 +20,7 @@ const ACCESS_DENIED_NOT_SHARED: &str = "Access denied: path is not shared";
 const ACCESS_DENIED_INVALID_PATH: &str = "Access denied: invalid path";
 const ACCESS_DENIED_SCOPE: &str = "Access denied: outside MCP scope";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum McpScopeKind {
     Global,
     CurrentProject,
@@ -51,7 +51,7 @@ impl McpScopeKind {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct McpScopeRequest {
     kind: McpScopeKind,
     group: Option<String>,
@@ -87,7 +87,7 @@ impl McpScopeRequest {
         let cli_group_set = cli_group.is_some();
         let cli_project_set = cli_project.is_some();
 
-        let env_scope = match std::env::var(MCP_SCOPE_ENV) {
+        let env_scope = match crate::execution::var(MCP_SCOPE_ENV) {
             Ok(value) if value.trim().is_empty() => {
                 return Err(format!("{MCP_SCOPE_ENV} must not be empty"));
             }
@@ -158,7 +158,7 @@ pub enum McpScope {
 
 impl McpScope {
     /// Keep the selected project/group identity, but enforce current membership.
-    pub(super) fn refreshed(&self, db: &Db) -> anyhow::Result<Self> {
+    pub(crate) fn refreshed(&self, db: &Db) -> anyhow::Result<Self> {
         Ok(match self {
             Self::Global => Self::Global,
             Self::Group { group_id, .. } => Self::Group {
@@ -185,7 +185,7 @@ impl McpScope {
         Self::Global
     }
 
-    pub(super) fn allows_project(&self, project_id: i64) -> bool {
+    pub(crate) fn allows_project(&self, project_id: i64) -> bool {
         match self {
             Self::Global => true,
             Self::Group { project_ids, .. } => project_ids.contains(&project_id),
@@ -250,7 +250,7 @@ impl McpScope {
 }
 
 fn env_var_non_empty(name: &str) -> Result<Option<String>, String> {
-    match std::env::var(name) {
+    match crate::execution::var(name) {
         Ok(value) if value.trim().is_empty() => Err(format!("{name} must not be empty")),
         Ok(value) => Ok(Some(value)),
         Err(_) => Ok(None),
@@ -312,7 +312,7 @@ pub fn resolve_scope(db: &Db, request: McpScopeRequest) -> Result<McpScope, Stri
     match request.kind {
         McpScopeKind::Global => Ok(McpScope::Global),
         McpScopeKind::CurrentProject => {
-            let cwd = std::env::current_dir()
+            let cwd = crate::execution::cwd()
                 .map_err(|e| format!("Failed to resolve current directory: {e}"))?;
             let cwd = cwd
                 .canonicalize()
@@ -378,7 +378,10 @@ struct SharedPathScope {
 }
 
 fn project_wide_tools_enabled() -> bool {
-    let enabled = std::env::var(PROJECT_WIDE_TOOLS_ENV).ok().as_deref() == Some("1");
+    let enabled = crate::execution::var(PROJECT_WIDE_TOOLS_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
     if enabled {
         debug!(
             "{}=1; project-wide MCP tools enabled",
@@ -389,7 +392,10 @@ fn project_wide_tools_enabled() -> bool {
 }
 
 pub(crate) fn project_file_write_enabled() -> bool {
-    let enabled = std::env::var(PROJECT_FILE_WRITE_ENV).ok().as_deref() == Some("1");
+    let enabled = crate::execution::var(PROJECT_FILE_WRITE_ENV)
+        .ok()
+        .as_deref()
+        == Some("1");
     if enabled {
         debug!(
             "{}=1; project_file_write MCP tool enabled",
