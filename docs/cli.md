@@ -112,8 +112,10 @@ claim a complete current snapshot.
 Registrations keep an untracked `.ai-workspace-id` UUID marker in their root.
 Preserve it when moving the checkout; do not commit or copy it to a sibling.
 Existing registrations establish this marker on first local context access.
-A missing or mismatched marker after that is an error, including when another
-directory occupies the old path. Relocation requires an explicit command from
+A missing or mismatched marker after that prevents direct source access, including
+when another directory occupies the old path. Workspace searches omit unavailable
+checkouts while preserving their historical index rows and continue searching
+healthy sources. Relocation requires an explicit command from
 the moved directory, with its original marker:
 
 ```bash

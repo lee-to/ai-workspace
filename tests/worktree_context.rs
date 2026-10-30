@@ -375,7 +375,7 @@ fn relocation_and_reused_path_never_rebind_implicitly() {
         ),
         "Checkout identity",
     );
-    assert!(!cli(&db, &a, &["search", "alpha_marker"]).status.success());
+    assert!(ok(&db, &a, &["search", "alpha_marker"]).contains("No matches"));
     let relocated: Value = serde_json::from_str(&ok(
         &db,
         &moved,
@@ -491,4 +491,149 @@ fn unregistered_nested_worktree_cannot_inherit_its_parents_context() {
         serde_json::from_str(&ok(&db, &b, &["worktree", "add", "--project", "sample"])).unwrap();
     assert_eq!(before["logical_project_id"], attached["logical_project_id"]);
     assert_ne!(before["binding_id"], context(&db, &b)["binding_id"]);
+}
+
+#[test]
+fn unavailable_checkout_does_not_block_other_projects_or_rewrite_its_index() {
+    let root = tempfile::tempdir().unwrap();
+    let (db, a) = seed(root.path());
+    std::fs::write(a.join("extra.md"), "unindexed_a_marker").unwrap();
+    ok(&db, &a, &["share", "extra.md"]);
+    let a_id = context(&db, &a)["project_id"].as_i64().unwrap();
+    let b = root.path().join("b");
+    std::fs::create_dir_all(b.join("docs")).unwrap();
+    std::fs::write(b.join("docs/b.md"), "alpha_marker beta_marker").unwrap();
+    ok(&db, &b, &["init", "--slug", "b"]);
+    ok(&db, &b, &["share", "docs"]);
+    let b_id = context(&db, &b)["project_id"].as_i64().unwrap();
+    let conn = Connection::open(&db).unwrap();
+    conn.execute("DELETE FROM indexed_files WHERE shared_item_id IN (SELECT id FROM shared_items WHERE project_id = ?1 AND path = 'extra.md')", [a_id]).unwrap();
+    let a_index = || -> Vec<(i64, String, String)> {
+        conn.prepare("SELECT i.id, i.abs_path, f.content FROM indexed_files i JOIN files_fts f ON f.rowid = i.id JOIN shared_items s ON s.id = i.shared_item_id WHERE s.project_id = ?1 ORDER BY i.id")
+            .unwrap().query_map([a_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let original_index = a_index();
+    assert_eq!(original_index.len(), 1);
+    std::fs::write(a.join("docs/a.md"), "changed_a_marker").unwrap();
+    let mut scoped = Client::start(&db, &b, &["--project", "b"]);
+    let mut global = Client::start(&db, &b, &[]);
+    let search = |client: &mut Client| {
+        let hits = value(client.call("workspace_search_fulltext", json!({"query":"alpha_marker"})));
+        assert_eq!(hits.as_array().unwrap().len(), 1, "{hits}");
+        assert_eq!(hits[0]["project_id"], b_id);
+        assert!(hits[0]["snippet"].as_str().unwrap().contains("beta_marker"));
+    };
+    // Even a healthy out-of-scope A must not be refreshed or newly indexed.
+    search(&mut scoped);
+    assert_eq!(a_index(), original_index);
+    let marker = std::fs::read_to_string(a.join(".ai-workspace-id")).unwrap();
+    let moved = root.path().join("moved-a");
+    for state in ["moved", "missing-marker", "mismatched-marker"] {
+        match state {
+            "moved" => std::fs::rename(&a, &moved).unwrap(),
+            "missing-marker" => {
+                std::fs::rename(a.join(".ai-workspace-id"), a.join(".saved-id")).unwrap()
+            }
+            _ => std::fs::write(a.join(".ai-workspace-id"), uuid::Uuid::new_v4().to_string())
+                .unwrap(),
+        }
+        search(&mut scoped);
+        search(&mut global);
+        assert!(ok(&db, &b, &["search", "alpha_marker"]).contains("beta_marker"));
+        let denied_a = global.call(
+            "workspace_read",
+            json!({"project_id":a_id,"rel_path":"docs/a.md"}),
+        );
+        assert_eq!(denied_a["result"]["isError"], true, "{state}: {denied_a}");
+        assert_eq!(a_index(), original_index, "{state}");
+        // The previous committed index must also remain searchable while a
+        // writer owns the refresh lock. Unavailable A cannot poison this path.
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        search(&mut global);
+        conn.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(a_index(), original_index);
+        match state {
+            "moved" => std::fs::rename(&moved, &a).unwrap(),
+            "missing-marker" => {
+                std::fs::rename(a.join(".saved-id"), a.join(".ai-workspace-id")).unwrap()
+            }
+            _ => std::fs::write(a.join(".ai-workspace-id"), &marker).unwrap(),
+        }
+    }
+}
+
+#[test]
+fn codegraph_visibility_is_applied_before_the_result_limit() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("workspace.db");
+    let project = root.path().join("p");
+    std::fs::create_dir(&project).unwrap();
+    // More hidden matches than the MCP oversampling cap, all ranked before
+    // the shared symbol. A larger fetch limit is not a visibility filter.
+    let hidden = (0..220)
+        .map(|n| format!("pub fn aaa_marker_{n:03}() {{}}\n"))
+        .collect::<String>();
+    std::fs::write(project.join("hidden.rs"), hidden).unwrap();
+    std::fs::write(project.join("visible.rs"), "pub fn zzz_marker_000() {}\n").unwrap();
+    ok(&db, &project, &["init", "--slug", "p"]);
+    ok(&db, &project, &["share", "visible.rs"]);
+    ok(&db, &project, &["codegraph", "reindex", "--full-project"]);
+    let id = context(&db, &project)["project_id"].clone();
+    let limited = ok(
+        &db,
+        &project,
+        &["codegraph", "search", "marker", "--limit", "1"],
+    );
+    assert!(limited.contains("zzz_marker"), "{limited}");
+    assert!(!limited.contains("aaa_marker"), "{limited}");
+    let all = ok(
+        &db,
+        &project,
+        &["codegraph", "search", "marker", "--limit", "20"],
+    );
+    assert!(
+        all.contains("zzz_marker") && !all.contains("aaa_marker"),
+        "{all}"
+    );
+    let explicit = ok(
+        &db,
+        &project,
+        &[
+            "codegraph",
+            "search",
+            "marker",
+            "--limit",
+            "1",
+            "--full-project",
+        ],
+    );
+    assert!(explicit.contains("aaa_marker"), "{explicit}");
+    let mut client = Client::start(&db, &project, &[]);
+    for query in [json!("marker"), json!(null)] {
+        let hits = value(client.call(
+            "codegraph_search",
+            json!({"project_id":id,"query":query,"kind":"function","limit":1}),
+        ));
+        assert_eq!(hits.as_array().unwrap().len(), 1, "{hits}");
+        assert_eq!(hits[0]["name"], "zzz_marker_000");
+    }
+    ok(&db, &project, &["rm", "visible.rs"]);
+    assert!(
+        ok(
+            &db,
+            &project,
+            &["codegraph", "search", "marker", "--limit", "1"]
+        )
+        .contains("No CodeGraph matches")
+    );
+    assert!(
+        value(client.call(
+            "codegraph_search",
+            json!({"project_id":id,"query":"marker","limit":1})
+        ))
+        .as_array()
+        .unwrap()
+        .is_empty()
+    );
 }

@@ -88,6 +88,12 @@ current source. This is also explicit during the read-only fallback while an
 index rebuild is active. CLI full-text output includes checkout ID, snapshot ID
 and stale state.
 
+Lazy index refresh is limited to the session's permitted checkouts, with scope
+filtering before its scan limit. Unavailable checkouts are omitted from searches
+without pruning their historical index rows or blocking healthy sources. Direct
+reads still reject unavailable bindings. CodeGraph applies current source-path
+visibility before ranking and limiting results in both CLI and MCP searches.
+
 Successful local file reads and CodeGraph results include the same context in
 the MCP result's `_meta.ai_workspace`, preserving existing text/JSON payloads.
 Complete contexts carry `complete: true`. If shared-source traversal exceeds

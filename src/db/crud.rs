@@ -3001,29 +3001,42 @@ impl Db {
 
     /// List all indexed files (for reindex / refresh passes).
     /// Returns (indexed_file_id, shared_item_id, rel_path, abs_path, mtime, size).
-    pub fn list_file_index_meta(&self, limit: usize) -> Result<Vec<IndexedFileMeta>> {
+    pub fn list_file_index_meta(
+        &self,
+        limit: usize,
+        project_ids: &[i64],
+    ) -> Result<Vec<IndexedFileMeta>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, shared_item_id, rel_path, abs_path, mtime, size
-             FROM indexed_files
-             ORDER BY id
+            "SELECT i.id, i.shared_item_id, i.rel_path, i.abs_path, i.mtime, i.size
+             FROM indexed_files i
+             JOIN shared_items s ON s.id = i.shared_item_id
+             WHERE s.project_id IN (SELECT value FROM json_each(?2))
+             ORDER BY i.id
              LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], |r| {
-            Ok((
-                r.get::<_, i64>(0)?,
-                r.get::<_, i64>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, i64>(4)?,
-                r.get::<_, i64>(5)?,
-            ))
-        })?;
+        let rows = stmt.query_map(
+            params![limit as i64, serde_json::to_string(project_ids)?],
+            |r| {
+                Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )?;
         let out = rows.collect::<Result<Vec<_>, _>>()?;
         Ok(out)
     }
 
     /// List file/dir shared items that have no indexed file rows yet.
-    pub fn list_unindexed_file_items(&self, limit: usize) -> Result<Vec<SharedItem>> {
+    pub fn list_unindexed_file_items(
+        &self,
+        limit: usize,
+        project_ids: &[i64],
+    ) -> Result<Vec<SharedItem>> {
         let mut stmt = self.conn.prepare(
             "SELECT si.id,
                     si.kind,
@@ -3037,6 +3050,7 @@ impl Db {
                     si.updated_at
              FROM shared_items si
              WHERE (si.kind = 'dir' OR (si.kind = 'file' AND lower(si.path) LIKE '%.md'))
+               AND si.project_id IN (SELECT value FROM json_each(?2))
                AND NOT EXISTS (
                    SELECT 1
                    FROM indexed_files i
@@ -3045,7 +3059,10 @@ impl Db {
              ORDER BY si.id
              LIMIT ?1",
         )?;
-        self.map_shared_items(&mut stmt, params![limit as i64])
+        self.map_shared_items(
+            &mut stmt,
+            params![limit as i64, serde_json::to_string(project_ids)?],
+        )
     }
 
     /// List indexed files for one shared item.
@@ -3564,10 +3581,12 @@ impl Db {
         })
     }
 
+    /// Apply current source visibility in SQL, before ranking/limiting results.
     pub fn search_code_nodes(
         &self,
         project_id: i64,
         search: &CodeNodeSearch,
+        paths: Option<&[String]>,
     ) -> Result<Vec<CodeGraphSearchHit>> {
         debug!(
             "codegraph search: project_id={} query={:?} kind={:?} language={:?} file_path={:?} limit={}",
@@ -3592,6 +3611,10 @@ impl Db {
                 Box::new(project_id),
                 Box::new(Self::sanitize_fts_query(query)),
             ];
+            if let Some(paths) = paths {
+                conditions.push("n.file_path IN (SELECT value FROM json_each(?))".to_string());
+                values.push(Box::new(serde_json::to_string(paths)?));
+            }
             if let Some(kind) = search.kind {
                 conditions.push("n.kind = ?".to_string());
                 values.push(Box::new(kind.as_str().to_string()));
@@ -3633,6 +3656,10 @@ impl Db {
 
         let mut conditions = vec!["project_id = ?".to_string()];
         let mut values: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(project_id)];
+        if let Some(paths) = paths {
+            conditions.push("file_path IN (SELECT value FROM json_each(?))".to_string());
+            values.push(Box::new(serde_json::to_string(paths)?));
+        }
         if let Some(kind) = search.kind {
             conditions.push("kind = ?".to_string());
             values.push(Box::new(kind.as_str().to_string()));
@@ -3978,6 +4005,11 @@ impl Db {
         if project_ids.is_some_and(|ids| ids.is_empty()) {
             return Ok(Vec::new());
         }
+        let available = self.available_checkout_ids(project_ids)?;
+        if available.is_empty() {
+            return Ok(Vec::new());
+        }
+        let project_ids = Some(available.as_slice());
         let fetch_limit = limit.saturating_mul(4).max(limit.saturating_add(16));
         let mut sql = String::from(
             "SELECT i.id, \
@@ -4058,7 +4090,13 @@ impl Db {
         for (indexed_file_id, mut hit, item_kind, item_path, project_path, abs_path) in rows {
             // A reused directory name must never make old index rows point at
             // an unrelated replacement checkout. Do not prune history here.
-            self.verify_checkout(hit.project_id)?;
+            if let Err(e) = self.verify_checkout(hit.project_id) {
+                warn!(
+                    "Skipping unavailable checkout {} during search: {}",
+                    hit.project_id, e
+                );
+                continue;
+            }
             let Ok(normalized_item_path) = normalize_portable_rel_path(&item_path) else {
                 if prune {
                     self.delete_file_index(hit.shared_item_id)?;

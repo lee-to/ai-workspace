@@ -2166,8 +2166,13 @@ fn workspace_search_fulltext_scoped(
     // Reserve the writer without waiting before lazy refresh or pruning. A
     // rebuild must not prevent searching the previous committed index. The
     // fallback still validates current shares, canonical paths and path policy.
+    let allowed = scope.allowed_project_ids();
+    let projects = match db.available_checkout_ids(allowed.as_deref()) {
+        Ok(projects) => projects,
+        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+    };
     let refreshed = db.try_refresh_file_index(|| {
-        crate::indexer::refresh_stale(db, 200)?;
+        crate::indexer::refresh_stale_for_projects(db, 200, &projects)?;
         let mut hits = search_files_for_scope(db, query, limit, scope, false)?;
         if crate::indexer::refresh_search_hits(db, &hits)? > 0 {
             hits = search_files_for_scope(db, query, limit, scope, false)?;
@@ -3077,9 +3082,7 @@ fn search_visible_code_nodes(
         search.limit.min(200)
     };
     let mut scoped_search = search.clone();
-    scoped_search.limit = requested_limit
-        .saturating_mul(8)
-        .clamp(requested_limit, 200);
+    scoped_search.limit = requested_limit;
     if let Some(file_path) = search.file_path.as_deref() {
         let normalized = normalize_rel_path(file_path)?;
         if !visibility.path_visible(&normalized) {
@@ -3088,8 +3091,9 @@ fn search_visible_code_nodes(
         scoped_search.file_path = Some(normalized);
     }
 
+    let visible_paths = visibility.visible_file_paths(db)?;
     let hits = db
-        .search_code_nodes(project_id, &scoped_search)
+        .search_code_nodes(project_id, &scoped_search, Some(&visible_paths))
         .map_err(|err| err.to_string())?;
     Ok(hits
         .into_iter()

@@ -2842,7 +2842,8 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         .with_context(|| {
                             "Invalid --kind. Expected one of: file, module, struct, enum, trait, impl, function, method, const, type_alias, import"
                         })?;
-                    let mut hits = db.search_code_nodes(
+                    let allowed_paths = shared_paths.into_iter().collect::<Vec<_>>();
+                    let hits = db.search_code_nodes(
                         project.id,
                         &crate::models::CodeNodeSearch {
                             query: Some(query.clone()),
@@ -2851,8 +2852,12 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                             file_path: None,
                             limit,
                         },
+                        if full_project {
+                            None
+                        } else {
+                            Some(&allowed_paths)
+                        },
                     )?;
-                    hits.retain(|hit| full_project || shared_paths.contains(&hit.node.file_path));
                     if hits.is_empty() {
                         warn!(
                             "codegraph search returned no results: project_slug='{}' query='{}'",

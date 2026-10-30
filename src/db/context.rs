@@ -19,6 +19,26 @@ fn read_marker(root: &Path) -> Result<String> {
 }
 
 impl Db {
+    /// Search maintenance may skip unavailable bindings, but must never read
+    /// their source or discard their historical index rows.
+    pub(crate) fn available_checkout_ids(&self, permitted: Option<&[i64]>) -> Result<Vec<i64>> {
+        let mut available = Vec::new();
+        for project in self.list_projects()? {
+            if permitted.is_some_and(|ids| !ids.contains(&project.id)) {
+                continue;
+            }
+            match self.verify_checkout(project.id) {
+                Ok(_) => available.push(project.id),
+                Err(e) => log::warn!(
+                    "Skipping unavailable checkout {} during search: {}",
+                    project.id,
+                    e
+                ),
+            }
+        }
+        Ok(available)
+    }
+
     pub(crate) fn verify_checkout(&self, project_id: i64) -> Result<PathBuf> {
         let project = self
             .get_project_by_id(project_id)?
