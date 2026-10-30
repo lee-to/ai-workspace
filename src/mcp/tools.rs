@@ -430,9 +430,8 @@ fn resolve_project_root(project_id: i64, db: &Db) -> Result<(PathBuf, PathBuf), 
         .ok_or_else(|| format!("Project {} not found", project_id))?;
 
     let root = PathBuf::from(&project.path);
-    let canonical_root = root
-        .canonicalize()
-        .map_err(|e| format!("Cannot resolve project path: {}", e))?;
+    let canonical_root =
+        crate::context::verify_checkout(db, project_id).map_err(|e| e.to_string())?;
 
     Ok((root, canonical_root))
 }
@@ -631,12 +630,19 @@ impl CodeGraphVisibility {
         } else {
             shared_path_scopes(project_id, &canonical_root, db)?
         };
-        Ok(Self {
+        let visibility = Self {
             project_id,
             canonical_root,
             project_wide,
             scopes,
+        };
+        crate::context::validate_code_index(db, project_id, visibility.project_wide, |path| {
+            walk::path_allowed_by_options(Path::new(path), Default::default())
+                && (visibility.project_wide
+                    || find_shared_scope(path, &visibility.scopes).is_some())
         })
+        .map_err(|e| e.to_string())?;
+        Ok(visibility)
     }
 
     fn path_visible(&self, rel_path: &str) -> bool {
@@ -684,6 +690,108 @@ pub fn handle_tool_call_scoped(
     params: serde_json::Value,
     scope: &McpScope,
 ) -> JsonRpcResponse {
+    let name = params["name"].as_str().unwrap_or("");
+    let args = &params["arguments"];
+    if name != "workspace_read" && !name.starts_with("codegraph_") {
+        return handle_tool_call_scoped_inner(id, params, scope);
+    }
+    if name == "workspace_read" {
+        let item = args["item_id"].as_i64();
+        let project = args["project_id"].as_i64();
+        let path = args["rel_path"].as_str();
+        if (item.is_some() && (project.is_some() || path.is_some()))
+            || (item.is_none() && (project.is_none() || path.is_none()))
+        {
+            return handle_tool_call_scoped_inner(id, params, scope);
+        }
+        if args.get("expected_snapshot_id").is_some() && item.is_some() {
+            return JsonRpcResponse::error(
+                id,
+                McpError::invalid_params("expected_snapshot_id requires project_id+rel_path"),
+            );
+        }
+    }
+    let db = match open_db() {
+        Ok(db) => db,
+        Err(e) => return tool_error(id, &e),
+    };
+    let project_id = if name.starts_with("codegraph_") {
+        codegraph_project_id_from_args_scoped(args, &db, scope).ok()
+    } else if let Some(item_id) = args["item_id"].as_i64() {
+        db.get_item_by_id(item_id)
+            .ok()
+            .flatten()
+            .filter(|item| scope.allows_item(item) && item.kind != SharedItemKind::Note)
+            .and_then(|item| item.project_id)
+    } else {
+        args["project_id"]
+            .as_i64()
+            .filter(|pid| scope.allows_project(*pid))
+    };
+    let Some(project_id) = project_id else {
+        return handle_tool_call_scoped_inner(id, params, scope);
+    };
+    let before = crate::context::capture(&db, project_id);
+    let mut response = handle_tool_call_scoped_inner(id.clone(), params.clone(), scope);
+    // Preserve authorization/parameter errors. A snapshot never authorizes a read.
+    if response.error.is_some()
+        || response
+            .result
+            .as_ref()
+            .is_some_and(|r| r["isError"] == true)
+    {
+        return response;
+    }
+    let checked = (|| -> anyhow::Result<crate::context::SourceContext> {
+        let before = before?;
+        if let Some(expected) = args.get("expected_snapshot_id") {
+            let expected = expected
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("expected_snapshot_id must be a string"))?;
+            if expected != before.snapshot_id {
+                anyhow::bail!(
+                    "Stale context: checkout, source or share configuration changed; request fresh context"
+                );
+            }
+        }
+        let after = crate::context::capture(&db, project_id)?;
+        if before.snapshot_id != after.snapshot_id {
+            anyhow::bail!(
+                "Stale context: source changed during the read; retry with fresh context"
+            );
+        }
+        Ok(after)
+    })();
+    match checked {
+        Ok(context) => {
+            if let Some(result) = response.result.as_mut() {
+                result["_meta"]["ai_workspace"] = serde_json::json!(context);
+            }
+            response
+        }
+        Err(e)
+            if e.is::<crate::context::SnapshotLimit>()
+                && args.get("expected_snapshot_id").is_none() =>
+        {
+            match crate::context::incomplete_context(&db, project_id) {
+                Ok(context) => {
+                    if let Some(result) = response.result.as_mut() {
+                        result["_meta"]["ai_workspace"] = context;
+                    }
+                    response
+                }
+                Err(e) => tool_error(id, &e.to_string()),
+            }
+        }
+        Err(e) => tool_error(id, &e.to_string()),
+    }
+}
+
+fn handle_tool_call_scoped_inner(
+    id: serde_json::Value,
+    params: serde_json::Value,
+    scope: &McpScope,
+) -> JsonRpcResponse {
     let tool_name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
     let arguments = params
         .get("arguments")
@@ -694,6 +802,23 @@ pub fn handle_tool_call_scoped(
     debug!("Tool arguments: {}", arguments);
 
     match tool_name {
+        "project_context" => {
+            let db = match open_db() {
+                Ok(db) => db,
+                Err(e) => return tool_error(id, &e),
+            };
+            let pid = match codegraph_project_id_from_args_scoped(&arguments, &db, scope) {
+                Ok(pid) => pid,
+                Err(e) => return tool_error(id, &e),
+            };
+            match crate::context::capture(&db, pid) {
+                Ok(context) => tool_result(
+                    id,
+                    serde_json::to_string_pretty(&context).unwrap_or_default(),
+                ),
+                Err(e) => tool_error(id, &e.to_string()),
+            }
+        }
         "workspace_context" => {
             let db = match open_db() {
                 Ok(db) => db,
@@ -1609,6 +1734,9 @@ fn workspace_context_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) ->
                     .collect::<Vec<_>>()
             })).collect::<Vec<_>>()
         });
+        if let Err(e) = add_checkout_identity(&mut project, p.id, db) {
+            return tool_error(id, &e.to_string());
+        }
         if include_project_paths {
             project["path"] = serde_json::json!(p.path);
         }
@@ -1825,6 +1953,9 @@ fn workspace_read_scoped(
     }
 
     let project_root = Path::new(&project.path);
+    if let Err(e) = crate::context::verify_checkout(db, project.id) {
+        return tool_error(id, &e.to_string());
+    }
     let full_path = project_root.join(rel_path);
 
     // Path traversal protection
@@ -2035,8 +2166,13 @@ fn workspace_search_fulltext_scoped(
     // Reserve the writer without waiting before lazy refresh or pruning. A
     // rebuild must not prevent searching the previous committed index. The
     // fallback still validates current shares, canonical paths and path policy.
+    let allowed = scope.allowed_project_ids();
+    let projects = match db.available_checkout_ids(allowed.as_deref()) {
+        Ok(projects) => projects,
+        Err(e) => return tool_error(id, &format!("Fulltext search error: {}", e)),
+    };
     let refreshed = db.try_refresh_file_index(|| {
-        crate::indexer::refresh_stale(db, 200)?;
+        crate::indexer::refresh_stale_for_projects(db, 200, &projects)?;
         let mut hits = search_files_for_scope(db, query, limit, scope, false)?;
         if crate::indexer::refresh_search_hits(db, &hits)? > 0 {
             hits = search_files_for_scope(db, query, limit, scope, false)?;
@@ -2054,7 +2190,11 @@ fn workspace_search_fulltext_scoped(
 
     match hits {
         Ok(hits) => {
-            let results: Vec<_> = hits
+            let contexts = match crate::context::search_contexts(db, &hits) {
+                Ok(contexts) => contexts,
+                Err(e) => return tool_error(id, &e.to_string()),
+            };
+            let results: anyhow::Result<Vec<_>> = hits
                 .iter()
                 .filter(|h| scope.allows_project(h.project_id))
                 .filter(|h| {
@@ -2064,16 +2204,23 @@ fn workspace_search_fulltext_scoped(
                     )
                 })
                 .map(|h| {
-                    serde_json::json!({
+                    let (context, stale) = &contexts[&(h.shared_item_id, h.path.clone())];
+                    Ok(serde_json::json!({
                         "shared_item_id": h.shared_item_id,
                         "project_id": h.project_id,
                         "path": h.path,
                         "snippet": h.snippet,
                         "rank": h.rank,
                         "content_hash": h.content_hash,
-                    })
+                        "context": context,
+                        "stale": stale,
+                    }))
                 })
                 .collect();
+            let results = match results {
+                Ok(results) => results,
+                Err(e) => return tool_error(id, &e.to_string()),
+            };
             let text = serde_json::to_string_pretty(&results).unwrap_or_default();
             tool_result(id, text)
         }
@@ -2367,7 +2514,7 @@ fn list_projects_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) -> Jso
         Err(e) => return tool_error(id, &format!("Failed to list projects: {}", e)),
     };
 
-    let result: Vec<_> = projects
+    let result: anyhow::Result<Vec<_>> = projects
         .iter()
         .map(|p| {
             let groups = scope.filter_groups(db.get_groups_for_project(p.id).unwrap_or_default());
@@ -2380,15 +2527,31 @@ fn list_projects_scoped(id: serde_json::Value, db: &Db, scope: &McpScope) -> Jso
                     "name": g.name
                 })).collect::<Vec<_>>()
             });
+            add_checkout_identity(&mut project, p.id, db)?;
             if include_project_paths {
                 project["path"] = serde_json::json!(p.path);
             }
-            project
+            Ok(project)
         })
         .collect();
+    let result = match result {
+        Ok(result) => result,
+        Err(e) => return tool_error(id, &e.to_string()),
+    };
 
     let text = serde_json::to_string_pretty(&result).unwrap_or_default();
     tool_result(id, text)
+}
+
+fn add_checkout_identity(
+    project: &mut serde_json::Value,
+    project_id: i64,
+    db: &Db,
+) -> anyhow::Result<()> {
+    let (logical_id, binding_id, _) = db.checkout_binding(project_id)?;
+    project["logical_project_id"] = serde_json::json!(logical_id);
+    project["binding_id"] = serde_json::json!(binding_id);
+    Ok(())
 }
 
 fn project_slug(db: &Db, project_id: i64) -> String {
@@ -2919,9 +3082,7 @@ fn search_visible_code_nodes(
         search.limit.min(200)
     };
     let mut scoped_search = search.clone();
-    scoped_search.limit = requested_limit
-        .saturating_mul(8)
-        .clamp(requested_limit, 200);
+    scoped_search.limit = requested_limit;
     if let Some(file_path) = search.file_path.as_deref() {
         let normalized = normalize_rel_path(file_path)?;
         if !visibility.path_visible(&normalized) {
@@ -2930,8 +3091,9 @@ fn search_visible_code_nodes(
         scoped_search.file_path = Some(normalized);
     }
 
+    let visible_paths = visibility.visible_file_paths(db)?;
     let hits = db
-        .search_code_nodes(project_id, &scoped_search)
+        .search_code_nodes(project_id, &scoped_search, Some(&visible_paths))
         .map_err(|err| err.to_string())?;
     Ok(hits
         .into_iter()
@@ -3140,7 +3302,7 @@ fn codegraph_node(
     });
     if include_source {
         match db.get_project_by_id(project_id) {
-            Ok(Some(project)) => match crate::codegraph::source_snippet(&project, &node, 2) {
+            Ok(Some(project)) => match crate::codegraph::source_snippet(db, &project, &node, 2) {
                 Ok(snippet) => {
                     result["source"] = serde_json::json!(snippet);
                 }
@@ -3304,7 +3466,10 @@ fn codegraph_context(
         )
         .unwrap_or_default()
         .len();
-        let snippet = crate::codegraph::source_snippet(&project, &hit.node, 1).unwrap_or_default();
+        let snippet = match crate::codegraph::source_snippet(db, &project, &hit.node, 1) {
+            Ok(snippet) => snippet,
+            Err(e) => return tool_error(id, &e.to_string()),
+        };
         blocks.push(serde_json::json!({
             "node_id": &hit.node.stable_id,
             "kind": hit.node.kind.as_str(),

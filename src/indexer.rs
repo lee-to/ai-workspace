@@ -256,6 +256,9 @@ fn index_shared_item_with_progress(
     project_root: &Path,
     after_file: &mut impl FnMut(&IndexStats) -> Result<()>,
 ) -> Result<IndexStats> {
+    if let Some(project_id) = item.project_id {
+        crate::context::verify_checkout(db, project_id)?;
+    }
     let mut stats = IndexStats::default();
     match item.kind {
         SharedItemKind::File => {
@@ -480,13 +483,27 @@ fn reindex_all_with_progress(
 /// Lazy pre-search refresh: stat each indexed file and reindex stale ones.
 /// Bounded to `max_checks` to keep search latency predictable.
 pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
+    if max_checks == 0 {
+        return Ok(0);
+    }
+    let projects = db.available_checkout_ids(None)?;
+    refresh_stale_for_projects(db, max_checks, &projects)
+}
+
+/// Refresh only caller-authorized, available bindings. Scope filtering happens
+/// before the bounded scan, so unrelated projects cannot consume its budget.
+pub fn refresh_stale_for_projects(
+    db: &Db,
+    max_checks: usize,
+    project_ids: &[i64],
+) -> Result<usize> {
     let start = Instant::now();
     if max_checks == 0 {
         debug!("refresh_stale: refreshed 0 files in {:?}", start.elapsed());
         return Ok(0);
     }
 
-    let metas = db.list_file_index_meta(max_checks)?;
+    let metas = db.list_file_index_meta(max_checks, project_ids)?;
     let mut remaining_checks = max_checks;
     let mut refreshed = 0usize;
     for (indexed_file_id, shared_item_id, rel_path, abs_path, old_mtime, old_size) in
@@ -509,6 +526,9 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
             refreshed += 1;
             continue;
         };
+        if crate::context::verify_checkout(db, pid).is_err() {
+            continue;
+        }
         let root = PathBuf::from(&project.path);
         let Some(rel) = item.path.as_deref() else {
             db.delete_indexed_file_by_id(indexed_file_id)?;
@@ -571,7 +591,7 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
         }
     }
 
-    for item in db.list_unindexed_file_items(remaining_checks)? {
+    for item in db.list_unindexed_file_items(remaining_checks, project_ids)? {
         let Some(project_id) = item.project_id else {
             db.delete_file_index(item.id)?;
             refreshed += 1;
@@ -582,6 +602,10 @@ pub fn refresh_stale(db: &Db, max_checks: usize) -> Result<usize> {
             refreshed += 1;
             continue;
         };
+
+        if crate::context::verify_checkout(db, project_id).is_err() {
+            continue;
+        }
 
         let stats = index_shared_item(db, &item, &PathBuf::from(&project.path))?;
         if stats.indexed > 0
@@ -632,6 +656,7 @@ pub fn refresh_search_hits(db: &Db, hits: &[FileSearchHit]) -> Result<usize> {
             refreshed += 1;
             continue;
         };
+        crate::context::verify_checkout(db, project_id)?;
         let root = PathBuf::from(&project.path);
         let Some(rel) = item.path.as_deref() else {
             db.delete_file_index(hit.shared_item_id)?;

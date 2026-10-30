@@ -330,6 +330,9 @@ pub enum CodeGraphCommand {
         /// Project id, slug, or registered path (defaults to current project)
         #[arg(long)]
         project: Option<String>,
+        /// Explicitly include indexed source outside the current shared scopes
+        #[arg(long)]
+        full_project: bool,
         /// Optional node kind such as function, method, struct, trait, or import
         #[arg(long)]
         kind: Option<String>,
@@ -366,6 +369,17 @@ pub enum CloudCommand {
 
 #[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
 pub enum Command {
+    /// Inspect a checkout's logical identity, source revision and share digest
+    Context {
+        /// Explicit checkout ID/path, or an unambiguous project slug
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Explicitly attach or relocate a checkout without copying shares/history
+    Worktree {
+        #[command(subcommand)]
+        command: WorktreeCommand,
+    },
     /// Initialize current directory as a project
     Init {
         /// Project name (defaults to directory name)
@@ -517,6 +531,23 @@ pub enum Command {
     },
 }
 
+#[derive(Debug, Subcommand, serde::Serialize, serde::Deserialize)]
+pub enum WorktreeCommand {
+    /// Register cwd as another checkout of an existing logical project
+    Add {
+        #[arg(long)]
+        project: String,
+        /// Unique checkout slug (defaults to a name with a unique suffix)
+        #[arg(long)]
+        slug: Option<String>,
+    },
+    /// Move an existing binding to cwd, requiring its original identity marker
+    Relocate {
+        #[arg(long)]
+        project: String,
+    },
+}
+
 /// Resolve the current project from cwd
 fn require_project(db: &Db) -> Result<crate::models::Project> {
     let cwd = current_project_dir()?;
@@ -524,6 +555,7 @@ fn require_project(db: &Db) -> Result<crate::models::Project> {
     debug!("Current directory: {}", cwd_str);
     match db.find_project_by_cwd(&cwd_str)? {
         Some(p) => {
+            crate::context::verify_checkout(db, p.id)?;
             debug!("Found project: {} (id={})", p.name, p.id);
             Ok(p)
         }
@@ -532,12 +564,14 @@ fn require_project(db: &Db) -> Result<crate::models::Project> {
 }
 
 fn resolve_cli_project(db: &Db, target: Option<&str>) -> Result<crate::models::Project> {
-    match target {
+    let project = match target {
         Some(target) => db
             .resolve_project_target(target)?
             .ok_or_else(|| anyhow::anyhow!("Project '{}' not found", target)),
         None => require_project(db),
-    }
+    }?;
+    crate::context::verify_checkout(db, project.id)?;
+    Ok(project)
 }
 
 fn codegraph_scope(full_project: bool) -> crate::codegraph::CodeGraphScope {
@@ -1583,6 +1617,46 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
             crate::mcp::serve(resolved_scope)
         }
 
+        Command::Context { project } => {
+            let db = Db::open_default()?;
+            let project = resolve_cli_project(&db, project.as_deref())?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::context::capture(&db, project.id)?)?
+            );
+            Ok(())
+        }
+        Command::Worktree { command } => {
+            let db = Db::open_default()?;
+            let cwd = current_project_dir()?;
+            let cwd_str = cwd.to_string_lossy().to_string();
+            let project_id = match command {
+                WorktreeCommand::Add { project, slug } => {
+                    let target = resolve_cli_project(&db, Some(&project))?;
+                    if db.get_project_by_path(&cwd_str)?.is_some() {
+                        bail!(
+                            "Checkout already registered; refusing to change its logical identity"
+                        );
+                    }
+                    let id =
+                        db.create_project_with_slug(&target.name, &cwd_str, slug.as_deref())?;
+                    db.attach_checkout(id, target.id)?;
+                    id
+                }
+                WorktreeCommand::Relocate { project } => {
+                    let target = db
+                        .resolve_project_target(&project)?
+                        .context("Checkout not found")?;
+                    db.relocate_checkout(target.id, &cwd_str)?;
+                    target.id
+                }
+            };
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&crate::context::capture(&db, project_id)?)?
+            );
+            Ok(())
+        }
         Command::Init {
             name,
             slug,
@@ -2633,12 +2707,18 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 print_info(format!("No matches for '{}'", query));
                 return Ok(());
             }
+            let contexts = crate::context::search_contexts(&db, &hits)?;
             for hit in &hits {
+                let (context, stale) = &contexts[&(hit.shared_item_id, hit.path.clone())];
                 println!(
-                    "{}  [id={} rank={:.3}]\n  {}\n",
+                    "{}  [id={} rank={:.3} project_id={} snapshot={} complete={} stale={}]\n  {}\n",
                     style_ok(&hit.path),
                     hit.shared_item_id,
                     hit.rank,
+                    hit.project_id,
+                    context["snapshot_id"].as_str().unwrap_or("unavailable"),
+                    context["complete"],
+                    stale,
                     hit.snippet.trim()
                 );
             }
@@ -2742,6 +2822,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                 CodeGraphCommand::Search {
                     query,
                     project,
+                    full_project,
                     kind,
                     limit,
                 } => {
@@ -2750,6 +2831,10 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         project, kind, limit, query
                     );
                     let project = resolve_cli_project(&db, project.as_deref())?;
+                    let shared_paths = crate::codegraph::shared_source_paths(&db, &project)?;
+                    crate::context::validate_code_index(&db, project.id, full_project, |path| {
+                        full_project || shared_paths.contains(path)
+                    })?;
                     let kind = kind
                         .as_deref()
                         .map(|kind| kind.parse::<crate::models::CodeNodeKind>())
@@ -2757,6 +2842,7 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                         .with_context(|| {
                             "Invalid --kind. Expected one of: file, module, struct, enum, trait, impl, function, method, const, type_alias, import"
                         })?;
+                    let allowed_paths = shared_paths.into_iter().collect::<Vec<_>>();
                     let hits = db.search_code_nodes(
                         project.id,
                         &crate::models::CodeNodeSearch {
@@ -2765,6 +2851,11 @@ pub fn run(cmd: Command, config_path_override: Option<PathBuf>) -> Result<()> {
                             language: Some("rust".to_string()),
                             file_path: None,
                             limit,
+                        },
+                        if full_project {
+                            None
+                        } else {
+                            Some(&allowed_paths)
                         },
                     )?;
                     if hits.is_empty() {

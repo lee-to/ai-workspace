@@ -10,6 +10,12 @@ It also includes a local Rust-only CodeGraph MVP: registered projects can index 
 
 For teams that need the same curated context away from a developer machine, optional [cloud synchronization](docs/cloud.md) pushes explicit project snapshots to PostgreSQL and exposes a separate seven-tool, read-only hosted MCP endpoint.
 
+Local context distinguishes a logical project from its concrete checkouts. Use
+[`worktree add`](docs/cli.md#worktree-add-worktree-relocate-and-context) to attach
+another checkout explicitly and `context` to inspect its binding, Git revision,
+shared-source digest and share configuration. Dirty contents participate in the
+snapshot; branch names never select a checkout.
+
 ## How it works
 
 ```
@@ -92,7 +98,7 @@ claude mcp add --scope user ai-workspace -- ai-workspace serve
 }
 ```
 
-That's it. The agent now has access to 17 MCP tools by default: `workspace_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
+That's it. The agent now has access to 18 MCP tools by default: `workspace_context`, `project_context`, `workspace_read`, `workspace_search`, `workspace_search_fulltext`, `workspace_service_graph`, `workspace_events`, `workspace_event_details`, `list_groups`, `list_projects`, `project_tree`, `project_grep`, and the Rust CodeGraph tools `codegraph_status`, `codegraph_search`, `codegraph_node`, `codegraph_callers`, `codegraph_callees`, and `codegraph_context`.
 During MCP initialization, AI Workspace also provides startup instructions that guide capable agents to call `workspace_context` when project/group context may matter, prefer shared context and CodeGraph tools before broad scans, and update shared Markdown context only for durable project knowledge.
 By default, project navigation, full-text file search, and direct path reads hide dotfiles and credential-like paths such as `.env`, `.ssh`, `.aws`, `*.pem`, and `*.key`. `workspace_read`, `project_tree`, and `project_grep` support explicit opt-in flags; `workspace_search_fulltext` is stricter and never returns hidden or credential-like `.md` paths.
 

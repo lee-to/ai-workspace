@@ -71,6 +71,49 @@ sessions or rewrite client configuration automatically.
 
 This is the full local tool surface backed by SQLite and local files. The optional hosted service uses authenticated HTTP, PostgreSQL snapshots, and a separate positive allowlist of seven read-only tools; see [Cloud](cloud.md).
 
+## Local checkout and source binding
+
+`project_context` accepts `project_id` or `project` (ID, unambiguous slug, or
+exact registered checkout path). It returns `logical_project_id`, `binding_id`,
+Git `revision`, SHA-256 `source_digest`, `share_digest`, and `snapshot_id`.
+The source digest covers safe shared files, including dirty contents; the share
+digest includes current checkout shares, project notes and group membership.
+Absolute checkout paths and credentials are not included in this metadata.
+Use [explicit checkout registration/relocation](cli.md#worktree-add-worktree-relocate-and-context)
+for siblings; the service never discovers or shares them automatically.
+
+Local full-text hits retain their `content_hash` and add a `context` object and
+`stale` flag. A stale hit describes indexed evidence and must not be treated as
+current source. This is also explicit during the read-only fallback while an
+index rebuild is active. CLI full-text output includes checkout ID, snapshot ID
+and stale state.
+
+Lazy index refresh is limited to the session's permitted checkouts, with scope
+filtering before its scan limit. Unavailable checkouts are omitted from searches
+without pruning their historical index rows or blocking healthy sources. Direct
+reads still reject unavailable bindings. CodeGraph applies current source-path
+visibility before ranking and limiting results in both CLI and MCP searches.
+
+Successful local file reads and CodeGraph results include the same context in
+the MCP result's `_meta.ai_workspace`, preserving existing text/JSON payloads.
+Complete contexts carry `complete: true`. If shared-source traversal exceeds
+its limits, ordinary reads/searches remain available with `complete: false`,
+`reason: "snapshot_limit"` and no `snapshot_id`; `project_context` reports the
+limit as an error. A required snapshot never falls back to incomplete evidence.
+`workspace_read` (with `project_id` + `rel_path`) and CodeGraph tools accept an optional `expected_snapshot_id`:
+use the snapshot from a previous context/search response to reject changes to
+the checkout, safe shared source or share configuration. For individual FTS
+files, also pass `expected_content_hash`; it validates the exact bytes returned.
+Without an expectation, reads use current source and still validate the binding.
+These tokens never grant access: current shares and MCP scope are checked on
+every operation, including in already-open sessions.
+
+CodeGraph validates indexed file hashes and eligible source-file additions.
+Stale queries return a tool error directing the caller to explicit `codegraph
+sync` or `codegraph reindex`. Source snippets also compare their actual read bytes
+with the indexed file hash before returning any source. These local semantics
+do not change the hosted seven-tool snapshot protocol.
+
 ## Event resource subscriptions
 
 The local stdio server advertises `resources.subscribe: true` alongside tools.

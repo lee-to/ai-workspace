@@ -75,6 +75,9 @@ ai-workspace/
 | src/models.rs | Shared data types |
 | src/walk.rs | File tree walker and project grep |
 | src/codegraph.rs | Rust CodeGraph extraction, reference resolution, incremental sync |
+| src/context.rs | Local checkout identity, shared-source snapshot digests and stale-index checks |
+| src/db/context.rs | Logical project/checkout association, relocation and binding persistence |
+| tests/worktree_context.rs | Synthetic worktree, dirty source, relocation and revocation acceptance tests |
 | src/cloud/http.rs | Hosted HTTP server and authenticated snapshot endpoint |
 | src/cloud/mcp.rs | Hosted MCP protocol and seven-tool allowlist |
 | src/cloud/store.rs | PostgreSQL snapshot persistence and tenant reads |

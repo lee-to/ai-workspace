@@ -4,7 +4,7 @@ use rusqlite::{Connection, params};
 
 use crate::models::normalize_project_slug;
 
-const CURRENT_SCHEMA_VERSION: i64 = 7;
+const CURRENT_SCHEMA_VERSION: i64 = 8;
 
 pub fn init_db(conn: &Connection) -> Result<()> {
     info!("Initializing database schema");
@@ -102,6 +102,18 @@ fn migrate_to_version(conn: &Connection, version: i64) -> Result<()> {
             debug!("Migration v7: add cloud sync revision state");
             ensure_cloud_sync_state_schema(conn)
         }
+        8 => conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS project_bindings (
+                project_id INTEGER PRIMARY KEY REFERENCES projects(id) ON DELETE CASCADE,
+                logical_id TEXT NOT NULL,
+                binding_id TEXT NOT NULL UNIQUE,
+                root_token TEXT
+            );
+            INSERT OR IGNORE INTO project_bindings (project_id, logical_id, binding_id)
+            SELECT id, 'project:' || id, 'checkout:' || id FROM projects;",
+            )
+            .context("Failed to create checkout bindings"),
         _ => {
             error!("No migration registered for schema version {}", version);
             anyhow::bail!("No migration registered for schema version {}", version);
@@ -797,8 +809,8 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
-        assert_eq!(CURRENT_SCHEMA_VERSION, 7);
+        assert_eq!(version, 8);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 8);
     }
 
     #[test]
@@ -870,7 +882,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
 
         let group_ids = conn
             .prepare("SELECT group_id FROM event_groups WHERE event_id = 42 ORDER BY group_id")

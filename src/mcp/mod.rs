@@ -158,6 +158,18 @@ fn handle_tools_list_with_project_file_write(
         serde_json::json!({
             "tools": [
                 {
+                    "name": "project_context",
+                    "description": "Inspect an explicitly selected local checkout: logical project ID, binding ID, Git revision, safe shared-source digest, share configuration digest and snapshot ID. Multiple checkouts require an explicit ID or registered path.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {
+                            "project_id": {"type": "integer", "minimum": 1},
+                            "project": {"type": "string", "minLength": 1}
+                        },
+                        "additionalProperties": false
+                    }
+                },
+                {
                     "name": "workspace_context",
                     "description": "Get workspace metadata within the configured MCP server scope: projects, groups, shared items list (no file content). Prefer this as the first tool when task context may span ai-workspace projects or groups.",
                     "inputSchema": {
@@ -235,6 +247,11 @@ fn handle_tools_list_with_project_file_write(
                                 "type": "string",
                                 "pattern": "^[0-9a-f]{64}$",
                                 "description": "Optional content_hash from local full-text search. Requires project_id+rel_path for a file. A mismatch returns a tool error without file content."
+                            },
+                            "expected_snapshot_id": {
+                                "type": "string",
+                                "pattern": "^[0-9a-f]{64}$",
+                                "description": "Optional snapshot_id from local project_context or search context. Rejects changed checkout/source/shares; never bypasses access checks."
                             },
                             "include_hidden": {
                                 "type": "boolean",
@@ -456,7 +473,7 @@ fn handle_tools_list_with_project_file_write(
                 },
                 {
                     "name": "codegraph_search",
-                    "description": "Search indexed Rust symbols by text, kind, language, and file path without scanning project files. Results are limited to the configured MCP scope and current shared file/dir visibility unless project-wide tools are enabled.",
+                    "description": "Search indexed Rust symbols by text, kind, language, and file path, validating current source against the index. Results are limited to the configured MCP scope and current shared file/dir visibility unless project-wide tools are enabled.",
                     "inputSchema": {
                         "type": "object",
                         "properties": {
@@ -559,6 +576,23 @@ fn handle_tools_list_with_project_file_write(
         }),
     );
 
+    if let Some(tools) = response
+        .result
+        .as_mut()
+        .and_then(|r| r["tools"].as_array_mut())
+    {
+        for tool in tools.iter_mut().filter(|tool| {
+            tool["name"]
+                .as_str()
+                .is_some_and(|name| name.starts_with("codegraph_"))
+        }) {
+            tool["inputSchema"]["properties"]["expected_snapshot_id"] = serde_json::json!({
+                "type": "string", "pattern": "^[0-9a-f]{64}$",
+                "description": "Optional local snapshot_id; rejects changed checkout/source/shares."
+            });
+        }
+    }
+
     if !include_project_file_write
         && let Some(result) = response.result.as_mut()
         && let Some(tools) = result["tools"].as_array_mut()
@@ -621,7 +655,7 @@ mod tests {
         let resp = handle_tools_list_with_project_file_write(json!(1), false);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 17);
+        assert_eq!(tools.len(), 18);
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
         assert!(names.contains(&"workspace_context"));
         assert!(!names.contains(&"project_file_write"));
